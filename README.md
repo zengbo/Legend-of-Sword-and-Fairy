@@ -107,15 +107,18 @@ curl -X POST http://127.0.0.1:8765/v1/input/up/release
 （由 GitHub Actions 自动构建部署，见 `.github/workflows/pages.yml`）
 
 整个同步引擎原样运行在 Web Worker 中：画面输出到 canvas，键盘输入与
-音频采样通过 SharedArrayBuffer 环形缓冲传递（音乐由 AudioWorklet 播放），
-存档保存在 localStorage。
+音频采样通过 SharedArrayBuffer 环形缓冲传递（音乐由 AudioWorklet 播放）。
+存档默认写 localStorage；用 `web/serve.py` 自建时支持**注册/登录**与云存档
+（`/api/auth/*`、`/api/saves`，按用户名存 `web/saves/`）。游客仅本地；
+登录后双写服务器，换设备同一账号即可同步。纯静态托管（如 GitHub Pages）
+自动降级为仅本地。详见 [docs/server-saves.md](docs/server-saves.md)。
 
 ```shell
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli
 ./web/build.sh          # 构建 wasm 包到 web/pkg/
-python3 web/serve.py    # 本地服务器（带 SharedArrayBuffer 所需的 COOP/COEP 头）
-# 打开 http://127.0.0.1:8080/web/
+python3 web/serve.py    # 本地服务器（COOP/COEP + 账号/云存档 API）
+# 打开 http://127.0.0.1:8080/web/  → 右上角注册/登录
 ```
 
 触屏设备（手机/平板）会显示虚拟按键：左下方向键，右下 確認/取消/連擊，

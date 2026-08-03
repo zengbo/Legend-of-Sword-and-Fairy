@@ -140,6 +140,27 @@ async function boot() {
     window.addEventListener(ev, resumeAudio);
   }
 
+  // Save store: localStorage always; cloud dual-write when logged in
+  // (see web/save-store.js + web/auth-ui.js + web/serve.py).
+  const saveStore = await PalSaveStore.createSaveStore({
+    status: (msg) => { status.textContent = msg; },
+  });
+  window.__palSaveStore = saveStore;
+  if (typeof PalAuthUI !== "undefined") {
+    PalAuthUI.mountAuthUI({
+      store: saveStore,
+      onAfterAuth: () => {
+        // Cloud slots are in localStorage now; in-game load still uses the
+        // worker's PAL_FILES snapshot from boot. Hint the user to refresh
+        // if they need to load an older cloud save immediately.
+        const s = saveStore.getState();
+        if (s.username) {
+          status.textContent = `已登入 ${s.username}（新存檔將同步雲端；讀取雲端舊檔請重新整理頁面）`;
+        }
+      },
+    });
+  }
+
   // Fetch all game data up front (~13 MB).
   let loaded = 0;
   const files = {};
@@ -150,15 +171,8 @@ async function boot() {
     status.textContent = `loading game data… ${++loaded}/${FILES.length}`;
   }));
 
-  // Seed saved games (slots 1-5) from localStorage into the file map.
-  for (let slot = 1; slot <= 5; slot++) {
-    const b64 = localStorage.getItem(`pal-save-${slot}`);
-    if (!b64) continue;
-    const bin = atob(b64);
-    const u8 = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-    files[`${slot}.RPG`] = u8;
-  }
+  // Seed slots 1–5 (server preferred, else localStorage) into the file map.
+  await saveStore.seedInto(files);
 
   const worker = new Worker("worker.js");
   worker.onmessage = (e) => {
@@ -166,13 +180,8 @@ async function boot() {
       status.textContent = "";
       presenter.present(new Uint8Array(e.data.buffer));
     } else if (e.data && e.data.palSave !== undefined) {
-      // Persist a saved game posted by the engine.
-      const u8 = e.data.data;
-      let bin = "";
-      for (let i = 0; i < u8.length; i += 0x8000) {
-        bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
-      }
-      localStorage.setItem(`pal-save-${e.data.palSave}`, btoa(bin));
+      // Engine posted a DOS .rpg blob — persist locally (+ cloud if enabled).
+      saveStore.persist(e.data.palSave, e.data.data);
     } else if (typeof e.data === "string") {
       status.textContent = e.data; // worker status/error text
     }

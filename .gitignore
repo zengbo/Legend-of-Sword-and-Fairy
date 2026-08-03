@@ -6,6 +6,8 @@ recordings/parts/
 reference/
 /target/
 /web/pkg/
+# Per-player cloud saves written by web/serve.py
+/web/saves/
 err.log
 .claude/
 # autoplay/battlerecord output: raw captures and encoded video
