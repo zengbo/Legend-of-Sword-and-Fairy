@@ -1,5 +1,8 @@
 # Offscreen / Console Autoplay
 
+> **For AI agents:** use the dedicated control brief
+> [`docs/ai-control.md`](ai-control.md) (API, step loop, system prompt).
+
 The native game exposes an opt-in HTTP interface for automation. Frames and
 input use the same engine path as a real keyboard; you can watch on a GUI
 window, headlessly, or in the **terminal console**.

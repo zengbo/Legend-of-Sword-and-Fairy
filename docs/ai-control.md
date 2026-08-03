@@ -1,0 +1,375 @@
+# rustpal AI 操控说明（给 Agent 读）
+
+本文档说明如何通过 **本地 HTTP API** 观察并控制仙剑 DOS 引擎的 Rust 移植版（rustpal）。  
+你是 **外部 Agent**：只通过 HTTP 与游戏进程通信，不要假设有 GUI 鼠标或剪贴板。
+
+**默认基址：** `http://127.0.0.1:8765`  
+（仅 loopback；非本机地址会被拒绝。）
+
+---
+
+## 1. 你能做什么 / 不能做什么
+
+| 可以 | 不可以 |
+| --- | --- |
+| 读最新画面 PNG（逻辑分辨率 320×200） | 直接改内存/存档格式（除非另有接口） |
+| 读结构化状态 JSON（场景、坐标、对话中…） | 绑定非 loopback 地址 |
+| 注入与真人相同的按键（点按 / 按住 / 松开） | 一次发送鼠标或触屏手势 |
+| 在 **步进模式** 下推进虚拟时钟（单帧控制） | 在未开 step 时用 `/v1/step` 控制时间（会 409） |
+
+游戏逻辑与真人游玩相同：对话、菜单、走路、战斗都走真实引擎路径。
+
+---
+
+## 2. 人类如何启动游戏（你依赖此环境）
+
+人类应已启动 rustpal，并打开 UI driver。常见方式：
+
+```bash
+# A. 无头 + 严格单帧（推荐给 AI 训练/规划）
+./target/release/rustpal --ui-driver --offscreen --ui-step --mute
+
+# B. 终端里能看见画面 + HTTP（console 下默认实时时钟，不必 step 也能动）
+./target/release/rustpal --console --ui-driver --ui-step
+
+# C. 终端里看，且严格单帧（画面会冻到你 POST /v1/step）
+RUSTPAL_UI_STEP_STRICT=1 ./target/release/rustpal --console --ui-driver --ui-step
+```
+
+| 启动参数 | 时钟 | 画面 | Agent 是否必须 step |
+| --- | --- | --- | --- |
+| `--ui-step --offscreen` | 虚拟 | 无窗口 | **必须**，否则游戏完全停住 |
+| `--console --ui-step` | 实时（默认） | 终端有画 | 不必须；仍可用 input + state |
+| 上式 + `RUSTPAL_UI_STEP_STRICT=1` | 虚拟 | 终端有画但会冻 | **必须** |
+| 仅 `--ui-driver`（无 step） | 实时 | 视后端 | 不必须；按实时节奏操作 |
+
+**探测：** `GET /v1/status` 中  
+- `step_mode === true` → 引擎在等你 step  
+- `step_configured === true` 且 `step_mode === false` → 开了 step 配置但 console 实时放行  
+
+先 `GET /v1/status` 或 `GET /` 确认服务在线，再进入主循环。
+
+---
+
+## 3. HTTP API 一览
+
+所有成功写操作多为 `202 Accepted`；读为 `200 OK`。  
+`Content-Type`：JSON 用 `application/json`，帧为 `image/png`。
+
+### 3.1 `GET /v1/status`
+
+快速心跳，体量小。
+
+```json
+{
+  "status": "ok",
+  "width": 320,
+  "height": 200,
+  "frame_id": 12,
+  "step_mode": true,
+  "step_configured": true,
+  "ticks": 1200
+}
+```
+
+- `frame_id`：每次成功 present 画面后递增；**变大**表示有新图可取。  
+- `ticks`：引擎时间（ms）。`step_mode` 时为虚拟时钟。
+
+### 3.2 `GET /v1/state`
+
+结构化状态（字段可能增加，**忽略未知字段**）。
+
+```json
+{
+  "status": "ok",
+  "frame_id": 12,
+  "step_mode": true,
+  "step_configured": true,
+  "ticks": 1200,
+  "frame_num": 42,
+  "scene": 1,
+  "viewport": [2200, 1280],
+  "party_offset": [160, 112],
+  "player": [2360, 1392],
+  "party_direction": 0,
+  "in_main_game": true,
+  "entering_scene": false,
+  "in_battle": false,
+  "in_dialog": true,
+  "dialog_line": 2,
+  "quit_requested": false,
+  "cash": 0,
+  "max_party_member_index": 0,
+  "party": [
+    {"slot": 0, "role": 0, "hp": 100, "max_hp": 100, "mp": 20, "max_mp": 20, "level": 1}
+  ]
+}
+```
+
+| 字段 | 含义与用法 |
+| --- | --- |
+| `in_dialog` | `true` → 优先 `confirm` 推进对话 |
+| `in_battle` | `true` → 用战斗键（如 `force` / `auto`），勿乱走地图 |
+| `in_main_game` | `false` → 可能在片头/菜单；多 `confirm` 或大量 `step` 跳过开场 |
+| `entering_scene` | 切场景中，少操作，多 step/等待 |
+| `player` / `viewport` | 地图坐标，用于是否在移动、相对目标 |
+| `scene` | 场景编号，换场景说明进度变化 |
+| `party[].hp` | 战斗/生存判断 |
+| `quit_requested` | 结束循环 |
+
+状态在 `process_event` / `video_update` 时刷新；若刚启动可能短暂为 `"starting"` 类占位。
+
+### 3.3 `GET /v1/frame.png`
+
+- 逻辑画面 **320×200** RGBA PNG（非 720p 超分）。  
+- 尚无帧时可能 `503`：稍后重试或先 `step`。  
+- 像素风、偏暗 UI：视觉模型建议放大后再理解；可与 `/v1/state` 交叉验证。
+
+### 3.4 `POST /v1/input/{key}/{action}`
+
+`action`：`tap` | `press` | `release`
+
+| action | 行为 |
+| --- | --- |
+| `tap` | 按下 → 约 75ms → 松开（最常用） |
+| `press` | 按住不放（走路） |
+| `release` | 松开 |
+
+**合法 `key` 名（小写，别名见下）：**
+
+| key | 游戏作用 | 别名 |
+| --- | --- | --- |
+| `up` `down` `left` `right` | 方向 | — |
+| `confirm` | 确认 / 调查 / 对话 | `enter`, `search` |
+| `space` | 搜索/确认类 | — |
+| `menu` | 菜单 / 取消 | `escape`, `esc` |
+| `force` | 战斗「法术/强力」等 | `magic`, `f` |
+| `auto` | 自动战斗相关 | `a` |
+| `defend` | 防御 | `d` |
+| `use_item` | 使用物品 | `e` |
+| `throw_item` | 投掷 | `w` |
+| `flee` | 逃跑 | `q` |
+| `status` | 状态 | `s` |
+| `repeat` | 重复 | `r` |
+| `page_up` `page_down` `home` `end` | 翻页等 | `pgup` `pgdn` |
+
+示例：
+
+```http
+POST /v1/input/confirm/tap HTTP/1.1
+Host: 127.0.0.1:8765
+Content-Length: 0
+```
+
+```http
+POST /v1/input/down/press
+POST /v1/input/down/release
+```
+
+**注意：**
+
+- 走路：先 `press` 方向，保持一段时间（实时模式 `sleep`；步进模式多次 `step`），再 `release`。  
+- 对话：反复 `confirm` tap，不要用方向键乱选（除非你确认在菜单上）。  
+- 主菜单：方向移动光标 + `confirm` 确认。  
+- 输入经队列注入，与真键盘相同；在 `step_mode` 下应 **先 input 再 step**，以便本帧读到按键。
+
+### 3.5 `POST /v1/step`（仅步进配置开启时）
+
+推进虚拟时钟。未配置 step 时返回 **409**。
+
+| 请求 | 效果 |
+| --- | --- |
+| `POST /v1/step` | +100ms（1 个 overworld 帧，`FRAME_TIME`） |
+| `POST /v1/step?frames=N` | +N×100ms |
+| `POST /v1/step?ms=N` | +N ms |
+| body `{"frames":5}` 或 `{"ms":500}` | 同上 |
+
+响应示例：
+
+```json
+{"accepted":true,"advanced_ms":100,"ticks":500,"frame_time_ms":100,"gating":true}
+```
+
+- `gating: true`：引擎时钟被 step 卡住，必须 step 才会动。  
+- `gating: false`：console 实时模式，step 仍会加虚拟计数，但 **不卡住** 游戏。
+
+**开场建议：** 若 `step_mode` 且 `in_main_game == false`，可先：
+
+```http
+POST /v1/step?frames=300
+```
+
+再轮询 `/v1/state` 直到 `in_main_game` 为 true（或配合 `confirm`）。
+
+---
+
+## 4. 推荐控制循环
+
+### 4.1 严格单帧（`--offscreen --ui-step`）
+
+```
+1. GET /v1/status  → 确认在线；记下 step_mode
+2. 若 step_mode 且未进主游戏：
+     可选 POST /v1/step?frames=50~300 跳过片头
+3. loop:
+     a. GET /v1/state
+     b. 若 quit_requested: 结束
+     c. 可选 GET /v1/frame.png（视觉模型）
+     d. 决策动作
+     e. POST /v1/input/...   （先输入）
+     f. POST /v1/step?frames=1   （再步进）
+     g. 若需长按移动：press → 多次 step → release
+```
+
+### 4.2 实时 / console 观看（`step_mode == false`）
+
+```
+loop:
+  GET /v1/state 和/或 frame.png
+  POST input
+  sleep 50~200ms（墙钟）  # 不要死循环空转 CPU
+```
+
+不必调用 `/v1/step`（调用也无门控作用）。
+
+### 4.3 策略启发式（省 token）
+
+1. **`in_dialog`** → `confirm` tap（可连点 1–3 次 + step）  
+2. **`in_battle`** → 优先 `force` 或 `auto`；观察 `party[].hp`  
+3. **`entering_scene`** → 少操作，只 step / 短等  
+4. **自由走动** → 方向 press/release；调查用 `confirm` 或 `space`  
+5. **卡住不动**（`player`/`frame_num` 长期不变）→ 换方向、或 `confirm`、或 `menu` 再取消  
+
+不要每帧把整张 PNG base64 打进超长上下文；优先 `/v1/state`，画面按需。
+
+---
+
+## 5. curl 速查
+
+```bash
+BASE=http://127.0.0.1:8765
+
+curl -s $BASE/v1/status
+curl -s $BASE/v1/state | jq .
+curl -s $BASE/v1/frame.png -o /tmp/pal.png
+
+curl -s -X POST $BASE/v1/input/confirm/tap
+curl -s -X POST $BASE/v1/input/down/press
+# ... 等待或 step ...
+curl -s -X POST $BASE/v1/input/down/release
+
+curl -s -X POST "$BASE/v1/step?frames=1"
+curl -s -X POST "$BASE/v1/step?ms=500"
+curl -s -X POST $BASE/v1/step -H 'Content-Type: application/json' -d '{"frames":10}'
+```
+
+---
+
+## 6. Python 最小 Agent 骨架
+
+```python
+import json, time, urllib.request
+
+BASE = "http://127.0.0.1:8765"
+
+def get_json(path):
+    with urllib.request.urlopen(BASE + path) as r:
+        return json.load(r)
+
+def post(path, data=None):
+    req = urllib.request.Request(
+        BASE + path,
+        data=(data if data is not None else b""),
+        method="POST",
+        headers={"Content-Type": "application/json"} if data else {},
+    )
+    with urllib.request.urlopen(req) as r:
+        return r.read()
+
+def tap(key):
+    post(f"/v1/input/{key}/tap")
+
+def step(frames=1):
+    post(f"/v1/step?frames={frames}")
+
+def frame_png():
+    with urllib.request.urlopen(BASE + "/v1/frame.png") as r:
+        return r.read()
+
+# 启动探测
+st = get_json("/v1/status")
+assert st.get("status") == "ok"
+
+if st.get("step_mode"):
+    step(200)  # 尝试越过片头
+
+while True:
+    state = get_json("/v1/state")
+    if state.get("quit_requested"):
+        break
+    if state.get("in_dialog"):
+        tap("confirm")
+    elif state.get("in_battle"):
+        tap("force")
+    else:
+        # TODO: 用地图策略或 VLM(frame_png()) 决策
+        tap("confirm")
+    if state.get("step_mode"):
+        step(1)
+    else:
+        time.sleep(0.1)
+```
+
+将 `# TODO` 换成你的模型调用即可。
+
+---
+
+## 7. 错误与边界
+
+| 情况 | 处理 |
+| --- | --- |
+| 连接失败 | 游戏未启动或端口不对 |
+| `POST /v1/step` → 409 | 未开 `--ui-step` |
+| `GET /v1/frame.png` → 503 | 尚无 present；先 step 或等待 |
+| 画面一直空 + step_mode | 你必须 step；或改用 console 非 STRICT |
+| 按键无效果 | 是否在菜单/脚本等待；是否先 input 后 step；是否误用未知 key 名 |
+| `frame_id` 不变 | 无新 present（卡在 delay 且无人 step） |
+
+---
+
+## 8. 与内置自动脚本的区别（勿混淆）
+
+| 程序 | 用途 |
+| --- | --- |
+| **主程序 + 本文 API** | 给你（AI）控 |
+| `examples/autoplay` | 内置随机探索 Pilot + 录像 |
+| `examples/fullgame_autoplay` | 规则寻路通关探针（非 HTTP Agent） |
+
+不要同时让 fullgame Pilot 与 HTTP Agent 抢键，除非明确只要其中一个。
+
+---
+
+## 9. 系统提示词摘要（可直接贴进 Agent）
+
+```
+你在控制 rustpal（仙剑 DOS 引擎）。基址 http://127.0.0.1:8765。
+观察：GET /v1/state（优先）、GET /v1/frame.png（320x200）、GET /v1/status。
+动作：POST /v1/input/{key}/tap|press|release；
+键：up down left right confirm space menu force auto defend use_item throw_item flee status。
+若 status.step_mode 为 true：每次决策后必须 POST /v1/step?frames=1（可先 frames=200 跳过片头）。
+对话 in_dialog=true 时按 confirm；战斗 in_battle=true 时用 force/auto；quit_requested 时停止。
+先 input 再 step。忽略 JSON 未知字段。不要假设有鼠标。
+```
+
+---
+
+## 10. 相关文件
+
+| 文件 | 内容 |
+| --- | --- |
+| `docs/ai-control.md` | 本文（给 AI） |
+| `docs/autoplay.md` | HTTP / step 设计说明 |
+| `docs/console.md` | 终端画面后端 |
+| `src/ui_driver.rs` | API 实现 |
+
+若 API 与本文冲突，以运行中的 `GET /` 帮助文本与源码为准。
