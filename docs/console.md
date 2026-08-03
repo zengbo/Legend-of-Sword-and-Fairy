@@ -49,11 +49,20 @@ Keys are held for ~150 ms in engine time (OS key-repeat extends this) so the
 game sees a real press; earlier builds released in the same frame and menus
 ignored input.
 
-### Flicker
+### Flicker (especially over SSH)
 
-Presents use the terminal **synchronized output** mode (`CSI ? 2026 h/l`) and
-only retransmit when the 320×200 frame changes. Kitty placement is set once;
-later frames replace the same image id without moving the cursor.
+Local Kitty is usually fine; **SSH latency** makes intermediate updates visible
+as white flashes if every frame re-places the image.
+
+Mitigations in the backend:
+
+1. **First frame** `a=T` (transmit + place once with `c=` columns).
+2. **Later frames** `a=t` only — replace pixel payload; placements stay put.
+3. **`CSI ? 2026` synchronized output** around each update (show finished frame only).
+4. Slightly lower FPS when `SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` is set.
+
+Prefer `kitten ssh user@host` so the graphics protocol is forwarded cleanly.
+Avoid tmux unless `allow-passthrough` is enabled.
 
 ### Kitty mode
 

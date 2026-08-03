@@ -26,8 +26,10 @@ use crate::surface::{Surface, SCREEN_H, SCREEN_W};
 
 const KITTY_CHUNK: usize = 4096;
 const IMAGE_ID: u32 = 1;
-/// ~12–15 fps is enough for PAL and keeps Kitty APC traffic reasonable.
+/// Local Kitty: ~14 fps. Over SSH we slow down further (see `frame_interval()`).
 const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(70);
+/// SSH has higher latency; fewer full-frame APC blasts = less white flash.
+const MIN_FRAME_INTERVAL_SSH: Duration = Duration::from_millis(100);
 /// How long a key stays down for the engine after a terminal press / repeat.
 const KEY_HOLD: Duration = Duration::from_millis(180);
 
@@ -55,6 +57,8 @@ struct HeldKey {
 
 pub struct ConsoleVideo {
     use_kitty: bool,
+    /// True when `SSH_CONNECTION` / `SSH_TTY` is set — use flicker-resistant path.
+    over_ssh: bool,
     /// Kitty: display width in terminal cells (`c=`). Aspect preserved by Kitty.
     place_cols: u32,
     /// ANSI only: integer nearest-neighbor scale (1–3).
@@ -160,6 +164,7 @@ impl ConsoleVideo {
             ConsoleMode::Auto => detect_kitty(),
         };
         let (place_cols, ansi_scale) = resolve_display_size(use_kitty);
+        let over_ssh = is_over_ssh();
 
         #[cfg(unix)]
         let (key_rx, tty_guard) = spawn_tty_reader()?;
@@ -167,8 +172,7 @@ impl ConsoleVideo {
         let key_rx = spawn_stdin_reader();
 
         let mut out = io::stdout();
-        // Alternate screen once; do NOT use CSI 2026 here (some Kitty builds
-        // leave the alt buffer blank if sync mode is mishandled).
+        // Alternate screen once.
         write!(out, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
         let label = if use_kitty { "Kitty" } else { "ANSI" };
         let size_note = if use_kitty {
@@ -181,13 +185,14 @@ impl ConsoleVideo {
                 SCREEN_H as u32 * ansi_scale
             )
         };
+        let ssh_note = if over_ssh { " · SSH" } else { "" };
         writeln!(
             out,
-            "\x1b[36mrustpal console ({label} · {size_note}) — arrows/hjkl · Enter · Esc · Ctrl-C restores terminal & quits\x1b[0m"
+            "\x1b[36mrustpal console ({label} · {size_note}{ssh_note}) — arrows/hjkl · Enter · Esc · Ctrl-C restores terminal & quits\x1b[0m"
         )?;
         out.flush()?;
         eprintln!(
-            "rustpal: console backend ready ({label}, place_cols={place_cols}, ansi_scale={ansi_scale})"
+            "rustpal: console backend ready ({label}, place_cols={place_cols}, ansi_scale={ansi_scale}, ssh={over_ssh})"
         );
 
         #[cfg(unix)]
@@ -201,12 +206,13 @@ impl ConsoleVideo {
 
         Ok(ConsoleVideo {
             use_kitty,
+            over_ssh,
             place_cols,
             ansi_scale,
             rgba: vec![0; SCREEN_W * SCREEN_H * 4],
             scaled: vec![0; scaled_len],
             prev_rgba: Vec::new(),
-            last_present: Instant::now() - MIN_FRAME_INTERVAL,
+            last_present: Instant::now() - frame_interval(over_ssh),
             close_requested: false,
             frame_n: 0,
             key_rx,
@@ -217,6 +223,10 @@ impl ConsoleVideo {
             #[cfg(unix)]
             _tty_guard: tty_guard,
         })
+    }
+
+    fn frame_interval(&self) -> Duration {
+        frame_interval(self.over_ssh)
     }
 
     pub fn pump(&mut self) -> Vec<(KeyCode, bool)> {
@@ -273,7 +283,7 @@ impl ConsoleVideo {
         shake: Option<(u16, u16)>,
     ) {
         let now = Instant::now();
-        if now.duration_since(self.last_present) < MIN_FRAME_INTERVAL {
+        if now.duration_since(self.last_present) < self.frame_interval() {
             return;
         }
 
@@ -288,13 +298,22 @@ impl ConsoleVideo {
         self.prev_rgba.clone_from(&self.rgba);
         self.last_present = now;
         self.frame_n = self.frame_n.saturating_add(1);
+        let first = self.frame_n == 1;
 
         let mut out = io::stdout();
+        // Synchronized output: terminal shows the finished update as one step.
+        // Essential over SSH (high latency makes partial APC blasts look like
+        // white flashes). Harmless locally on modern Kitty.
+        let _ = write!(out, "\x1b[?2026h");
+
         if self.use_kitty {
-            // Stay on row 2; C=1 keeps the cursor from scrolling the buffer.
-            if self.frame_n == 1 {
+            if first {
+                // Place once under the banner.
                 let _ = write!(out, "\x1b[2;1H");
             }
+            // First frame: transmit + place (a=T). Later frames: transmit only
+            // (a=t) so existing placements update in place — avoids the
+            // delete/repaint flash that is very visible over SSH.
             if let Err(e) = write_kitty_frame(
                 &mut out,
                 IMAGE_ID,
@@ -302,14 +321,16 @@ impl ConsoleVideo {
                 SCREEN_H as u32,
                 &self.rgba,
                 self.place_cols,
+                first,
             ) {
                 eprintln!("rustpal: kitty frame error: {e}");
             }
-            if self.frame_n == 1 {
+            if first {
                 eprintln!(
-                    "rustpal: first kitty frame sent ({} bytes raw, c={})",
+                    "rustpal: first kitty frame sent ({} bytes raw, c={}, ssh={})",
                     self.rgba.len(),
-                    self.place_cols
+                    self.place_cols,
+                    self.over_ssh
                 );
             }
         } else {
@@ -326,6 +347,8 @@ impl ConsoleVideo {
             };
             let _ = write_ansi_halfblock(&mut out, fw, fh, frame);
         }
+
+        let _ = write!(out, "\x1b[?2026l");
         let _ = out.flush();
     }
 
@@ -641,6 +664,23 @@ fn nearest_upscale(src: &[u8], sw: usize, sh: usize, scale: u32, dst: &mut [u8])
 
 // --- Kitty -------------------------------------------------------------------
 
+fn is_over_ssh() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
+}
+
+fn frame_interval(over_ssh: bool) -> Duration {
+    if over_ssh {
+        MIN_FRAME_INTERVAL_SSH
+    } else {
+        MIN_FRAME_INTERVAL
+    }
+}
+
+/// `place_first`: use a=T (transmit+display with placement). Subsequent frames
+/// use a=t (replace image payload only) so placements stay put — much less
+/// flicker over SSH than re-running a=T every frame.
 fn write_kitty_frame(
     out: &mut impl Write,
     image_id: u32,
@@ -648,9 +688,10 @@ fn write_kitty_frame(
     height: u32,
     rgba: &[u8],
     place_cols: u32,
+    place_first: bool,
 ) -> io::Result<()> {
     assert_eq!(rgba.len(), (width * height * 4) as usize);
-    // Fast compression level — present must stay snappy so pump() keeps running.
+    // Fast compression — present must stay snappy so pump() keeps running.
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(rgba, 1);
     let payload = BASE64.encode(&compressed);
     let chunks: Vec<&[u8]> = payload.as_bytes().chunks(KITTY_CHUNK).collect();
@@ -658,12 +699,19 @@ fn write_kitty_frame(
     for (i, chunk) in chunks.iter().enumerate() {
         let more = u8::from(i != last);
         if i == 0 {
-            // c=N → display over N columns; Kitty computes rows to keep aspect.
-            // C=1 → do not move cursor after the image (no scroll flicker).
-            write!(
-                out,
-                "\x1b_Ga=T,f=32,o=z,s={width},v={height},t=d,i={image_id},p=1,c={place_cols},C=1,q=2,m={more};"
-            )?;
+            if place_first {
+                // Transmit + place: c= columns, C=1 keep cursor.
+                write!(
+                    out,
+                    "\x1b_Ga=T,f=32,o=z,s={width},v={height},t=d,i={image_id},p=1,c={place_cols},C=1,q=2,m={more};"
+                )?;
+            } else {
+                // Transmit only — existing placements refresh in place.
+                write!(
+                    out,
+                    "\x1b_Ga=t,f=32,o=z,s={width},v={height},t=d,i={image_id},q=2,m={more};"
+                )?;
+            }
         } else {
             write!(out, "\x1b_Gm={more};")?;
         }
@@ -710,13 +758,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kitty_header_has_columns() {
+    fn kitty_first_frame_places_later_only_transmits() {
         let px = [255u8, 0, 0, 255];
         let mut out = Vec::new();
-        write_kitty_frame(&mut out, 1, 1, 1, &px, 80).unwrap();
+        write_kitty_frame(&mut out, 1, 1, 1, &px, 80, true).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("c=80"), "{s}");
         assert!(s.contains("a=T"));
+
+        out.clear();
+        write_kitty_frame(&mut out, 1, 1, 1, &px, 80, false).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("a=t"), "{s}");
+        assert!(!s.contains("a=T,"));
     }
 
     #[test]
