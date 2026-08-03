@@ -1856,6 +1856,13 @@ fn main() {
 
     let mut engine = open_engine(console.as_deref());
     engine.init_ui().expect("initialize UI");
+    // Headless sets auto_confirm=true in Engine::build; Console does not.
+    // The probe relies on it: dialogs/menus/script waits skip input instead of
+    // blocking forever (outer Pilot only presses keys between start_frame
+    // calls, not inside nested wait_for_key / dialog_wait_for_key loops).
+    // Without this, --console freezes on the first "press confirm" dialog
+    // (e.g. 李大娘's scolding at game start).
+    engine.ui.auto_confirm = true;
     let mut recorder = std::env::var("RUSTPAL_AUTOPLAY_VIDEO")
         .ok()
         .map(|output| start_video_recorder(&mut engine, output));
