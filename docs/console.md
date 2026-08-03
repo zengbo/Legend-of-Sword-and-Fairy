@@ -115,6 +115,11 @@ cargo run --release --example autoplay -- record --console /tmp/ap 60
 # Same, and also expose the HTTP control API for a second client
 RUSTPAL_UI_DRIVER=127.0.0.1:8765 \
   cargo run --release --example autoplay -- record --console=kitty /tmp/ap 60
+
+# Whole-game route probe, watched in the terminal (realtime; no video file)
+cargo run --release --example fullgame_autoplay -- --console
+cargo run --release --example fullgame_autoplay -- --console=kitty
+# logs → recordings/fullgame-autoplay.log  (default when watching)
 ```
 
 Feature flags (`Cargo.toml`):

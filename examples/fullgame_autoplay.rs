@@ -1,12 +1,23 @@
-//! Autonomous, headless whole-game route probe.
+//! Autonomous whole-game route probe (headless by default).
 //!
 //! This harness starts a genuine new game, visits active scene triggers using
 //! the engine's collision map, confirms menus/dialogue, and auto-battles.  It
 //! is intentionally separate from the normal binary: its first job is to
 //! discover and validate a route all the way to the ending before the same
 //! decisions are used by the recorder.
+//!
+//! Watch the probe in a terminal (realtime pacing, no video file unless set):
+//!
+//! ```text
+//! cargo run --release --example fullgame_autoplay -- --console
+//! cargo run --release --example fullgame_autoplay -- --console=kitty
+//! ```
+//!
+//! Headless (default) still uses `RUSTPAL_HEADLESS_TIME_SCALE=100` for speed.
+//! Optional video: `RUSTPAL_AUTOPLAY_VIDEO=/path/out.mp4`.
+//! Resume: `RUSTPAL_AUTOPLAY_RESUME=path.rpg`.
 
-use rustpal::game_loop::Engine;
+use rustpal::game_loop::{Engine, FRAME_TIME};
 use rustpal::global::{
     seed_random, EventObject, ITEMFLAG_USABLE, LOAD_PLAYER_SPRITE, LOAD_SCENE, MAX_PLAYER_ROLES,
 };
@@ -1738,12 +1749,112 @@ fn finish_video_recorder(engine: &mut Engine, mut recorder: VideoRecorder) {
     );
 }
 
+/// Pull `--console` / `--console=MODE` / `--console-scale=N` out of argv.
+fn take_console_flags(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut console: Option<String> = None;
+    let mut rest = Vec::new();
+    for argument in args {
+        match argument.as_str() {
+            "--console" => console = Some("auto".into()),
+            "--console=kitty" => console = Some("kitty".into()),
+            "--console=ansi" => console = Some("ansi".into()),
+            other if other.starts_with("--console-scale=") => {
+                if let Some(n) = other.strip_prefix("--console-scale=") {
+                    std::env::set_var("RUSTPAL_CONSOLE_SCALE", n);
+                }
+            }
+            other if other.starts_with("--console=") => {
+                let mode = other.trim_start_matches("--console=");
+                console = Some(if mode.is_empty() {
+                    "auto".into()
+                } else {
+                    mode.to_string()
+                });
+            }
+            "--help" | "-h" => {
+                eprintln!(
+                    "Usage: fullgame_autoplay [options]\n\n\
+                     (default)              Headless probe, time scale ×100\n\
+                     --console              Watch in terminal (realtime)\n\
+                     --console=kitty|ansi   Force terminal graphics mode\n\
+                     --console-scale=N      Kitty width / ANSI scale\n\n\
+                     Env:\n\
+                       RUSTPAL_AUTOPLAY_VIDEO=path.mp4   optional ffmpeg capture\n\
+                       RUSTPAL_AUTOPLAY_RESUME=path.rpg   resume checkpoint\n\
+                       RUSTPAL_CONSOLE_LOG=path           stderr while on alt screen\n\
+                       RUSTPAL_UI_DRIVER=127.0.0.1:8765   HTTP control + frame API"
+                );
+                std::process::exit(0);
+            }
+            other => rest.push(other.to_string()),
+        }
+    }
+    if console.is_none() {
+        if std::env::var_os("RUSTPAL_CONSOLE").is_some() {
+            let mode = std::env::var("RUSTPAL_CONSOLE_MODE").unwrap_or_else(|_| "auto".into());
+            console = Some(mode);
+        }
+    }
+    if !rest.is_empty() {
+        eprintln!(
+            "fullgame_autoplay: ignoring unknown args {rest:?} (try --help)"
+        );
+    }
+    (console, rest)
+}
+
+fn open_engine(console_mode: Option<&str>) -> Engine {
+    match console_mode {
+        Some(mode) => {
+            #[cfg(feature = "console")]
+            {
+                std::env::set_var("RUSTPAL_CONSOLE", "1");
+                std::env::set_var("RUSTPAL_CONSOLE_MODE", mode);
+                std::env::set_var("RUSTPAL_DISABLE_AUDIO", "1");
+                Engine::with_backend(rustpal::game_loop::VideoBackend::Console)
+                    .expect("console engine")
+            }
+            #[cfg(not(feature = "console"))]
+            {
+                let _ = mode;
+                panic!("fullgame_autoplay --console requires the `console` feature");
+            }
+        }
+        None => Engine::new(true).expect("headless engine"),
+    }
+}
+
 fn main() {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let (console, _rest) = take_console_flags(&raw);
+    let console_watch = console.is_some();
+
     std::env::set_var("PAL_DATA_DIR", concat!(env!("CARGO_MANIFEST_DIR"), "/pal"));
-    // Keep script timing and captured-frame timestamps in game milliseconds
-    // while completing an offscreen probe much faster than wall time.
-    std::env::set_var("RUSTPAL_HEADLESS_TIME_SCALE", "100");
-    let mut engine = Engine::new(true).expect("headless engine");
+
+    if console_watch {
+        // Realtime: Console backend uses tick_scale=1. Do not force ×100.
+        eprintln!("fullgame_autoplay: console watch (realtime pacing)");
+        if std::env::var_os("RUSTPAL_CONSOLE_LOG").is_none()
+            && std::env::var_os("RUSTPAL_CONSOLE_VERBOSE").is_none()
+        {
+            std::fs::create_dir_all("recordings").ok();
+            let log_path = "recordings/fullgame-autoplay.log";
+            std::env::set_var("RUSTPAL_CONSOLE_LOG", log_path);
+            eprintln!("fullgame_autoplay: probe logs → {log_path}");
+        }
+    } else {
+        // Keep script timing in game ms while the offscreen probe runs much
+        // faster than wall time (only applies to Headless backend).
+        if std::env::var_os("RUSTPAL_HEADLESS_TIME_SCALE").is_none() {
+            std::env::set_var("RUSTPAL_HEADLESS_TIME_SCALE", "100");
+        }
+        eprintln!(
+            "fullgame_autoplay: headless probe (time scale ×{})",
+            std::env::var("RUSTPAL_HEADLESS_TIME_SCALE").unwrap_or_else(|_| "1".into())
+        );
+    }
+
+    let mut engine = open_engine(console.as_deref());
     engine.init_ui().expect("initialize UI");
     let mut recorder = std::env::var("RUSTPAL_AUTOPLAY_VIDEO")
         .ok()
@@ -1794,7 +1905,18 @@ fn main() {
     let mut pilot = Pilot::new(&engine);
     let mut iterations = 0u64;
     let mut logged_battles = 0usize;
+    // Pace like PAL_GameMain when watching so present() is not skipped for
+    // thousands of logical frames between terminal refreshes.
+    let mut next_frame_at = engine.ticks();
     while !engine.quit_requested && iterations < MAX_FRAMES {
+        if console_watch {
+            engine.delay_until(next_frame_at);
+            next_frame_at = engine.ticks() + FRAME_TIME;
+            if engine.quit_requested {
+                break;
+            }
+        }
+
         // Match Engine::game_main: scene-change scripts set load flags, and
         // the new map/event sprites must be installed before pathfinding or
         // collision checks for the next frame.
