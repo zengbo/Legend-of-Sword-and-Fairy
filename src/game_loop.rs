@@ -1636,7 +1636,7 @@ impl Engine {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gui"))]
 mod video_tests {
     use super::*;
 

@@ -19,9 +19,16 @@ cargo build --release
 ./target/release/rustpal --console          # auto: Kitty if detected, else ANSI
 ./target/release/rustpal --console=kitty    # force Kitty graphics protocol
 ./target/release/rustpal --console=ansi     # force half-block truecolor
+./target/release/rustpal --console --console-scale=6   # force 6× (1920×1200)
+# or: RUSTPAL_CONSOLE_SCALE=6 ./target/release/rustpal --console
 ```
 
 Needs the `pal/` data directory (same as GUI).
+
+Native game resolution is **320×200**. Kitty mode used to draw 1:1 device
+pixels (postage-stamp on Retina). The console backend now **integer-upscales**
+(nearest-neighbor) to fit the terminal (or `RUSTPAL_CONSOLE_SCALE` / `--console-scale=N`).
+Banner line shows the effective scale, e.g. `4× → 1280×800`.
 
 ### Controls
 

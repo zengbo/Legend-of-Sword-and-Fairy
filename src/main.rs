@@ -36,6 +36,10 @@ fn main() {
                     return;
                 }
                 other => {
+                    if let Some(n) = other.strip_prefix("--console-scale=") {
+                        std::env::set_var("RUSTPAL_CONSOLE_SCALE", n);
+                        continue;
+                    }
                     #[cfg(feature = "gui")]
                     if let Some(bind) = other.strip_prefix("--ui-driver=") {
                         ui_driver = Some(bind.to_owned());
@@ -98,6 +102,7 @@ fn print_help() {
          --console           Terminal video (Kitty pixels or ANSI half-blocks)\n\
          --console=kitty     Force Kitty graphics protocol\n\
          --console=ansi      Force ANSI half-block rendering\n\
+         --console-scale=N   Integer upscale (1–16); default auto-fits the terminal\n\
          --offscreen         GUI: render without a visible window\n\
          --mute              Disable music and sound effects"
     );

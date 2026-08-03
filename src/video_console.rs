@@ -37,7 +37,11 @@ pub enum ConsoleMode {
 
 pub struct ConsoleVideo {
     use_kitty: bool,
+    /// Integer nearest-neighbor scale (1 = native 320×200). Auto-fit by default.
+    scale: u32,
     rgba: Vec<u8>,
+    /// Upscaled RGBA when scale > 1 (reused each frame).
+    scaled: Vec<u8>,
     last_present: Instant,
     close_requested: bool,
     #[cfg(unix)]
@@ -55,6 +59,7 @@ impl ConsoleVideo {
             ConsoleMode::Ansi => false,
             ConsoleMode::Auto => detect_kitty(),
         };
+        let scale = resolve_scale(use_kitty);
 
         #[cfg(unix)]
         let orig_termios = Some(enter_raw_mode()?);
@@ -67,15 +72,20 @@ impl ConsoleVideo {
         } else {
             "ANSI half-block"
         };
+        let dw = SCREEN_W as u32 * scale;
+        let dh = SCREEN_H as u32 * scale;
         writeln!(
             out,
-            "\x1b[36mrustpal console ({label}) — arrows/hjkl move · Enter confirm · Esc menu · Ctrl-C quit\x1b[0m"
+            "\x1b[36mrustpal console ({label} · {scale}× → {dw}×{dh}) — arrows/hjkl · Enter · Esc · Ctrl-C · RUSTPAL_CONSOLE_SCALE=N\x1b[0m"
         )?;
         out.flush()?;
 
+        let scaled_len = (SCREEN_W * SCREEN_H * 4) * (scale as usize) * (scale as usize);
         Ok(ConsoleVideo {
             use_kitty,
+            scale,
             rgba: vec![0; SCREEN_W * SCREEN_H * 4],
+            scaled: vec![0; scaled_len],
             last_present: Instant::now() - MIN_FRAME_INTERVAL,
             close_requested: false,
             #[cfg(unix)]
@@ -117,21 +127,31 @@ impl ConsoleVideo {
         self.last_present = now;
         render_rgba(surf, palette, shake, &mut self.rgba);
 
+        let (fw, fh, frame) = if self.scale <= 1 {
+            (SCREEN_W as u32, SCREEN_H as u32, self.rgba.as_slice())
+        } else {
+            nearest_upscale(
+                &self.rgba,
+                SCREEN_W,
+                SCREEN_H,
+                self.scale,
+                &mut self.scaled,
+            );
+            (
+                SCREEN_W as u32 * self.scale,
+                SCREEN_H as u32 * self.scale,
+                self.scaled.as_slice(),
+            )
+        };
+
         let mut out = io::stdout();
         let _ = write!(out, "\x1b[H"); // cursor home
+        // Skip the banner line so the image sits at the top.
+        let _ = write!(out, "\x1b[2;1H");
         if self.use_kitty {
-            // Skip the banner line so the image sits at the top.
-            let _ = write!(out, "\x1b[2;1H");
-            let _ = write_kitty_frame(
-                &mut out,
-                IMAGE_ID,
-                SCREEN_W as u32,
-                SCREEN_H as u32,
-                &self.rgba,
-            );
+            let _ = write_kitty_frame(&mut out, IMAGE_ID, fw, fh, frame);
         } else {
-            let _ = write!(out, "\x1b[2;1H");
-            let _ = write_ansi_halfblock(&mut out, SCREEN_W, SCREEN_H, &self.rgba);
+            let _ = write_ansi_halfblock(&mut out, fw as usize, fh as usize, frame);
         }
         let _ = out.flush();
     }
@@ -288,6 +308,82 @@ fn detect_kitty() -> bool {
             .unwrap_or(false)
 }
 
+/// Integer scale for console output.
+///
+/// Order: `RUSTPAL_CONSOLE_SCALE` (1–16) → auto-fit terminal size → default 4 (Kitty) / 2 (ANSI).
+fn resolve_scale(use_kitty: bool) -> u32 {
+    if let Ok(s) = std::env::var("RUSTPAL_CONSOLE_SCALE") {
+        if let Ok(n) = s.parse::<u32>() {
+            return n.clamp(1, 16);
+        }
+    }
+    let (cols, rows) = terminal_size().unwrap_or((100, 30));
+    if use_kitty {
+        // Kitty draws 1 image pixel ≈ 1 device pixel. Cell size varies; use a
+        // conservative ~8×16 so we rarely overflow the window on Retina Macs.
+        let max_w = cols.saturating_sub(2).saturating_mul(8).max(SCREEN_W as u32);
+        let max_h = rows.saturating_sub(3).saturating_mul(16).max(SCREEN_H as u32);
+        let sx = max_w / SCREEN_W as u32;
+        let sy = max_h / SCREEN_H as u32;
+        sx.min(sy).clamp(2, 12) // at least 2× so 320×200 is not postage-stamp size
+    } else {
+        // ANSI: each source pixel is one cell wide; two pixels tall → one cell.
+        // After scale S: cells = (320S) × (100S).
+        let max_cols = cols.saturating_sub(2).max(1);
+        let max_rows = rows.saturating_sub(3).max(1);
+        let sx = max_cols / SCREEN_W as u32;
+        let sy = max_rows / ((SCREEN_H as u32) / 2);
+        sx.min(sy).clamp(1, 4).max(1)
+    }
+}
+
+fn terminal_size() -> Option<(u32, u32)> {
+    #[cfg(unix)]
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0
+            && ws.ws_col > 0
+            && ws.ws_row > 0
+        {
+            return Some((ws.ws_col as u32, ws.ws_row as u32));
+        }
+    }
+    // Fallback env (some SSH setups).
+    let cols = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse().ok())?;
+    let rows = std::env::var("LINES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    Some((cols, rows))
+}
+
+/// Nearest-neighbor integer upscale of RGBA8.
+fn nearest_upscale(src: &[u8], sw: usize, sh: usize, scale: u32, dst: &mut [u8]) {
+    let scale = scale as usize;
+    let dw = sw * scale;
+    let dh = sh * scale;
+    assert_eq!(src.len(), sw * sh * 4);
+    assert!(dst.len() >= dw * dh * 4);
+    for y in 0..sh {
+        for sy in 0..scale {
+            let dy = y * scale + sy;
+            for x in 0..sw {
+                let si = (y * sw + x) * 4;
+                let px = [src[si], src[si + 1], src[si + 2], src[si + 3]];
+                for sx in 0..scale {
+                    let di = (dy * dw + x * scale + sx) * 4;
+                    dst[di] = px[0];
+                    dst[di + 1] = px[1];
+                    dst[di + 2] = px[2];
+                    dst[di + 3] = px[3];
+                }
+            }
+        }
+    }
+}
+
 // --- Kitty graphics protocol -------------------------------------------------
 
 fn write_kitty_frame(
@@ -430,5 +526,20 @@ mod tests {
         let mut buf = vec![0x1b, b'[', b'A'];
         assert_eq!(parse_escape(&mut buf), Some(KeyCode::ArrowUp));
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn nearest_upscale_2x() {
+        // 2×2 red/blue pattern → 4×4
+        let src = [
+            255, 0, 0, 255, 0, 0, 255, 255, // row0
+            0, 255, 0, 255, 255, 255, 0, 255, // row1
+        ];
+        let mut dst = vec![0u8; 4 * 4 * 4];
+        nearest_upscale(&src, 2, 2, 2, &mut dst);
+        // top-left 2×2 block should be red
+        assert_eq!(&dst[0..4], &[255, 0, 0, 255]);
+        assert_eq!(&dst[4..8], &[255, 0, 0, 255]);
+        assert_eq!(&dst[(2 * 4) * 4..(2 * 4) * 4 + 4], &[255, 0, 0, 255]);
     }
 }
