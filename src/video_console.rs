@@ -81,6 +81,8 @@ pub struct ConsoleVideo {
     esc_solo_since: Option<Instant>,
     held: Vec<HeldKey>,
     pending: Vec<(KeyCode, bool)>,
+    /// Optional HTTP control API (`RUSTPAL_UI_DRIVER` / `--ui-driver`).
+    ui_driver: Option<crate::ui_driver::UiDriver>,
     #[cfg(unix)]
     _tty_guard: TtyRawGuard,
 }
@@ -207,6 +209,8 @@ impl ConsoleVideo {
         #[cfg(unix)]
         install_console_signal_handlers();
 
+        let ui_driver = crate::ui_driver::UiDriver::start_from_env()?;
+
         let scaled_len = if use_kitty {
             0
         } else {
@@ -233,6 +237,7 @@ impl ConsoleVideo {
             esc_solo_since: None,
             held: Vec::new(),
             pending: Vec::new(),
+            ui_driver,
             #[cfg(unix)]
             _tty_guard: tty_guard,
         })
@@ -286,7 +291,12 @@ impl ConsoleVideo {
         }
         self.held = still;
 
-        std::mem::take(&mut self.pending)
+        let mut events = std::mem::take(&mut self.pending);
+        // External scripts inject keys through the same path as the tty.
+        if let Some(driver) = self.ui_driver.as_ref() {
+            driver.drain_input(&mut events);
+        }
+        events
     }
 
     pub fn present(
@@ -295,6 +305,12 @@ impl ConsoleVideo {
         palette: &[PalColor; 256],
         shake: Option<(u16, u16)>,
     ) {
+        // Always publish the latest logical frame for HTTP clients, even when
+        // terminal output is throttled or de-duplicated.
+        if let Some(driver) = self.ui_driver.as_mut() {
+            driver.capture(surf, palette, shake);
+        }
+
         let now = Instant::now();
         if now.duration_since(self.last_present) < self.frame_interval() {
             return;

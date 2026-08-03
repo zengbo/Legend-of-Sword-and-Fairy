@@ -13,8 +13,9 @@ default = ["gui", "console"]
 # (pkg-config, libasound, X11/Wayland, …).
 gui = ["dep:winit", "dep:pixels", "dep:cpal", "dep:pollster", "dep:png"]
 # Pure terminal backend: no window, no sound device. Builds with only crates.io
-# deps (see --no-default-features --features console).
-console = ["dep:base64", "dep:miniz_oxide", "dep:libc"]
+# deps (see --no-default-features --features console). `png` is pure Rust and
+# only needed for the optional HTTP UI driver (`--ui-driver`).
+console = ["dep:base64", "dep:miniz_oxide", "dep:libc", "dep:png"]
 
 [dependencies]
 web-time = "1"

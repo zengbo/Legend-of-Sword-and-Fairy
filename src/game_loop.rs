@@ -268,16 +268,7 @@ impl GuiVideo {
     pub fn new() -> io::Result<GuiVideo> {
         let event_loop =
             EventLoop::new().map_err(|e| io::Error::other(format!("winit event loop: {e}")))?;
-        let ui_driver = match std::env::var("RUSTPAL_UI_DRIVER") {
-            Ok(bind) => Some(crate::ui_driver::UiDriver::start(&bind)?),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(error) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("invalid RUSTPAL_UI_DRIVER: {error}"),
-                ))
-            }
-        };
+        let ui_driver = crate::ui_driver::UiDriver::start_from_env()?;
         Ok(GuiVideo {
             event_loop,
             app: VideoApp {

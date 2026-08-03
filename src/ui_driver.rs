@@ -1,8 +1,9 @@
 //! Opt-in local HTTP driver for controlling and observing the native game.
 //!
 //! The server deliberately accepts loopback addresses only. It feeds key
-//! transitions into the same queue as winit and captures the logical 320x200
-//! RGBA frame presented by the engine.
+//! transitions into the same queue as the active video backend (GUI window or
+//! console) and captures the logical 320×200 RGBA frame presented by the
+//! engine.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -36,6 +37,18 @@ pub(crate) struct UiDriver {
 }
 
 impl UiDriver {
+    /// Start from `RUSTPAL_UI_DRIVER` when set; otherwise `Ok(None)`.
+    pub(crate) fn start_from_env() -> io::Result<Option<Self>> {
+        match std::env::var("RUSTPAL_UI_DRIVER") {
+            Ok(bind) => Ok(Some(Self::start(&bind)?)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid RUSTPAL_UI_DRIVER: {error}"),
+            )),
+        }
+    }
+
     pub(crate) fn start(bind: &str) -> io::Result<Self> {
         let bind = if matches!(bind, "" | "1" | "true") {
             DEFAULT_BIND

@@ -25,6 +25,12 @@ cargo build --release
 # Show FPS on the top status line (displayed frames / wall time, ~0.5s window)
 RUSTPAL_CONSOLE_FPS=1 ./target/release/rustpal --console=kitty
 # alias: RUSTPAL_SHOW_FPS=1
+
+# Terminal video + external script control (HTTP on loopback)
+./target/release/rustpal --console --ui-driver
+./target/release/rustpal --console=kitty --ui-driver=127.0.0.1:8765
+# Then from another shell: curl -X POST http://127.0.0.1:8765/v1/input/confirm/tap
+# Full API: docs/autoplay.md
 ```
 
 Needs the `pal/` data directory (same as GUI).
@@ -89,9 +95,21 @@ columns × 100 rows of cells — zoom the font or use a large window.
 Engine (unchanged game logic)
   → VideoBackend::Console
   → ConsoleVideo
-       pump()    → raw stdin → KeyCode
-       present() → render_rgba → Kitty or ANSI → stdout
-  → audio = None
+       pump()    → tty keys + optional UiDriver HTTP input
+       present() → UiDriver frame capture (if --ui-driver)
+                 → render_rgba → Kitty or ANSI → stdout
+  → audio = None  (optional offline mixer only in tools)
+```
+
+### Built-in pilot + recording
+
+```shell
+# Watch the synthetic pilot in the terminal while dumping frames/audio
+cargo run --release --example autoplay -- record --console /tmp/ap 60
+
+# Same, and also expose the HTTP control API for a second client
+RUSTPAL_UI_DRIVER=127.0.0.1:8765 \
+  cargo run --release --example autoplay -- record --console=kitty /tmp/ap 60
 ```
 
 Feature flags (`Cargo.toml`):

@@ -8,12 +8,12 @@ fn main() {
         let mut mute = false;
         let mut console = false;
         let mut console_mode = "auto";
-        #[cfg(feature = "gui")]
+        #[cfg(any(feature = "gui", feature = "console"))]
         let mut ui_driver = None::<String>;
 
         for argument in std::env::args().skip(1) {
             match argument.as_str() {
-                #[cfg(feature = "gui")]
+                #[cfg(any(feature = "gui", feature = "console"))]
                 "--ui-driver" => {
                     ui_driver = Some(rustpal::ui_driver::DEFAULT_BIND.to_owned());
                 }
@@ -40,7 +40,7 @@ fn main() {
                         std::env::set_var("RUSTPAL_CONSOLE_SCALE", n);
                         continue;
                     }
-                    #[cfg(feature = "gui")]
+                    #[cfg(any(feature = "gui", feature = "console"))]
                     if let Some(bind) = other.strip_prefix("--ui-driver=") {
                         ui_driver = Some(bind.to_owned());
                         continue;
@@ -51,7 +51,7 @@ fn main() {
             }
         }
 
-        #[cfg(feature = "gui")]
+        #[cfg(any(feature = "gui", feature = "console"))]
         if let Some(bind) = ui_driver {
             std::env::set_var("RUSTPAL_UI_DRIVER", bind);
         }
@@ -111,15 +111,23 @@ fn print_help() {
            RUSTPAL_CONSOLE_SYNC=0  Disable CSI 2026 sync (SSH)\n\
            RUSTPAL_CONSOLE_SCALE=N Same as --console-scale"
     );
-    #[cfg(feature = "gui")]
+    // ui_driver is native + (gui|console); keep the same gate as lib.rs so
+    // `cargo build --target wasm32-unknown-unknown` (default features) works.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(feature = "gui", feature = "console")
+    ))]
     println!(
-        "--ui-driver         Enable local control API at {}\n\
-         --ui-driver=ADDR    Enable it at a loopback IP and port",
+        "\n--ui-driver         Enable local control API at {}\n\
+         --ui-driver=ADDR    Enable it at a loopback IP and port\n\
+                           Works with GUI, --offscreen, or --console\n\
+                           (see docs/autoplay.md)",
         rustpal::ui_driver::DEFAULT_BIND
     );
     println!(
         "\nConsole-only (no system GUI/audio libs):\n\
          cargo build --release --no-default-features --features console\n\
-         ./target/release/rustpal --console"
+         ./target/release/rustpal --console\n\
+         ./target/release/rustpal --console --ui-driver"
     );
 }

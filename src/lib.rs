@@ -28,7 +28,11 @@ pub mod script;
 pub mod surface;
 pub mod text;
 pub mod ui;
-#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
+// HTTP control API for GUI and/or console (needs `png` via either feature).
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "gui", feature = "console")
+))]
 pub mod ui_driver;
 pub mod uibattle;
 pub mod uigame;

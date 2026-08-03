@@ -1,16 +1,28 @@
-# Offscreen Autoplay
+# Offscreen / Console Autoplay
 
-The native game exposes an opt-in HTTP interface for automation. It can run
-without a visible window or audio while continuing to render frames for an
-autoplay client:
+The native game exposes an opt-in HTTP interface for automation. Frames and
+input use the same engine path as a real keyboard; you can watch on a GUI
+window, headlessly, or in the **terminal console**.
 
 ```shell
+# GUI offscreen (no window) + HTTP
 cargo run --release -- --ui-driver --offscreen
+
+# Terminal video + HTTP (watch in Kitty/ANSI while a script presses keys)
+cargo run --release -- --console --ui-driver
+cargo run --release -- --console=kitty --ui-driver=127.0.0.1:8765
+
+# Built-in pilot example, visible in the terminal
+cargo run --release --example autoplay -- record --console /tmp/ap 60
 ```
 
 The default endpoint is `http://127.0.0.1:8765`. Use
 `--ui-driver=127.0.0.1:PORT` to select another loopback port. Non-loopback
 addresses are rejected.
+
+`--ui-driver` works with **GUI**, **`--offscreen`**, and **`--console`**. On
+console, logical 320×200 frames are still published to `/v1/frame.png` even
+when terminal redraw is throttled.
 
 ## Interface
 

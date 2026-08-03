@@ -25,19 +25,32 @@
 //!     and muxes 1280x800 H.264 with the audio.
 //!
 //! Usage:
-//!   autoplay record <dir> [seconds]   record only
+//!   autoplay record <dir> [seconds]   record only (headless)
 //!   autoplay encode <dir> [fps]       encode a previous recording
 //!   autoplay <dir> [seconds] [fps]    both
+//!
+//! Watch in the terminal while recording (or recording+encode):
+//!   autoplay record --console <dir> [seconds]
+//!   autoplay record --console=kitty <dir> [seconds]
+//!   autoplay --console <dir> [seconds] [fps]
+//!
+//! Optional HTTP control while console is up (same as the main binary):
+//!   RUSTPAL_UI_DRIVER=127.0.0.1:8765 autoplay record --console <dir> [seconds]
 
 use rustpal::audio::Mixer;
 use rustpal::game_loop::Engine;
 use rustpal::global::seed_random;
+#[cfg(feature = "gui")]
 use rustpal::native_upscale::offline::{
     OfflineUpscaler, INPUT_SIZE, OUTPUT_HEIGHT, OUTPUT_SIZE, OUTPUT_WIDTH,
 };
+#[cfg(feature = "gui")]
 use rustpal::surface::{SCREEN_H, SCREEN_W};
 use std::collections::HashMap;
-use std::io::{BufRead, Read, Write};
+#[cfg(feature = "gui")]
+use std::io::{BufRead, Read};
+use std::io::Write;
+#[cfg(feature = "gui")]
 use std::process::{Command, Stdio};
 use rustpal::keys::KeyCode;
 
@@ -45,6 +58,7 @@ const AUDIO_RATE: u32 = 44100;
 
 /// The encoder reads `frames.rgba` in `INPUT_SIZE` strides, which only lines up
 /// with what `frame_sink` wrote while the upscaler's input is the screen.
+#[cfg(feature = "gui")]
 const _: () = assert!(INPUT_SIZE == SCREEN_W * SCREEN_H * 4);
 
 /// Hands off the keyboard for the first stretch, so the recording opens with
@@ -383,10 +397,13 @@ struct Paths {
     /// Headerless s16le stereo PCM at `AUDIO_RATE`.
     audio: String,
     /// Upscaled H.264, before the audio is muxed in.
+    #[cfg(feature = "gui")]
     video: String,
     /// The finished file.
+    #[cfg(feature = "gui")]
     out: String,
     /// Both ffmpeg passes' stderr, so a failed encode is diagnosable.
+    #[cfg(feature = "gui")]
     log: String,
 }
 
@@ -397,14 +414,18 @@ impl Paths {
             frames: format!("{dir}/frames.rgba"),
             times: format!("{dir}/times.txt"),
             audio: format!("{dir}/audio.pcm"),
+            #[cfg(feature = "gui")]
             video: format!("{dir}/video.mp4"),
+            #[cfg(feature = "gui")]
             out: format!("{dir}/autoplay.mp4"),
+            #[cfg(feature = "gui")]
             log: format!("{dir}/ffmpeg.log"),
         }
     }
 
     /// Append-mode handle on the ffmpeg log, so the second pass does not
     /// clobber the first pass's diagnostics.
+    #[cfg(feature = "gui")]
     fn log_file(&self, truncate: bool) -> std::fs::File {
         std::fs::OpenOptions::new()
             .create(true)
@@ -419,7 +440,12 @@ impl Paths {
 /// Play the game for `seconds` of wall clock, dumping raw frames, their ticks
 /// and the audio.  Deliberately cheap per frame: whatever this loop spends is
 /// spent against the engine's own real-time deadlines.
-fn record(paths: &Paths, seconds: u64) {
+///
+/// `console_mode`: `None` = headless (default). `Some("auto"|"kitty"|"ansi")`
+/// opens the terminal video backend so you can watch the pilot play. When the
+/// `RUSTPAL_UI_DRIVER` env var is set, the console backend also starts the
+/// HTTP control API (same as `rustpal --console --ui-driver`).
+fn record(paths: &Paths, seconds: u64, console_mode: Option<&str>) {
     let mut frames = std::io::BufWriter::with_capacity(
         1 << 22,
         std::fs::File::create(&paths.frames).expect("frames file"),
@@ -432,9 +458,28 @@ fn record(paths: &Paths, seconds: u64) {
     );
 
     seed_random(19950710);
-    let mut e = Engine::new(true).expect("engine");
+    let mut e = match console_mode {
+        Some(mode) => {
+            #[cfg(feature = "console")]
+            {
+                std::env::set_var("RUSTPAL_CONSOLE", "1");
+                std::env::set_var("RUSTPAL_CONSOLE_MODE", mode);
+                // Match main binary: console never opens a sound device.
+                std::env::set_var("RUSTPAL_DISABLE_AUDIO", "1");
+                Engine::with_backend(rustpal::game_loop::VideoBackend::Console)
+                    .expect("console engine")
+            }
+            #[cfg(not(feature = "console"))]
+            {
+                let _ = mode;
+                panic!("autoplay --console requires the `console` feature");
+            }
+        }
+        None => Engine::new(true).expect("engine"),
+    };
     // A recording is a performance, not a test: no headless escape hatches.
     // Dialogs wait for their key, menus wait for their key, the pilot presses.
+    // (Headless sets auto_confirm=true in Engine::build; clear it always.)
     e.ui.auto_confirm = false;
     e.demo_pilot = Some(0);
 
@@ -464,7 +509,14 @@ fn record(paths: &Paths, seconds: u64) {
         move |e: &mut Engine| pilot.step(e)
     }));
 
-    eprintln!("recording {seconds}s of autoplay into {}/ ...", paths.dir);
+    if console_mode.is_some() {
+        eprintln!(
+            "recording {seconds}s of autoplay into {}/ (console video on) ...",
+            paths.dir
+        );
+    } else {
+        eprintln!("recording {seconds}s of autoplay into {}/ ...", paths.dir);
+    }
     e.run();
 
     // Dropping the sinks flushes and closes their files.
@@ -473,7 +525,45 @@ fn record(paths: &Paths, seconds: u64) {
     e.audio = None;
 }
 
+/// Pull `--console` / `--console=MODE` / `--console-scale=N` out of argv.
+/// Remaining args keep their original order for record/encode parsing.
+fn take_console_flags(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut console: Option<String> = None;
+    let mut rest = Vec::new();
+    for argument in args {
+        match argument.as_str() {
+            "--console" => console = Some("auto".into()),
+            "--console=kitty" => console = Some("kitty".into()),
+            "--console=ansi" => console = Some("ansi".into()),
+            other if other.starts_with("--console-scale=") => {
+                if let Some(n) = other.strip_prefix("--console-scale=") {
+                    std::env::set_var("RUSTPAL_CONSOLE_SCALE", n);
+                }
+            }
+            other if other.starts_with("--console=") => {
+                let mode = other.trim_start_matches("--console=");
+                console = Some(if mode.is_empty() {
+                    "auto".into()
+                } else {
+                    mode.to_string()
+                });
+            }
+            other => rest.push(other.to_string()),
+        }
+    }
+    // Env fallback when no flag was given (mirrors main binary).
+    if console.is_none() {
+        if std::env::var_os("RUSTPAL_CONSOLE").is_some() {
+            let mode = std::env::var("RUSTPAL_CONSOLE_MODE").unwrap_or_else(|_| "auto".into());
+            console = Some(mode);
+        }
+    }
+    (console, rest)
+}
+
 /// Turn a recording into `autoplay.mp4`: upscale, resample to `fps`, mux.
+/// Requires the `gui` feature (neural offline upscaler + ffmpeg).
+#[cfg(feature = "gui")]
 fn encode(paths: &Paths, fps: u64) {
     let ticks: Vec<u64> = std::io::BufReader::new(
         std::fs::File::open(&paths.times).expect("times.txt (record first?)"),
@@ -624,8 +714,20 @@ fn encode(paths: &Paths, fps: u64) {
     );
 }
 
+#[cfg(not(feature = "gui"))]
+fn encode(_paths: &Paths, _fps: u64) {
+    eprintln!(
+        "autoplay: encode requires the `gui` feature (neural upscaler).\n\
+         Record with: cargo run --release --no-default-features --features console \\\n\
+                      --example autoplay -- record --console <dir> [seconds]\n\
+         Encode later with a full (gui) build."
+    );
+    std::process::exit(2);
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let (console, args) = take_console_flags(&raw);
     let arg = |i: usize| args.get(i).map(String::as_str);
     let num = |i: usize, default: u64| arg(i).and_then(|s| s.parse().ok()).unwrap_or(default);
 
@@ -636,10 +738,14 @@ fn main() {
         None => (true, true, ".", 300, 30),
     };
 
+    if console.is_some() && !do_record {
+        eprintln!("autoplay: --console only applies to record (encode is offline)");
+    }
+
     std::fs::create_dir_all(dir).expect("mkdir");
     let paths = Paths::new(dir);
     if do_record {
-        record(&paths, seconds);
+        record(&paths, seconds, console.as_deref());
     }
     if do_encode {
         encode(&paths, fps);
