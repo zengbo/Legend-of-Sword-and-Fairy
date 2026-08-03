@@ -40,6 +40,16 @@ Banner line shows the effective scale, e.g. `4× → 1280×800`.
 | R A D E W Q F S | Battle shortcuts (same as GUI) |
 | Ctrl-C | Quit |
 
+Keys are held for ~150 ms in engine time (OS key-repeat extends this) so the
+game sees a real press; earlier builds released in the same frame and menus
+ignored input.
+
+### Flicker
+
+Presents use the terminal **synchronized output** mode (`CSI ? 2026 h/l`) and
+only retransmit when the 320×200 frame changes. Kitty placement is set once;
+later frames replace the same image id without moving the cursor.
+
 ### Kitty mode
 
 Uses the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)

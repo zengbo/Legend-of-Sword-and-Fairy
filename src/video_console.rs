@@ -7,8 +7,8 @@
 //!   * **ANSI half-block fallback** — truecolor `▄` cells for ordinary terminals.
 //!
 //! Input: raw stdin (termios on Unix), mapped to engine `KeyCode`s. Terminals
-//! only deliver "press" events, so each press is immediately followed by a
-//! synthetic release so `InputState` does not stick.
+//! only deliver "press" events; we keep keys held for a short window (and extend
+//! on OS key-repeat) so `InputState::update_keyboard_state` can see them.
 
 use std::io::{self, Write};
 #[cfg(not(unix))]
@@ -24,8 +24,11 @@ use crate::surface::{Surface, SCREEN_H, SCREEN_W};
 
 const KITTY_CHUNK: usize = 4096;
 const IMAGE_ID: u32 = 1;
-/// Cap present rate so SSH / slow terminals stay usable (~20 fps).
-const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(50);
+/// Cap present rate so SSH / slow terminals stay usable (~15 fps).
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(66);
+/// How long a terminal key stays "held" for the engine (ms). OS key-repeat
+/// extends this, so holding a key keeps walking.
+const KEY_HOLD: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleMode {
@@ -35,6 +38,12 @@ pub enum ConsoleMode {
     Ansi,
 }
 
+struct HeldKey {
+    code: KeyCode,
+    /// Release after this instant unless extended by another press.
+    until: Instant,
+}
+
 pub struct ConsoleVideo {
     use_kitty: bool,
     /// Integer nearest-neighbor scale (1 = native 320×200). Auto-fit by default.
@@ -42,13 +51,21 @@ pub struct ConsoleVideo {
     rgba: Vec<u8>,
     /// Upscaled RGBA when scale > 1 (reused each frame).
     scaled: Vec<u8>,
+    /// Previous source frame for skip-if-identical.
+    prev_rgba: Vec<u8>,
     last_present: Instant,
     close_requested: bool,
+    /// First Kitty frame places the image; later frames only replace payload.
+    kitty_placed: bool,
     #[cfg(unix)]
     orig_termios: Option<libc::termios>,
     /// Incomplete CSI sequence bytes.
     esc_buf: Vec<u8>,
-    /// Synthetic (key, pressed) events waiting to be returned from `pump`.
+    /// When we last saw a lone Esc (for delayed bare-Esc recognition).
+    esc_solo_since: Option<Instant>,
+    /// Keys currently held for the engine, with release deadlines.
+    held: Vec<HeldKey>,
+    /// Events generated this pump (press/release transitions).
     pending: Vec<(KeyCode, bool)>,
 }
 
@@ -65,8 +82,10 @@ impl ConsoleVideo {
         let orig_termios = Some(enter_raw_mode()?);
 
         let mut out = io::stdout();
-        // Alternate screen buffer, hide cursor, clear.
+        // Alternate screen, hide cursor, clear once.
         write!(out, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
+        // Enable synchronized output if the terminal supports it (reduces tear).
+        write!(out, "\x1b[?2026h")?;
         let label = if use_kitty {
             "Kitty pixels"
         } else {
@@ -76,8 +95,9 @@ impl ConsoleVideo {
         let dh = SCREEN_H as u32 * scale;
         writeln!(
             out,
-            "\x1b[36mrustpal console ({label} · {scale}× → {dw}×{dh}) — arrows/hjkl · Enter · Esc · Ctrl-C · RUSTPAL_CONSOLE_SCALE=N\x1b[0m"
+            "\x1b[36mrustpal console ({label} · {scale}× → {dw}×{dh}) — arrows/hjkl · Enter · Esc · Ctrl-C · --console-scale=N\x1b[0m"
         )?;
+        write!(out, "\x1b[?2026l")?;
         out.flush()?;
 
         let scaled_len = (SCREEN_W * SCREEN_H * 4) * (scale as usize) * (scale as usize);
@@ -86,31 +106,60 @@ impl ConsoleVideo {
             scale,
             rgba: vec![0; SCREEN_W * SCREEN_H * 4],
             scaled: vec![0; scaled_len],
+            prev_rgba: Vec::new(),
             last_present: Instant::now() - MIN_FRAME_INTERVAL,
             close_requested: false,
+            kitty_placed: false,
             #[cfg(unix)]
             orig_termios,
             esc_buf: Vec::new(),
+            esc_solo_since: None,
+            held: Vec::new(),
             pending: Vec::new(),
         })
     }
 
     pub fn pump(&mut self) -> Vec<(KeyCode, bool)> {
-        // Drain stdin (non-blocking).
+        let now = Instant::now();
+
+        // 1) Drain stdin (non-blocking).
         loop {
             let mut byte = [0u8; 1];
             match read_stdin_nonblock(&mut byte) {
                 Ok(0) => break,
-                Ok(_) => self.feed_byte(byte[0]),
+                Ok(_) => self.feed_byte(byte[0], now),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
         }
-        // Bare Esc (no CSI follow-up yet) → menu key.
+
+        // 2) Bare Esc: if we only got 0x1b and nothing followed within ~40ms,
+        //    treat it as Escape (arrow keys send CSI quickly after Esc).
         if self.esc_buf == [0x1b] {
-            self.esc_buf.clear();
-            self.push_tap(KeyCode::Escape);
+            match self.esc_solo_since {
+                None => self.esc_solo_since = Some(now),
+                Some(t) if now.duration_since(t) >= Duration::from_millis(40) => {
+                    self.esc_buf.clear();
+                    self.esc_solo_since = None;
+                    self.note_press(KeyCode::Escape, now);
+                }
+                Some(_) => {}
+            }
+        } else {
+            self.esc_solo_since = None;
         }
+
+        // 3) Expire held keys → synthetic releases.
+        let mut still = Vec::with_capacity(self.held.len());
+        for h in self.held.drain(..) {
+            if now >= h.until {
+                self.pending.push((h.code, false));
+            } else {
+                still.push(h);
+            }
+        }
+        self.held = still;
+
         std::mem::take(&mut self.pending)
     }
 
@@ -124,8 +173,15 @@ impl ConsoleVideo {
         if now.duration_since(self.last_present) < MIN_FRAME_INTERVAL {
             return;
         }
-        self.last_present = now;
+
         render_rgba(surf, palette, shake, &mut self.rgba);
+
+        // Skip transmit if the logical frame did not change (menus idle).
+        if self.prev_rgba == self.rgba {
+            return;
+        }
+        self.prev_rgba.clone_from(&self.rgba);
+        self.last_present = now;
 
         let (fw, fh, frame) = if self.scale <= 1 {
             (SCREEN_W as u32, SCREEN_H as u32, self.rgba.as_slice())
@@ -145,14 +201,23 @@ impl ConsoleVideo {
         };
 
         let mut out = io::stdout();
-        let _ = write!(out, "\x1b[H"); // cursor home
-        // Skip the banner line so the image sits at the top.
-        let _ = write!(out, "\x1b[2;1H");
+        // Synchronized update: terminal shows the finished frame at once.
+        let _ = write!(out, "\x1b[?2026h");
+
         if self.use_kitty {
+            if !self.kitty_placed {
+                // Place once under the banner; later frames only replace image data.
+                let _ = write!(out, "\x1b[2;1H");
+                self.kitty_placed = true;
+            }
             let _ = write_kitty_frame(&mut out, IMAGE_ID, fw, fh, frame);
         } else {
+            // ANSI: redraw from row 2 (leave banner). Home without full clear.
+            let _ = write!(out, "\x1b[2;1H");
             let _ = write_ansi_halfblock(&mut out, fw as usize, fh as usize, frame);
         }
+
+        let _ = write!(out, "\x1b[?2026l");
         let _ = out.flush();
     }
 
@@ -169,7 +234,7 @@ impl ConsoleVideo {
 
     pub fn disable_enhanced_background(&mut self) {}
 
-    fn feed_byte(&mut self, b: u8) {
+    fn feed_byte(&mut self, b: u8, now: Instant) {
         if b == 0x03 || b == 0x04 {
             // Ctrl-C / Ctrl-D
             self.close_requested = true;
@@ -177,27 +242,43 @@ impl ConsoleVideo {
         }
         if !self.esc_buf.is_empty() || b == 0x1b {
             self.esc_buf.push(b);
+            self.esc_solo_since = if self.esc_buf == [0x1b] {
+                Some(now)
+            } else {
+                None
+            };
             if let Some(code) = parse_escape(&mut self.esc_buf) {
-                self.push_tap(code);
+                self.esc_solo_since = None;
+                self.note_press(code, now);
             }
             return;
         }
         if let Some(code) = map_ascii(b) {
-            self.push_tap(code);
+            self.note_press(code, now);
         }
     }
 
-    fn push_tap(&mut self, code: KeyCode) {
+    /// Record a key press for the engine. If already held, only extend the
+    /// hold timer (OS key-repeat). Otherwise emit a press event.
+    fn note_press(&mut self, code: KeyCode, now: Instant) {
+        let until = now + KEY_HOLD;
+        if let Some(h) = self.held.iter_mut().find(|h| h.code == code) {
+            h.until = until;
+            return;
+        }
+        self.held.push(HeldKey { code, until });
         self.pending.push((code, true));
-        self.pending.push((code, false));
     }
 }
 
 impl Drop for ConsoleVideo {
     fn drop(&mut self) {
         let mut out = io::stdout();
-        // Delete kitty image, show cursor, leave alt screen.
-        let _ = write!(out, "\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?25h\x1b[?1049l");
+        // End sync, delete kitty image, show cursor, leave alt screen.
+        let _ = write!(
+            out,
+            "\x1b[?2026l\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?25h\x1b[?1049l"
+        );
         let _ = out.flush();
         #[cfg(unix)]
         if let Some(t) = self.orig_termios.take() {
@@ -233,17 +314,17 @@ fn parse_escape(buf: &mut Vec<u8>) -> Option<KeyCode> {
     if buf.is_empty() {
         return None;
     }
-    // Lone Esc after a short wait is hard without a timer; treat Esc + non-[
-    // as Esc, and Esc [ … letter as CSI.
     if buf.len() == 1 {
-        return None; // wait for more (or next byte)
+        return None; // wait for more (or bare-Esc timeout in pump)
     }
     if buf[0] != 0x1b {
         buf.clear();
         return None;
     }
-    // ESC alone followed by a non-CSI introducer → plain Escape
+    // ESC alone followed by a non-CSI introducer → plain Escape, re-feed? We
+    // only handle when second byte is clearly not part of CSI.
     if buf.len() == 2 && buf[1] != b'[' && buf[1] != b'O' {
+        // e.g. ESC then letter — treat as Escape; letter is lost (rare).
         buf.clear();
         return Some(KeyCode::Escape);
     }
@@ -262,6 +343,9 @@ fn parse_escape(buf: &mut Vec<u8>) -> Option<KeyCode> {
                         b"5" => Some(KeyCode::PageUp),
                         b"6" => Some(KeyCode::PageDown),
                         b"2" => Some(KeyCode::Insert),
+                        // Mac/iTerm sometimes send 1~ for Home, 4~ for End
+                        b"1" => Some(KeyCode::Home),
+                        b"4" => Some(KeyCode::End),
                         _ => None,
                     },
                     _ => None,
@@ -348,7 +432,6 @@ fn terminal_size() -> Option<(u32, u32)> {
             return Some((ws.ws_col as u32, ws.ws_row as u32));
         }
     }
-    // Fallback env (some SSH setups).
     let cols = std::env::var("COLUMNS")
         .ok()
         .and_then(|s| s.parse().ok())?;
@@ -401,7 +484,8 @@ fn write_kitty_frame(
     for (i, chunk) in chunks.iter().enumerate() {
         let more = u8::from(i != last);
         if i == 0 {
-            // a=T transmit+display, f=32 RGBA, o=z zlib, t=d direct, C=1 keep cursor
+            // a=T transmit+display, f=32 RGBA, o=z zlib, t=d direct,
+            // C=1 do not move cursor after display (avoids scroll flicker).
             write!(
                 out,
                 "\x1b_Ga=T,f=32,o=z,s={width},v={height},t=d,i={image_id},p=1,C=1,q=2,m={more};"
@@ -423,24 +507,22 @@ fn write_ansi_halfblock(
     height: usize,
     rgba: &[u8],
 ) -> io::Result<()> {
-    // Pair rows into `▄` (lower half = bottom pixel, upper = top via bg/fg).
-    // Optionally scale down if the terminal is small — keep 1:1 for simplicity
-    // (320 cols × 100 rows of cells); user can zoom the terminal font.
     let rows = height / 2;
     for cy in 0..rows {
         let y0 = cy * 2;
         let y1 = y0 + 1;
+        // Position each row explicitly (avoids scroll when the buffer is full).
+        write!(out, "\x1b[{};1H", cy + 2)?;
         for x in 0..width {
             let t = pixel(rgba, width, x, y0);
             let b = pixel(rgba, width, x, y1);
-            // fg = bottom, bg = top, char = lower half block
             write!(
                 out,
                 "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m▄",
                 b[0], b[1], b[2], t[0], t[1], t[2]
             )?;
         }
-        write!(out, "\x1b[0m\r\n")?;
+        write!(out, "\x1b[0m")?;
     }
     Ok(())
 }
@@ -449,7 +531,6 @@ fn pixel(rgba: &[u8], width: usize, x: usize, y: usize) -> [u8; 3] {
     let o = (y * width + x) * 4;
     [rgba[o], rgba[o + 1], rgba[o + 2]]
 }
-
 
 // --- termios raw mode (Unix) -------------------------------------------------
 
@@ -463,10 +544,18 @@ fn enter_raw_mode() -> io::Result<libc::termios> {
         }
         let mut raw = old;
         libc::cfmakeraw(&mut raw);
+        // Non-blocking read: return immediately if no input.
         raw.c_cc[libc::VMIN] = 0;
         raw.c_cc[libc::VTIME] = 0;
+        // Keep Ctrl-C as a byte (0x03) so we can quit cleanly from pump.
+        // cfmakeraw already clears ISIG.
         if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
             return Err(io::Error::last_os_error());
+        }
+        // Also mark stdin non-blocking at the fd level (macOS sometimes needs both).
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
         Ok(old)
     }
@@ -475,7 +564,13 @@ fn enter_raw_mode() -> io::Result<libc::termios> {
 #[cfg(unix)]
 fn restore_termios(t: &libc::termios) -> io::Result<()> {
     unsafe {
-        if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t) != 0 {
+        let fd = libc::STDIN_FILENO;
+        // Clear O_NONBLOCK.
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+        if libc::tcsetattr(fd, libc::TCSANOW, t) != 0 {
             return Err(io::Error::last_os_error());
         }
     }
@@ -487,8 +582,12 @@ fn read_stdin_nonblock(buf: &mut [u8]) -> io::Result<usize> {
     let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut _, buf.len()) };
     if n < 0 {
         let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EAGAIN) || err.raw_os_error() == Some(libc::EWOULDBLOCK)
-        {
+        let code = err.raw_os_error();
+        if code == Some(libc::EAGAIN) || code == Some(libc::EWOULDBLOCK) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, err));
+        }
+        // macOS may report EINTR
+        if code == Some(libc::EINTR) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, err));
         }
         return Err(err);
@@ -505,7 +604,6 @@ fn read_stdin_nonblock(buf: &mut [u8]) -> io::Result<usize> {
         Ok(n)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -530,20 +628,58 @@ mod tests {
 
     #[test]
     fn nearest_upscale_2x() {
-        // 2×2 red/blue pattern → 4×4
         let src = [
             255, 0, 0, 255, 0, 0, 255, 255, // row0
             0, 255, 0, 255, 255, 255, 0, 255, // row1
         ];
         let mut dst = vec![0u8; 4 * 4 * 4];
         nearest_upscale(&src, 2, 2, 2, &mut dst);
-        // top-left 2×2 block (out rows 0–1) should be red
         assert_eq!(&dst[0..4], &[255, 0, 0, 255]);
         assert_eq!(&dst[4..8], &[255, 0, 0, 255]);
-        let row1 = 4 * 4; // second output row, first pixel
+        let row1 = 4 * 4;
         assert_eq!(&dst[row1..row1 + 4], &[255, 0, 0, 255]);
-        // out row 2 comes from source y=1 → green
         let row2 = 2 * 4 * 4;
         assert_eq!(&dst[row2..row2 + 4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn note_press_holds_without_immediate_release() {
+        let mut v = ConsoleVideo {
+            use_kitty: false,
+            scale: 1,
+            rgba: vec![0; 4],
+            scaled: vec![],
+            prev_rgba: vec![],
+            last_present: Instant::now(),
+            close_requested: false,
+            kitty_placed: false,
+            #[cfg(unix)]
+            orig_termios: None,
+            esc_buf: vec![],
+            esc_solo_since: None,
+            held: vec![],
+            pending: vec![],
+        };
+        let now = Instant::now();
+        v.note_press(KeyCode::Enter, now);
+        let ev = std::mem::take(&mut v.pending);
+        assert_eq!(ev, [(KeyCode::Enter, true)]);
+        assert_eq!(v.held.len(), 1);
+        // Same frame: no release yet.
+        let later = now + Duration::from_millis(200);
+        v.held[0].until = later; // still held
+        // Force expire
+        v.held[0].until = now;
+        let now2 = Instant::now();
+        // Manually run expire logic from pump
+        let mut still = Vec::new();
+        for h in v.held.drain(..) {
+            if now2 >= h.until {
+                v.pending.push((h.code, false));
+            } else {
+                still.push(h);
+            }
+        }
+        assert_eq!(v.pending, [(KeyCode::Enter, false)]);
     }
 }
