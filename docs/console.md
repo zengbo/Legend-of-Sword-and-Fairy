@@ -31,8 +31,9 @@ upscaled bitmaps that froze the loop).
 
 **ANSI:** small integer upscale (1–3×) + half-block cells.
 
-**Input:** background thread reads `/dev/tty`; **Ctrl-C keeps ISIG** so it
-kills the process even if a frame is being encoded.
+**Input:** background thread reads `/dev/tty`. **Ctrl-C** installs a signal
+handler that leaves the alternate screen, restores echo/cooked mode, then
+exits — so Kitty does not stay frozen on the game frame with invisible typing.
 
 ### Controls
 

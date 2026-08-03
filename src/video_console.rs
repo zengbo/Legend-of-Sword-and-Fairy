@@ -5,12 +5,14 @@
 //! * **ANSI** — half-block truecolor cells, modest integer upscale.
 //!
 //! Input is read on a **background thread** from `/dev/tty` so keys (and a
-//! stuck main thread) still work. Ctrl-C keeps terminal `ISIG` so it delivers
-//! SIGINT even if the game loop is busy.
+//! stuck main thread) still work. Ctrl-C is handled by a signal handler that
+//! **restores the terminal** (leave alt screen, re-enable echo) before exit —
+//! a bare SIGINT kill would leave Kitty stuck on the game buffer.
 
 use std::io::{self, Write};
 #[cfg(not(unix))]
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,6 +30,16 @@ const IMAGE_ID: u32 = 1;
 const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(70);
 /// How long a key stays down for the engine after a terminal press / repeat.
 const KEY_HOLD: Duration = Duration::from_millis(180);
+
+/// Set by SIGINT/SIGTERM so the game loop can also quit cleanly if needed.
+static CONSOLE_QUIT: AtomicBool = AtomicBool::new(false);
+/// `/dev/tty` fd saved for emergency termios restore in the signal handler.
+static TTY_FD: AtomicI32 = AtomicI32::new(-1);
+/// Original termios bytes (platform `termios` layout) for async-signal-safe restore.
+#[cfg(unix)]
+static mut SAVED_TERMIOS: libc::termios = unsafe { std::mem::zeroed() };
+#[cfg(unix)]
+static TERMIOS_SAVED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleMode {
@@ -73,9 +85,70 @@ struct TtyRawGuard {
 #[cfg(unix)]
 impl Drop for TtyRawGuard {
     fn drop(&mut self) {
-        unsafe {
-            let _ = libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig);
+        restore_termios_fd(self.fd, &self.orig);
+    }
+}
+
+/// Leave alt screen, show cursor, drop Kitty images, restore cooked termios.
+/// Safe to call more than once. Used from `Drop` and from the SIGINT handler.
+fn restore_terminal_ui() {
+    // Best-effort writes — ignore errors (stdout may be half-dead in a handler).
+    let seq = b"\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?25h\x1b[?1049l\r\n";
+    let _ = io::stdout().write_all(seq);
+    let _ = io::stdout().flush();
+    #[cfg(unix)]
+    unsafe {
+        // Also write directly to the tty fd (async-signal-safe path for handlers).
+        let fd = TTY_FD.load(Ordering::SeqCst);
+        if fd >= 0 {
+            let _ = libc::write(fd, seq.as_ptr() as *const _, seq.len());
         }
+        if TERMIOS_SAVED.load(Ordering::SeqCst) {
+            let tfd = if fd >= 0 { fd } else { libc::STDIN_FILENO };
+            let _ = libc::tcsetattr(tfd, libc::TCSANOW, std::ptr::addr_of!(SAVED_TERMIOS));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn restore_termios_fd(fd: i32, orig: &libc::termios) {
+    unsafe {
+        let _ = libc::tcsetattr(fd, libc::TCSANOW, orig);
+    }
+}
+
+/// SIGINT/SIGTERM: restore the terminal then exit. Without this, a default
+/// SIGINT aborts the process and skips `Drop`, leaving Kitty on the alt buffer
+/// with echo off — looks like the game is still running.
+#[cfg(unix)]
+extern "C" fn console_signal_handler(sig: libc::c_int) {
+    CONSOLE_QUIT.store(true, Ordering::SeqCst);
+    // Inline minimal restore (only async-signal-safe calls).
+    let seq = b"\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?25h\x1b[?1049l\r\n";
+    unsafe {
+        let fd = TTY_FD.load(Ordering::SeqCst);
+        let out = if fd >= 0 { fd } else { libc::STDOUT_FILENO };
+        let _ = libc::write(out, seq.as_ptr() as *const _, seq.len());
+        if TERMIOS_SAVED.load(Ordering::SeqCst) {
+            let tfd = if fd >= 0 { fd } else { libc::STDIN_FILENO };
+            let _ = libc::tcsetattr(tfd, libc::TCSANOW, std::ptr::addr_of!(SAVED_TERMIOS));
+        }
+        // 128 + signal number (shell convention for fatal signals).
+        let code = if sig == libc::SIGINT { 130 } else { 143 };
+        libc::_exit(code);
+    }
+}
+
+#[cfg(unix)]
+fn install_console_signal_handlers() {
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        // Classic handler (not SA_SIGINFO): signature fn(c_int).
+        sa.sa_sigaction = console_signal_handler as *const () as usize;
+        sa.sa_flags = 0;
+        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
     }
 }
 
@@ -110,12 +183,15 @@ impl ConsoleVideo {
         };
         writeln!(
             out,
-            "\x1b[36mrustpal console ({label} · {size_note}) — arrows/hjkl · Enter · Esc · Ctrl-C quits process\x1b[0m"
+            "\x1b[36mrustpal console ({label} · {size_note}) — arrows/hjkl · Enter · Esc · Ctrl-C restores terminal & quits\x1b[0m"
         )?;
         out.flush()?;
         eprintln!(
             "rustpal: console backend ready ({label}, place_cols={place_cols}, ansi_scale={ansi_scale})"
         );
+
+        #[cfg(unix)]
+        install_console_signal_handlers();
 
         let scaled_len = if use_kitty {
             0
@@ -144,6 +220,9 @@ impl ConsoleVideo {
     }
 
     pub fn pump(&mut self) -> Vec<(KeyCode, bool)> {
+        if CONSOLE_QUIT.load(Ordering::SeqCst) {
+            self.close_requested = true;
+        }
         let now = Instant::now();
 
         // Drain all pending tty bytes from the input thread.
@@ -301,10 +380,8 @@ impl ConsoleVideo {
 
 impl Drop for ConsoleVideo {
     fn drop(&mut self) {
-        let mut out = io::stdout();
-        let _ = write!(out, "\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?25h\x1b[?1049l");
-        let _ = out.flush();
-        // TtyRawGuard restores termios.
+        restore_terminal_ui();
+        // TtyRawGuard also restores termios on drop.
     }
 }
 
@@ -324,6 +401,11 @@ fn spawn_tty_reader() -> io::Result<(Receiver<u8>, TtyRawGuard)> {
         if libc::tcgetattr(fd, &mut old) != 0 {
             return Err(io::Error::last_os_error());
         }
+        // Stash for the SIGINT handler (must restore even if Drop never runs).
+        SAVED_TERMIOS = old;
+        TERMIOS_SAVED.store(true, Ordering::SeqCst);
+        TTY_FD.store(fd, Ordering::SeqCst);
+
         let mut raw = old;
         libc::cfmakeraw(&mut raw);
         // Keep ISIG so Ctrl-C raises SIGINT (always works, even if main is busy).
