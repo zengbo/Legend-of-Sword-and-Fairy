@@ -39,7 +39,7 @@ use rustpal::surface::{SCREEN_H, SCREEN_W};
 use std::collections::HashMap;
 use std::io::{BufRead, Read, Write};
 use std::process::{Command, Stdio};
-use winit::keyboard::KeyCode;
+use rustpal::keys::KeyCode;
 
 const AUDIO_RATE: u32 = 44100;
 

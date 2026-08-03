@@ -69,6 +69,18 @@ cargo run --release
 
 操作：方向键移动，空格/回车 调查·确认，Esc 菜单；战斗中 R 连续攻击、A 自动、D 防御、E 物品、W 投掷、Q 逃跑、F 仙术、S 状态。
 
+#### 终端版 / Console (no GUI system deps)
+
+无需安装 ALSA/X11 等系统库时，可只编终端后端（Kitty 像素或 ANSI 半块，无声音）：
+
+```shell
+cargo build --release --no-default-features --features console
+./target/release/rustpal --console
+# 或 --console=kitty / --console=ansi
+```
+
+说明见 [docs/console.md](docs/console.md)。
+
 #### 本地控制 API / Local control API
 
 原生版可选择启用仅监听回环地址的 HTTP 控制接口，供自动化程序读取当前

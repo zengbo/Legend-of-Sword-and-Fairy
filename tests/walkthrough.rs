@@ -6,8 +6,8 @@
 use rustpal::battle::BattleResult;
 use rustpal::game_loop::Engine;
 use rustpal::global::{seed_random, EventObject, ScriptEntry, MAX_PLAYER_MAGICS, MAX_PLAYER_ROLES};
+use rustpal::keys::KeyCode;
 use std::collections::{HashMap, HashSet, VecDeque};
-use winit::keyboard::KeyCode;
 
 fn new_game_engine() -> Engine {
     std::env::set_var("PAL_DATA_DIR", concat!(env!("CARGO_MANIFEST_DIR"), "/pal"));

@@ -8,31 +8,33 @@
 #![allow(dead_code)] // used incrementally as engine bring-up proceeds
 
 use std::io;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 use std::io::Cursor;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 use std::time::Duration;
 use web_time::Instant;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 use pixels::{wgpu, Pixels, PixelsBuilder, SurfaceTexture};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 use winit::application::ApplicationHandler;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 use winit::event::{ElementState, WindowEvent};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 use winit::keyboard::PhysicalKey;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 use winit::platform::pump_events::EventLoopExtPumpEvents;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 use winit::window::{Window, WindowId};
 
 #[cfg(target_arch = "wasm32")]
 use crate::web::Video;
+
+use crate::keys::KeyCode;
 
 use crate::data::DataDir;
 use crate::font::Font;
@@ -52,16 +54,16 @@ pub const BATTLE_FRAME_TIME: u64 = 40;
 /// 1152x720 viewport with narrow pillarboxes, preserving its geometry instead
 /// of stretching it to 16:9. (The web build presents the raw 320x200 frame
 /// and lets CSS scale it.)
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 pub const DISPLAY_W: usize = 1280;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 pub const DISPLAY_H: usize = 720;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 const VIEW_W: usize = 1152;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 const VIEW_X: usize = (DISPLAY_W - VIEW_W) / 2;
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 const OPENING_MENU_HD_PNG: &[u8] = include_bytes!("../resources/hd/opening-menu-720p.png");
 
 /// One entry of the hardware palette.
@@ -125,9 +127,10 @@ pub(crate) fn render_rgba(
 // ===========================================================================
 // Video shell (video.c): winit window + pixels framebuffer, pumped
 // synchronously so the imperative game flow of the original engine works.
+// Only compiled with the `gui` feature.
 // ===========================================================================
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 struct VideoApp {
     window: Option<Arc<Window>>,
     pixels: Option<Pixels<'static>>,
@@ -135,7 +138,7 @@ struct VideoApp {
     /// Windows this is lowered to Vulkan when that backend is selected.
     upscaler: Option<crate::native_upscale::NativeUpscaler>,
     surface_size: (u32, u32),
-    key_events: Vec<(winit::keyboard::KeyCode, bool)>,
+    key_events: Vec<(KeyCode, bool)>,
     close_requested: bool,
     /// RGBA staging buffer for the native 720p presentation surface.
     rgba: Vec<u8>,
@@ -149,7 +152,7 @@ struct VideoApp {
     enhanced_target_palette: Option<[PalColor; 256]>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 impl ApplicationHandler for VideoApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -236,8 +239,10 @@ impl ApplicationHandler for VideoApp {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
-                    self.key_events
-                        .push((code, event.state == ElementState::Pressed));
+                    if let Some(code) = crate::keys::from_winit(code) {
+                        self.key_events
+                            .push((code, event.state == ElementState::Pressed));
+                    }
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -250,17 +255,17 @@ impl ApplicationHandler for VideoApp {
     }
 }
 
-/// The window + framebuffer (None in headless mode, e.g. tests).
-#[cfg(not(target_arch = "wasm32"))]
-pub struct Video {
+/// The window + framebuffer (GUI backend).
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
+struct GuiVideo {
     event_loop: EventLoop<()>,
     app: VideoApp,
     ui_driver: Option<crate::ui_driver::UiDriver>,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-impl Video {
-    pub fn new() -> io::Result<Video> {
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
+impl GuiVideo {
+    pub fn new() -> io::Result<GuiVideo> {
         let event_loop =
             EventLoop::new().map_err(|e| io::Error::other(format!("winit event loop: {e}")))?;
         let ui_driver = match std::env::var("RUSTPAL_UI_DRIVER") {
@@ -273,7 +278,7 @@ impl Video {
                 ))
             }
         };
-        Ok(Video {
+        Ok(GuiVideo {
             event_loop,
             app: VideoApp {
                 window: None,
@@ -298,7 +303,7 @@ impl Video {
     }
 
     /// Pump pending window events; returns collected key transitions.
-    fn pump(&mut self) -> Vec<(winit::keyboard::KeyCode, bool)> {
+    fn pump(&mut self) -> Vec<(KeyCode, bool)> {
         self.event_loop
             .pump_app_events(Some(Duration::ZERO), &mut self.app);
         let mut events = std::mem::take(&mut self.app.key_events);
@@ -371,7 +376,153 @@ impl Video {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Native video backend selector (GUI and/or console).
+// ---------------------------------------------------------------------------
+
+/// How to present the game on native builds.
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoBackend {
+    /// No window / terminal (tests, tools).
+    Headless,
+    /// winit + pixels window.
+    #[cfg(feature = "gui")]
+    Gui,
+    /// Pure terminal (Kitty / ANSI).
+    #[cfg(feature = "console")]
+    Console,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl VideoBackend {
+    /// Interactive backend from flags/env. Prefers console when
+    /// `RUSTPAL_CONSOLE` is set (and the feature is enabled).
+    pub fn interactive() -> io::Result<VideoBackend> {
+        if std::env::var_os("RUSTPAL_CONSOLE").is_some() {
+            #[cfg(feature = "console")]
+            {
+                return Ok(VideoBackend::Console);
+            }
+            #[cfg(not(feature = "console"))]
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "RUSTPAL_CONSOLE set but binary built without `console` feature",
+                ));
+            }
+        }
+        #[cfg(feature = "gui")]
+        {
+            return Ok(VideoBackend::Gui);
+        }
+        #[cfg(all(feature = "console", not(feature = "gui")))]
+        {
+            return Ok(VideoBackend::Console);
+        }
+        #[cfg(all(not(feature = "gui"), not(feature = "console")))]
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "no video backend: enable `gui` and/or `console` features",
+            ));
+        }
+        #[allow(unreachable_code)]
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no video backend selected",
+        ))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum Video {
+    #[cfg(feature = "gui")]
+    Gui(GuiVideo),
+    #[cfg(feature = "console")]
+    Console(crate::video_console::ConsoleVideo),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Video {
+    fn open(backend: VideoBackend) -> io::Result<Option<Video>> {
+        match backend {
+            VideoBackend::Headless => Ok(None),
+            #[cfg(feature = "gui")]
+            VideoBackend::Gui => Ok(Some(Video::Gui(GuiVideo::new()?))),
+            #[cfg(feature = "console")]
+            VideoBackend::Console => {
+                let mode = match std::env::var("RUSTPAL_CONSOLE_MODE")
+                    .unwrap_or_default()
+                    .as_str()
+                {
+                    "kitty" => crate::video_console::ConsoleMode::Kitty,
+                    "ansi" => crate::video_console::ConsoleMode::Ansi,
+                    _ => crate::video_console::ConsoleMode::Auto,
+                };
+                Ok(Some(Video::Console(
+                    crate::video_console::ConsoleVideo::new(mode)?,
+                )))
+            }
+        }
+    }
+
+    fn pump(&mut self) -> Vec<(KeyCode, bool)> {
+        match self {
+            #[cfg(feature = "gui")]
+            Video::Gui(v) => v.pump(),
+            #[cfg(feature = "console")]
+            Video::Console(v) => v.pump(),
+        }
+    }
+
+    fn present(
+        &mut self,
+        surf: &Surface,
+        palette: &[PalColor; 256],
+        shake: Option<(u16, u16)>,
+    ) {
+        match self {
+            #[cfg(feature = "gui")]
+            Video::Gui(v) => v.present(surf, palette, shake),
+            #[cfg(feature = "console")]
+            Video::Console(v) => v.present(surf, palette, shake),
+        }
+    }
+
+    fn close_requested(&self) -> bool {
+        match self {
+            #[cfg(feature = "gui")]
+            Video::Gui(v) => v.close_requested(),
+            #[cfg(feature = "console")]
+            Video::Console(v) => v.close_requested(),
+        }
+    }
+
+    fn enable_enhanced_opening_menu(
+        &mut self,
+        baseline: Vec<u8>,
+        target_palette: [PalColor; 256],
+    ) {
+        match self {
+            #[cfg(feature = "gui")]
+            Video::Gui(v) => v.enable_enhanced_opening_menu(baseline, target_palette),
+            #[cfg(feature = "console")]
+            Video::Console(v) => v.enable_enhanced_opening_menu(baseline, target_palette),
+        }
+    }
+
+    fn disable_enhanced_background(&mut self) {
+        match self {
+            #[cfg(feature = "gui")]
+            Video::Gui(v) => v.disable_enhanced_background(),
+            #[cfg(feature = "console")]
+            Video::Console(v) => v.disable_enhanced_background(),
+        }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 fn fit_neural_viewport(surface_width: u32, surface_height: u32) -> (f32, f32, f32, f32) {
     let surface_width = surface_width.max(1) as f32;
     let surface_height = surface_height.max(1) as f32;
@@ -386,7 +537,7 @@ fn fit_neural_viewport(surface_width: u32, surface_height: u32) -> (f32, f32, f3
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 fn decode_opening_menu_hd() -> io::Result<Vec<u8>> {
     let decoder = png::Decoder::new(Cursor::new(OPENING_MENU_HD_PNG));
     let mut reader = decoder
@@ -417,7 +568,7 @@ fn decode_opening_menu_hd() -> io::Result<Vec<u8>> {
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 fn render_720p(
     surf: &Surface,
     palette: &[PalColor; 256],
@@ -529,7 +680,7 @@ pub struct Engine {
     pub shake_time: u16,
     pub shake_level: u16,
 
-    /// Audio mixer (None when no output device / headless).
+    /// Audio mixer (None when no output device / headless / console).
     pub audio: Option<crate::audio::Mixer>,
     /// AUDIO_MusicEnabled / AUDIO_SoundEnabled (gAudioDevice.fMusicEnabled /
     /// fSoundEnabled) — toggled from the in-game system menu.
@@ -603,8 +754,38 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Initialize the engine. `headless` skips window creation (tests).
+    /// Initialize the engine. `headless` skips window/terminal creation (tests).
     pub fn new(headless: bool) -> io::Result<Engine> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let backend = if headless {
+            VideoBackend::Headless
+        } else {
+            VideoBackend::interactive()?
+        };
+        #[cfg(target_arch = "wasm32")]
+        let _ = headless;
+        Self::with_backend(
+            #[cfg(not(target_arch = "wasm32"))]
+            backend,
+            #[cfg(target_arch = "wasm32")]
+            headless,
+        )
+    }
+
+    /// Native: pick an explicit backend. Web: `headless` is ignored (always has video).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_backend(backend: VideoBackend) -> io::Result<Engine> {
+        Self::build(backend)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn with_backend(_headless: bool) -> io::Result<Engine> {
+        Self::build()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn build(backend: VideoBackend) -> io::Result<Engine> {
+        let headless = matches!(backend, VideoBackend::Headless);
         let data_dir = DataDir::new()?;
         let pat = data_dir.mkf("pat.mkf")?;
         let mus = data_dir.mkf("mus.mkf")?;
@@ -612,8 +793,15 @@ impl Engine {
         let texts = Texts::load(&data_dir)?;
         let font = Font::load(&data_dir)?;
         let globals = Globals::init(data_dir)?;
-        let video = if headless { None } else { Some(Video::new()?) };
-        let audio = if headless || std::env::var_os("RUSTPAL_DISABLE_AUDIO").is_some() {
+        let video = Video::open(backend)?;
+        #[cfg(feature = "console")]
+        let console = matches!(backend, VideoBackend::Console);
+        #[cfg(not(feature = "console"))]
+        let console = false;
+        let audio = if headless
+            || console
+            || std::env::var_os("RUSTPAL_DISABLE_AUDIO").is_some()
+        {
             None
         } else {
             crate::audio::Mixer::new()
@@ -667,7 +855,63 @@ impl Engine {
         // PAL_InitUI: load gpSpriteUI / dialog icons. Without this, menu boxes,
         // numbers, the item picture frame, and dialog wait icons never blit.
         engine.init_ui()?;
-        // Create the window right away so the first present works.
+        // Create the window/terminal right away so the first present works.
+        engine.process_event();
+        Ok(engine)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn build() -> io::Result<Engine> {
+        let data_dir = DataDir::new()?;
+        let pat = data_dir.mkf("pat.mkf")?;
+        let mus = data_dir.mkf("mus.mkf")?;
+        let voc = data_dir.mkf("voc.mkf")?;
+        let texts = Texts::load(&data_dir)?;
+        let font = Font::load(&data_dir)?;
+        let globals = Globals::init(data_dir)?;
+        let video = Some(Video::new()?);
+        let audio = if std::env::var_os("RUSTPAL_DISABLE_AUDIO").is_some() {
+            None
+        } else {
+            crate::audio::Mixer::new()
+        };
+        let mut engine = Engine {
+            globals,
+            res: Resources::new(),
+            texts,
+            font,
+            screen: Surface::screen(),
+            screen_bak: Surface::screen(),
+            palette: [[0; 3]; 256],
+            pat,
+            shake_time: 0,
+            shake_level: 0,
+            audio,
+            music_enabled: true,
+            sound_enabled: true,
+            mus,
+            voc,
+            cur_music: 0,
+            input: InputState::new(),
+            video,
+            start: Instant::now(),
+            tick_scale: 1,
+            quit_requested: false,
+            ending_effect_sprite: 0,
+            battle: None,
+            battle_instant: false,
+            battle_records: Vec::new(),
+            frame_sink: None,
+            demo_pilot: None,
+            autopilot: None,
+            script: Default::default(),
+            ui: Default::default(),
+            scene: Default::default(),
+            play: Default::default(),
+        };
+        // PAL_InitUI: load gpSpriteUI / dialog icons. Without this, menu boxes,
+        // numbers, the item picture frame, and dialog wait icons never blit.
+        engine.init_ui()?;
         engine.process_event();
         Ok(engine)
     }

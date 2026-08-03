@@ -11,10 +11,11 @@ pub mod game_loop;
 pub mod global;
 pub mod input;
 pub mod itemmenu;
+pub mod keys;
 pub mod magicmenu;
 pub mod map;
 pub mod mkf;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 pub mod native_upscale;
 pub mod opl;
 pub mod palette;
@@ -27,10 +28,12 @@ pub mod script;
 pub mod surface;
 pub mod text;
 pub mod ui;
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 pub mod ui_driver;
 pub mod uibattle;
 pub mod uigame;
+#[cfg(all(not(target_arch = "wasm32"), feature = "console"))]
+pub mod video_console;
 pub mod voc;
 #[cfg(target_arch = "wasm32")]
 pub mod web;

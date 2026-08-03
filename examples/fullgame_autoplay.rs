@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufWriter, Write};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
-use winit::keyboard::KeyCode;
+use rustpal::keys::KeyCode;
 
 const MAX_FRAMES: u64 = 5_000_000;
 const IDLE_RESET_FRAMES: u64 = 240;

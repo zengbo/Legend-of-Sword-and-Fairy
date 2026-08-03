@@ -9,10 +9,10 @@
 //! AudioWorkletProcessor (web/worklet.js) drains on the audio thread.
 #![allow(dead_code)] // used incrementally as engine bring-up proceeds
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 use std::sync::{Arc, Mutex};
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::rix::RixPlayer;
@@ -139,11 +139,11 @@ impl Shared {
 }
 
 /// Consumer of interleaved stereo samples produced by an offline mixer.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 pub type AudioSink = Box<dyn FnMut(&[f32])>;
 
 /// Where a native mixer sends its samples.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 enum Backend {
     /// Real output device; cpal pulls from the mixer on its own thread.
     Device(cpal::Stream),
@@ -158,14 +158,15 @@ enum Backend {
 }
 
 /// Software mixer. Everything is rendered at the output device's rate.
-#[cfg(not(target_arch = "wasm32"))]
+/// Only available with the `gui` feature (cpal). Console builds are silent.
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 pub struct Mixer {
     backend: Backend,
     shared: Arc<Mutex<Shared>>,
     out_rate: u32,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 impl Mixer {
     /// Open the default output device. Returns None if no device is
     /// available (headless CI, tests).
@@ -269,6 +270,33 @@ impl Mixer {
         (sink.borrow_mut())(&buf);
         rendered.set(target);
     }
+}
+
+/// Silent stub used by console-only native builds (`--no-default-features
+/// --features console`): no cpal, no device, all methods no-op.
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "gui")))]
+pub struct Mixer {
+    out_rate: u32,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(feature = "gui")))]
+impl Mixer {
+    pub fn new() -> Option<Mixer> {
+        None
+    }
+
+    pub fn offline(_out_rate: u32, _sink: Box<dyn FnMut(&[f32])>) -> Mixer {
+        Mixer { out_rate: 44100 }
+    }
+
+    pub fn out_rate(&self) -> u32 {
+        self.out_rate
+    }
+
+    pub fn play_music(&self, _rix: RixPlayer, _fade_time: f32) {}
+    pub fn stop_music(&self, _fade_time: f32) {}
+    pub fn play_sound(&self, _voc: VocSound) {}
+    pub fn pump(&self, _now_ms: u64) {}
 }
 
 /// Web mixer: renders ahead into the `PAL_AUDIO` SharedArrayBuffer ring that

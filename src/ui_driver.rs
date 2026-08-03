@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use winit::keyboard::KeyCode;
+use crate::keys::KeyCode;
 
 use crate::game_loop::{render_rgba, PalColor};
 use crate::surface::{Surface, SCREEN_H, SCREEN_W};

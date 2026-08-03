@@ -7,16 +7,30 @@ license = "GPL-3.0-only"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+[features]
+default = ["gui", "console"]
+# Desktop window (winit + pixels + cpal). Needs system packages on Linux
+# (pkg-config, libasound, X11/Wayland, …).
+gui = ["dep:winit", "dep:pixels", "dep:cpal", "dep:pollster", "dep:png"]
+# Pure terminal backend: no window, no sound device. Builds with only crates.io
+# deps (see --no-default-features --features console).
+console = ["dep:base64", "dep:miniz_oxide", "dep:libc"]
+
 [dependencies]
-winit = "0.30"
 web-time = "1"
 
+# GUI stack (native window). Optional so console-only builds skip system libs.
+winit = { version = "0.30", optional = true }
+
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-pixels = "0.17.2"
-cpal = "0.15"
-png = "0.18"
-# Blocking adapter/device requests for the windowless upscale device.
-pollster = "0.4"
+pixels = { version = "0.17.2", optional = true }
+cpal = { version = "0.15", optional = true }
+png = { version = "0.18", optional = true }
+pollster = { version = "0.4", optional = true }
+# Console video: Kitty graphics protocol (+ ANSI fallback). Pure Rust crates + libc for termios.
+base64 = { version = "0.22", optional = true }
+miniz_oxide = { version = "0.8", optional = true }
+libc = { version = "0.2", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

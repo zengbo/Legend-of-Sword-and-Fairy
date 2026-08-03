@@ -16,7 +16,7 @@ use std::io;
 use js_sys::{Atomics, Int32Array, SharedArrayBuffer, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use winit::keyboard::KeyCode;
+use crate::keys::KeyCode;
 
 use crate::game_loop::PalColor;
 use crate::surface::{Surface, SCREEN_H, SCREEN_W};

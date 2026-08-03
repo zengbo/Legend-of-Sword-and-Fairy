@@ -2,7 +2,7 @@
 //! bitmask plus the key-order based walking direction tracking.
 #![allow(dead_code)] // used incrementally as engine bring-up proceeds
 
-use winit::keyboard::KeyCode;
+use crate::keys::KeyCode;
 
 // PALKEY bits (input.h).
 pub const KEY_MENU: u32 = 1 << 0;
