@@ -97,9 +97,33 @@ fn install_control(control: Arc<SharedControl>) {
     }
 }
 
-/// True when the running UI driver was started with step mode
-/// (`RUSTPAL_UI_STEP` / `--ui-step`).
+/// True when the engine should use the **virtual** step clock and block in
+/// `delay_until` until `POST /v1/step`.
+///
+/// `--ui-step` alone enables this for headless/offscreen agents. With
+/// **console** video, the gate is off by default so the alternate screen keeps
+/// animating in real time (otherwise the first `delay` freezes on a blank
+/// frame until an agent steps). Force the freeze even on console with
+/// `RUSTPAL_UI_STEP_STRICT=1`.
 pub(crate) fn step_mode_enabled() -> bool {
+    let Some(c) = control() else {
+        return false;
+    };
+    if !c.step_enabled() {
+        return false;
+    }
+    if env_flag("RUSTPAL_UI_STEP_STRICT") {
+        return true;
+    }
+    // Console needs wall-clock presents; agent still has /v1/state + input.
+    if std::env::var_os("RUSTPAL_CONSOLE").is_some() {
+        return false;
+    }
+    true
+}
+
+/// `--ui-step` / `RUSTPAL_UI_STEP` was set (API may still accept /v1/step).
+pub(crate) fn step_mode_configured() -> bool {
     control().is_some_and(|c| c.step_enabled())
 }
 
@@ -201,10 +225,21 @@ impl UiDriver {
 
         eprintln!("rustpal: UI driver listening on http://{local_addr}");
         if step_enabled {
-            eprintln!(
-                "rustpal: UI step mode ON — engine clock is virtual; POST /v1/step to advance \
-                 (default +{FRAME_TIME}ms per call)"
-            );
+            if std::env::var_os("RUSTPAL_CONSOLE").is_some()
+                && !env_flag("RUSTPAL_UI_STEP_STRICT")
+            {
+                eprintln!(
+                    "rustpal: UI step requested with console — using **realtime** display so the \
+                     terminal keeps painting. Set RUSTPAL_UI_STEP_STRICT=1 to freeze the clock \
+                     until POST /v1/step (needed for single-frame AI loops while watching)."
+                );
+            } else {
+                eprintln!(
+                    "rustpal: UI step mode ON — engine clock is virtual; the game will not advance \
+                     until POST /v1/step (default +{FRAME_TIME}ms per call). Without steps the \
+                     screen stays blank/frozen."
+                );
+            }
         }
         Ok(Self {
             input_rx,
@@ -306,10 +341,15 @@ fn handle_connection(
                 .map_err(|_| io::Error::other("frame lock poisoned"))?;
             let body = format!(
                 "{{\"status\":\"ok\",\"width\":{SCREEN_W},\"height\":{SCREEN_H},\
-                 \"frame_id\":{},\"step_mode\":{},\"ticks\":{}}}\n",
+                 \"frame_id\":{},\"step_mode\":{},\"step_configured\":{},\"ticks\":{}}}\n",
                 frame.id,
+                step_mode_enabled(),
                 control.step_enabled(),
-                control.virtual_ms(),
+                if step_mode_enabled() {
+                    control.virtual_ms()
+                } else {
+                    0
+                },
             );
             write_response(stream, 200, "OK", "application/json", body.as_bytes())
         }
@@ -408,8 +448,10 @@ fn handle_step(
     };
     control.advance_ms(ms);
     let ticks = control.virtual_ms();
+    let gating = step_mode_enabled();
     let body = format!(
-        "{{\"accepted\":true,\"advanced_ms\":{ms},\"ticks\":{ticks},\"frame_time_ms\":{FRAME_TIME}}}\n"
+        "{{\"accepted\":true,\"advanced_ms\":{ms},\"ticks\":{ticks},\
+         \"frame_time_ms\":{FRAME_TIME},\"gating\":{gating}}}\n"
     );
     write_response(stream, 202, "Accepted", "application/json", body.as_bytes())
 }

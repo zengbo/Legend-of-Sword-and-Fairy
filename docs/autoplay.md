@@ -71,14 +71,30 @@ JSON object (fields may grow; treat unknown keys as optional):
 
 ### Step mode (`--ui-step` / `RUSTPAL_UI_STEP=1`)
 
-With step mode **on**, `Engine::ticks` no longer follows wall time. Delays and
-frame pacing wait until an agent calls `POST /v1/step`. This is the headless
-**single-frame** control loop for AI:
+With step mode **gating on**, `Engine::ticks` no longer follows wall time.
+Delays and frame pacing wait until an agent calls `POST /v1/step`. This is the
+headless **single-frame** control loop for AI.
+
+| How you run | Clock | Console picture |
+| --- | --- | --- |
+| `--ui-step --offscreen` | Virtual (must `POST /v1/step`) | n/a |
+| `--ui-step --console` | **Realtime** by default | Animates normally |
+| `--ui-step --console` + `RUSTPAL_UI_STEP_STRICT=1` | Virtual | Frozen until stepped |
+
+Why: every boot path hits `delay` before the first full present. If the clock
+is virtual and nothing calls `/v1/step`, the console stays on an empty alt
+screen. So **console defaults to wall-clock** so you can still watch; use
+`STRICT` when you want single-frame control while watching.
 
 ```shell
-# Terminal 1 — engine blocks until stepped
-cargo run --release --no-default-features --features console -- \
-  --ui-driver --offscreen --ui-step --mute
+# Terminal 1 — headless agent: engine blocks until stepped
+cargo run --release -- --ui-driver --offscreen --ui-step --mute
+
+# Terminal 1 — watch in console (realtime) + HTTP state/input
+cargo run --release -- --console --ui-driver --ui-step
+
+# Terminal 1 — watch AND freeze until stepped
+RUSTPAL_UI_STEP_STRICT=1 cargo run --release -- --console --ui-driver --ui-step
 
 # Terminal 2 — agent
 curl -s http://127.0.0.1:8765/v1/state
@@ -89,9 +105,8 @@ curl -s http://127.0.0.1:8765/v1/frame.png -o frame.png
 
 JSON body is also accepted: `{"frames":5}` or `{"ms":500}`.
 
-Boot (trademark / splash) still runs real delay loops; under step mode you must
-advance time through them (e.g. `POST /v1/step?frames=200` once after start) or
-use a small helper that steps until `in_main_game` is true.
+Under strict/offscreen step mode you must advance boot delays yourself
+(e.g. `POST /v1/step?frames=200`) until `in_main_game` is true.
 
 Without step mode the game runs in real time; HTTP input still works.
 
