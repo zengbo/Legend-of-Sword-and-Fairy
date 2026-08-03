@@ -31,6 +31,11 @@ RUSTPAL_CONSOLE_FPS=1 ./target/release/rustpal --console=kitty
 ./target/release/rustpal --console=kitty --ui-driver=127.0.0.1:8765
 # Then from another shell: curl -X POST http://127.0.0.1:8765/v1/input/confirm/tap
 # Full API: docs/autoplay.md
+
+# Logs while the game is on the alternate screen (avoids scrolling the picture)
+# Default: stderr is muted (/dev/null) after startup.
+# RUSTPAL_CONSOLE_LOG=/tmp/rustpal.log   # append engine/pilot logs here
+# RUSTPAL_CONSOLE_VERBOSE=1              # keep stderr on the tty (debug; may jump the image)
 ```
 
 Needs the `pal/` data directory (same as GUI).

@@ -8,10 +8,17 @@
 //! stuck main thread) still work. Ctrl-C is handled by a signal handler that
 //! **restores the terminal** (leave alt screen, re-enable echo) before exit —
 //! a bare SIGINT kill would leave Kitty stuck on the game buffer.
+//!
+//! After the alternate screen is entered, **stderr is redirected** away from
+//! the tty (to `RUSTPAL_CONSOLE_LOG` or `/dev/null`) so `eprintln!` from the
+//! engine / autoplay pilot cannot scroll the game image. Set
+//! `RUSTPAL_CONSOLE_VERBOSE=1` to keep stderr on the terminal (debug only).
 
 use std::io::{self, Write};
 #[cfg(not(unix))]
 use std::io::Read;
+#[cfg(unix)]
+use std::os::fd::IntoRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -83,6 +90,9 @@ pub struct ConsoleVideo {
     pending: Vec<(KeyCode, bool)>,
     /// Optional HTTP control API (`RUSTPAL_UI_DRIVER` / `--ui-driver`).
     ui_driver: Option<crate::ui_driver::UiDriver>,
+    /// Restores original stderr when the console backend ends.
+    #[cfg(unix)]
+    _stderr_guard: Option<StderrRedirect>,
     #[cfg(unix)]
     _tty_guard: TtyRawGuard,
 }
@@ -92,6 +102,58 @@ pub struct ConsoleVideo {
 struct TtyRawGuard {
     fd: i32,
     orig: libc::termios,
+}
+
+/// Redirects `stderr` to a file or `/dev/null` so log lines cannot scroll the
+/// alternate-screen framebuffer. Restored on drop.
+#[cfg(unix)]
+struct StderrRedirect {
+    saved_fd: i32,
+}
+
+#[cfg(unix)]
+impl StderrRedirect {
+    fn install() -> io::Result<Option<Self>> {
+        // Opt out for debugging (accepts that logs may jump the picture).
+        if env_flag_enabled("RUSTPAL_CONSOLE_VERBOSE") {
+            return Ok(None);
+        }
+        let target = match std::env::var("RUSTPAL_CONSOLE_LOG") {
+            Ok(path) if !path.is_empty() => path,
+            _ => "/dev/null".to_string(),
+        };
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&target)?;
+        let saved_fd = unsafe { libc::dup(libc::STDERR_FILENO) };
+        if saved_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let new_fd = file.into_raw_fd();
+        let rc = unsafe { libc::dup2(new_fd, libc::STDERR_FILENO) };
+        unsafe {
+            let _ = libc::close(new_fd);
+        }
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            unsafe {
+                let _ = libc::close(saved_fd);
+            }
+            return Err(err);
+        }
+        Ok(Some(Self { saved_fd }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StderrRedirect {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = libc::dup2(self.saved_fd, libc::STDERR_FILENO);
+            let _ = libc::close(self.saved_fd);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -181,9 +243,11 @@ impl ConsoleVideo {
         #[cfg(not(unix))]
         let key_rx = spawn_stdin_reader();
 
-        let mut out = io::stdout();
-        // Alternate screen once.
-        write!(out, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
+        // HTTP driver + startup diagnostics go to the *main* screen (before
+        // alt buffer). After alt screen, stderr is redirected so game/pilot
+        // logs cannot scroll the picture.
+        let ui_driver = crate::ui_driver::UiDriver::start_from_env()?;
+
         let label = if use_kitty { "Kitty" } else { "ANSI" };
         let size_note = if use_kitty {
             format!("{place_cols} cols wide")
@@ -197,19 +261,38 @@ impl ConsoleVideo {
         };
         let ssh_note = if over_ssh { " · SSH" } else { "" };
         let fps_note = if show_fps { " · FPS on" } else { "" };
+        eprintln!(
+            "rustpal: console backend ready ({label}, place_cols={place_cols}, ansi_scale={ansi_scale}, ssh={over_ssh}, fps={show_fps})"
+        );
+        if !env_flag_enabled("RUSTPAL_CONSOLE_VERBOSE") {
+            match std::env::var("RUSTPAL_CONSOLE_LOG") {
+                Ok(path) if !path.is_empty() => {
+                    eprintln!("rustpal: console stderr → {path} (set RUSTPAL_CONSOLE_VERBOSE=1 to keep on tty)");
+                }
+                _ => {
+                    eprintln!(
+                        "rustpal: console stderr muted during play (RUSTPAL_CONSOLE_LOG=path or VERBOSE=1)"
+                    );
+                }
+            }
+        }
+
+        let mut out = io::stdout();
+        // Alternate screen once.
+        write!(out, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
         writeln!(
             out,
             "\x1b[36mrustpal console ({label} · {size_note}{ssh_note}{fps_note}) — arrows/hjkl · Enter · Esc · Ctrl-C restores terminal & quits\x1b[0m"
         )?;
         out.flush()?;
-        eprintln!(
-            "rustpal: console backend ready ({label}, place_cols={place_cols}, ansi_scale={ansi_scale}, ssh={over_ssh}, fps={show_fps})"
-        );
 
         #[cfg(unix)]
         install_console_signal_handlers();
 
-        let ui_driver = crate::ui_driver::UiDriver::start_from_env()?;
+        // Mute stderr only after the alt screen is up (messages above stay visible
+        // on the primary screen when the user leaves alt buffer).
+        #[cfg(unix)]
+        let stderr_guard = StderrRedirect::install()?;
 
         let scaled_len = if use_kitty {
             0
@@ -238,6 +321,8 @@ impl ConsoleVideo {
             held: Vec::new(),
             pending: Vec::new(),
             ui_driver,
+            #[cfg(unix)]
+            _stderr_guard: stderr_guard,
             #[cfg(unix)]
             _tty_guard: tty_guard,
         })
@@ -353,16 +438,8 @@ impl ConsoleVideo {
                 &self.rgba,
                 self.place_cols,
             ) {
+                // Goes to redirected stderr (file or /dev/null) — never the alt screen.
                 eprintln!("rustpal: kitty frame error: {e}");
-            }
-            if first {
-                eprintln!(
-                    "rustpal: first kitty frame sent ({} bytes raw, c={}, ssh={}, sync={})",
-                    self.rgba.len(),
-                    self.place_cols,
-                    self.over_ssh,
-                    use_sync
-                );
             }
         } else {
             let scale = self.ansi_scale.max(1);

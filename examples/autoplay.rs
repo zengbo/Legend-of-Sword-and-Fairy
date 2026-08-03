@@ -458,6 +458,27 @@ fn record(paths: &Paths, seconds: u64, console_mode: Option<&str>) {
     );
 
     seed_random(19950710);
+
+    // Log *before* the console alt-screen (and stderr redirect) takes over.
+    let console_on = console_mode.is_some();
+    if console_on {
+        eprintln!(
+            "recording {seconds}s of autoplay into {}/ (console video on) ...",
+            paths.dir
+        );
+        // Keep pilot / frame progress off the tty; ConsoleVideo will redirect
+        // stderr here once the alt screen is up (unless VERBOSE=1).
+        if std::env::var_os("RUSTPAL_CONSOLE_LOG").is_none()
+            && std::env::var_os("RUSTPAL_CONSOLE_VERBOSE").is_none()
+        {
+            let log_path = format!("{}/autoplay.log", paths.dir);
+            std::env::set_var("RUSTPAL_CONSOLE_LOG", &log_path);
+            eprintln!("rustpal: pilot logs → {log_path}");
+        }
+    } else {
+        eprintln!("recording {seconds}s of autoplay into {}/ ...", paths.dir);
+    }
+
     let mut e = match console_mode {
         Some(mode) => {
             #[cfg(feature = "console")]
@@ -495,6 +516,8 @@ fn record(paths: &Paths, seconds: u64, console_mode: Option<&str>) {
     ));
 
     let mut captured: u64 = 0;
+    // Progress lines go through eprintln; with console video they land in the
+    // redirected log file (not the alt screen).
     e.frame_sink = Some(Box::new(move |rgba, ticks| {
         frames.write_all(rgba).expect("write frame");
         writeln!(times, "{ticks}").expect("write tick");
@@ -509,14 +532,6 @@ fn record(paths: &Paths, seconds: u64, console_mode: Option<&str>) {
         move |e: &mut Engine| pilot.step(e)
     }));
 
-    if console_mode.is_some() {
-        eprintln!(
-            "recording {seconds}s of autoplay into {}/ (console video on) ...",
-            paths.dir
-        );
-    } else {
-        eprintln!("recording {seconds}s of autoplay into {}/ ...", paths.dir);
-    }
     e.run();
 
     // Dropping the sinks flushes and closes their files.
