@@ -762,7 +762,7 @@ mod tests {
         let px = [255u8, 0, 0, 255];
         let mut out = Vec::new();
         write_kitty_frame(&mut out, 1, 1, 1, &px, 80, true).unwrap();
-        let s = String::from_utf8(out).unwrap();
+        let s = String::from_utf8(out.clone()).unwrap();
         assert!(s.contains("c=80"), "{s}");
         assert!(s.contains("a=T"));
 
