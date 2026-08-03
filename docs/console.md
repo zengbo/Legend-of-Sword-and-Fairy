@@ -17,18 +17,22 @@ cargo build --release
 
 ```shell
 ./target/release/rustpal --console          # auto: Kitty if detected, else ANSI
-./target/release/rustpal --console=kitty    # force Kitty graphics protocol
-./target/release/rustpal --console=ansi     # force half-block truecolor
-./target/release/rustpal --console --console-scale=6   # force 6× (1920×1200)
-# or: RUSTPAL_CONSOLE_SCALE=6 ./target/release/rustpal --console
+./target/release/rustpal --console=kitty
+./target/release/rustpal --console=ansi
+# Kitty size: --console-scale=N ≈ N×40 terminal columns (e.g. 4 → ~160 cols)
+./target/release/rustpal --console --console-scale=5
 ```
 
 Needs the `pal/` data directory (same as GUI).
 
-Native game resolution is **320×200**. Kitty mode used to draw 1:1 device
-pixels (postage-stamp on Retina). The console backend now **integer-upscales**
-(nearest-neighbor) to fit the terminal (or `RUSTPAL_CONSOLE_SCALE` / `--console-scale=N`).
-Banner line shows the effective scale, e.g. `4× → 1280×800`.
+**Kitty:** always sends **320×200** pixels; the terminal stretches them with the
+graphics-protocol `c=` (column) placement — large and fast (no multi‑MB
+upscaled bitmaps that froze the loop).
+
+**ANSI:** small integer upscale (1–3×) + half-block cells.
+
+**Input:** background thread reads `/dev/tty`; **Ctrl-C keeps ISIG** so it
+kills the process even if a frame is being encoded.
 
 ### Controls
 
