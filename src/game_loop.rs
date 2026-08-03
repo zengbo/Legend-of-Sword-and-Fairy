@@ -941,6 +941,7 @@ impl Engine {
     fn ui_driver_state_json(&self) -> String {
         let frame_id = crate::ui_driver::latest_frame_id();
         let step_mode = crate::ui_driver::step_mode_enabled();
+        let step_configured = crate::ui_driver::step_mode_configured();
         let player_x = self.globals.viewport.0 + self.globals.partyoffset.0;
         let player_y = self.globals.viewport.1 + self.globals.partyoffset.1;
         let in_dialog = self.ui.in_dialog || self.ui.current_dialog_line > 0;
@@ -969,6 +970,7 @@ impl Engine {
              \"status\":\"ok\",\
              \"frame_id\":{frame_id},\
              \"step_mode\":{step_mode},\
+             \"step_configured\":{step_configured},\
              \"ticks\":{},\
              \"frame_num\":{},\
              \"scene\":{},\
