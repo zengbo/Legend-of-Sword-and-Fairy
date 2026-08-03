@@ -69,6 +69,12 @@ pub struct ConsoleVideo {
     last_present: Instant,
     close_requested: bool,
     frame_n: u64,
+    /// Show FPS on the status line when `RUSTPAL_CONSOLE_FPS` / `RUSTPAL_SHOW_FPS` is set.
+    show_fps: bool,
+    fps_window_start: Instant,
+    fps_frames: u32,
+    /// Smoothed FPS written to the banner (~1 Hz update).
+    fps_value: f32,
     /// Bytes from the input thread.
     key_rx: Receiver<u8>,
     esc_buf: Vec<u8>,
@@ -165,6 +171,8 @@ impl ConsoleVideo {
         };
         let (place_cols, ansi_scale) = resolve_display_size(use_kitty);
         let over_ssh = is_over_ssh();
+        let show_fps = env_flag_enabled("RUSTPAL_CONSOLE_FPS")
+            || env_flag_enabled("RUSTPAL_SHOW_FPS");
 
         #[cfg(unix)]
         let (key_rx, tty_guard) = spawn_tty_reader()?;
@@ -186,13 +194,14 @@ impl ConsoleVideo {
             )
         };
         let ssh_note = if over_ssh { " · SSH" } else { "" };
+        let fps_note = if show_fps { " · FPS on" } else { "" };
         writeln!(
             out,
-            "\x1b[36mrustpal console ({label} · {size_note}{ssh_note}) — arrows/hjkl · Enter · Esc · Ctrl-C restores terminal & quits\x1b[0m"
+            "\x1b[36mrustpal console ({label} · {size_note}{ssh_note}{fps_note}) — arrows/hjkl · Enter · Esc · Ctrl-C restores terminal & quits\x1b[0m"
         )?;
         out.flush()?;
         eprintln!(
-            "rustpal: console backend ready ({label}, place_cols={place_cols}, ansi_scale={ansi_scale}, ssh={over_ssh})"
+            "rustpal: console backend ready ({label}, place_cols={place_cols}, ansi_scale={ansi_scale}, ssh={over_ssh}, fps={show_fps})"
         );
 
         #[cfg(unix)]
@@ -215,6 +224,10 @@ impl ConsoleVideo {
             last_present: Instant::now() - frame_interval(over_ssh),
             close_requested: false,
             frame_n: 0,
+            show_fps,
+            fps_window_start: Instant::now(),
+            fps_frames: 0,
+            fps_value: 0.0,
             key_rx,
             esc_buf: Vec::new(),
             esc_solo_since: None,
@@ -350,10 +363,31 @@ impl ConsoleVideo {
             let _ = write_ansi_halfblock(&mut out, fw, fh, frame);
         }
 
+        if self.show_fps {
+            self.note_displayed_frame(now);
+            // Status line (row 1): keep help text short, append FPS on the right.
+            let _ = write!(
+                out,
+                "\x1b[1;1H\x1b[36mrustpal\x1b[0m  \x1b[33m{:>5.1} FPS\x1b[0m\x1b[K",
+                self.fps_value
+            );
+        }
+
         if use_sync {
             let _ = write!(out, "\x1b[?2026l");
         }
         let _ = out.flush();
+    }
+
+    /// Count a frame that was actually sent to the terminal; refresh `fps_value` ~1 Hz.
+    fn note_displayed_frame(&mut self, now: Instant) {
+        self.fps_frames = self.fps_frames.saturating_add(1);
+        let elapsed = now.duration_since(self.fps_window_start).as_secs_f32();
+        if elapsed >= 0.5 {
+            self.fps_value = self.fps_frames as f32 / elapsed.max(0.001);
+            self.fps_frames = 0;
+            self.fps_window_start = now;
+        }
     }
 
     pub fn close_requested(&self) -> bool {
@@ -688,6 +722,20 @@ fn sync_output_enabled(over_ssh: bool) -> bool {
         Some("0") | Some("false") | Some("no") => false,
         // Default: on over SSH only (reduces white flash); off locally.
         _ => over_ssh,
+    }
+}
+
+/// True for `1` / `true` / `yes` / `on` (case-insensitive). Empty/unset → false.
+fn env_flag_enabled(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.trim();
+            v == "1"
+                || v.eq_ignore_ascii_case("true")
+                || v.eq_ignore_ascii_case("yes")
+                || v.eq_ignore_ascii_case("on")
+        }
+        Err(_) => false,
     }
 }
 

@@ -102,9 +102,14 @@ fn print_help() {
          --console           Terminal video (Kitty pixels or ANSI half-blocks)\n\
          --console=kitty     Force Kitty graphics protocol\n\
          --console=ansi      Force ANSI half-block rendering\n\
-         --console-scale=N   Integer upscale (1–16); default auto-fits the terminal\n\
+         --console-scale=N   Integer upscale / Kitty width (see docs/console.md)\n\
          --offscreen         GUI: render without a visible window\n\
-         --mute              Disable music and sound effects"
+         --mute              Disable music and sound effects\n\n\
+         Env (console):\n\
+           RUSTPAL_CONSOLE_FPS=1   Show FPS on the status line\n\
+           RUSTPAL_SHOW_FPS=1      Same as above\n\
+           RUSTPAL_CONSOLE_SYNC=0  Disable CSI 2026 sync (SSH)\n\
+           RUSTPAL_CONSOLE_SCALE=N Same as --console-scale"
     );
     #[cfg(feature = "gui")]
     println!(

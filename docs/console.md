@@ -21,6 +21,10 @@ cargo build --release
 ./target/release/rustpal --console=ansi
 # Kitty size: --console-scale=N ≈ N×40 terminal columns (e.g. 4 → ~160 cols)
 ./target/release/rustpal --console --console-scale=5
+
+# Show FPS on the top status line (displayed frames / wall time, ~0.5s window)
+RUSTPAL_CONSOLE_FPS=1 ./target/release/rustpal --console=kitty
+# alias: RUSTPAL_SHOW_FPS=1
 ```
 
 Needs the `pal/` data directory (same as GUI).
