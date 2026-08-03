@@ -537,9 +537,13 @@ mod tests {
         ];
         let mut dst = vec![0u8; 4 * 4 * 4];
         nearest_upscale(&src, 2, 2, 2, &mut dst);
-        // top-left 2×2 block should be red
+        // top-left 2×2 block (out rows 0–1) should be red
         assert_eq!(&dst[0..4], &[255, 0, 0, 255]);
         assert_eq!(&dst[4..8], &[255, 0, 0, 255]);
-        assert_eq!(&dst[(2 * 4) * 4..(2 * 4) * 4 + 4], &[255, 0, 0, 255]);
+        let row1 = 4 * 4; // second output row, first pixel
+        assert_eq!(&dst[row1..row1 + 4], &[255, 0, 0, 255]);
+        // out row 2 comes from source y=1 → green
+        let row2 = 2 * 4 * 4;
+        assert_eq!(&dst[row2..row2 + 4], &[0, 255, 0, 255]);
     }
 }
