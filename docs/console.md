@@ -51,18 +51,20 @@ ignored input.
 
 ### Flicker (especially over SSH)
 
-Local Kitty is usually fine; **SSH latency** makes intermediate updates visible
-as white flashes if every frame re-places the image.
+Local Kitty is usually fine; **SSH latency** can make APC chunk gaps look like
+white flashes.
 
-Mitigations in the backend:
+Mitigations:
 
-1. **First frame** `a=T` (transmit + place once with `c=` columns).
-2. **Later frames** `a=t` only — replace pixel payload; placements stay put.
-3. **`CSI ? 2026` synchronized output** around each update (show finished frame only).
-4. Slightly lower FPS when `SSH_CONNECTION` / `SSH_CLIENT` / `SSH_TTY` is set.
+1. Stable Kitty image id + placement (`i=1`, `p=1`, `c=…`) every frame via `a=T`.
+2. Over SSH: **`CSI ? 2026` synchronized output** (batch until the frame is complete).
+   - Force on/off: `RUSTPAL_CONSOLE_SYNC=1` or `=0`
+3. Slightly lower FPS when `SSH_*` is set.
 
-Prefer `kitten ssh user@host` so the graphics protocol is forwarded cleanly.
-Avoid tmux unless `allow-passthrough` is enabled.
+Prefer `kitten ssh user@host`. Avoid tmux unless passthrough is enabled.
+
+> Note: `a=t` (transmit-only) updates were tried for less flicker but left a
+> **blank screen** on several Kitty builds, so they are not used.
 
 ### Kitty mode
 

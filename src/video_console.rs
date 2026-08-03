@@ -301,19 +301,21 @@ impl ConsoleVideo {
         let first = self.frame_n == 1;
 
         let mut out = io::stdout();
-        // Synchronized output: terminal shows the finished update as one step.
-        // Essential over SSH (high latency makes partial APC blasts look like
-        // white flashes). Harmless locally on modern Kitty.
-        let _ = write!(out, "\x1b[?2026h");
+        // Sync output (CSI 2026) only over SSH — batches the APC so the
+        // terminal does not flash between chunks. Locally we skip it: some
+        // Kitty builds held a blank buffer when 2026 was used incorrectly.
+        // Force: RUSTPAL_CONSOLE_SYNC=1/0.
+        let use_sync = sync_output_enabled(self.over_ssh);
+        if use_sync {
+            let _ = write!(out, "\x1b[?2026h");
+        }
 
         if self.use_kitty {
+            // Always a=T with the same image id + placement. (a=t-only updates
+            // did not repaint on several Kitty versions → black screen.)
             if first {
-                // Place once under the banner.
                 let _ = write!(out, "\x1b[2;1H");
             }
-            // First frame: transmit + place (a=T). Later frames: transmit only
-            // (a=t) so existing placements update in place — avoids the
-            // delete/repaint flash that is very visible over SSH.
             if let Err(e) = write_kitty_frame(
                 &mut out,
                 IMAGE_ID,
@@ -321,16 +323,16 @@ impl ConsoleVideo {
                 SCREEN_H as u32,
                 &self.rgba,
                 self.place_cols,
-                first,
             ) {
                 eprintln!("rustpal: kitty frame error: {e}");
             }
             if first {
                 eprintln!(
-                    "rustpal: first kitty frame sent ({} bytes raw, c={}, ssh={})",
+                    "rustpal: first kitty frame sent ({} bytes raw, c={}, ssh={}, sync={})",
                     self.rgba.len(),
                     self.place_cols,
-                    self.over_ssh
+                    self.over_ssh,
+                    use_sync
                 );
             }
         } else {
@@ -348,7 +350,9 @@ impl ConsoleVideo {
             let _ = write_ansi_halfblock(&mut out, fw, fh, frame);
         }
 
-        let _ = write!(out, "\x1b[?2026l");
+        if use_sync {
+            let _ = write!(out, "\x1b[?2026l");
+        }
         let _ = out.flush();
     }
 
@@ -678,9 +682,18 @@ fn frame_interval(over_ssh: bool) -> Duration {
     }
 }
 
-/// `place_first`: use a=T (transmit+display with placement). Subsequent frames
-/// use a=t (replace image payload only) so placements stay put — much less
-/// flicker over SSH than re-running a=T every frame.
+fn sync_output_enabled(over_ssh: bool) -> bool {
+    match std::env::var("RUSTPAL_CONSOLE_SYNC").ok().as_deref() {
+        Some("1") | Some("true") | Some("yes") => true,
+        Some("0") | Some("false") | Some("no") => false,
+        // Default: on over SSH only (reduces white flash); off locally.
+        _ => over_ssh,
+    }
+}
+
+/// Transmit + display (a=T) with stable image/placement ids so Kitty replaces
+/// the same slot. Same `i`/`p`/`c` every frame is the portable path that
+/// actually paints; `a=t` alone left a black screen on several Kitty builds.
 fn write_kitty_frame(
     out: &mut impl Write,
     image_id: u32,
@@ -688,10 +701,8 @@ fn write_kitty_frame(
     height: u32,
     rgba: &[u8],
     place_cols: u32,
-    place_first: bool,
 ) -> io::Result<()> {
     assert_eq!(rgba.len(), (width * height * 4) as usize);
-    // Fast compression — present must stay snappy so pump() keeps running.
     let compressed = miniz_oxide::deflate::compress_to_vec_zlib(rgba, 1);
     let payload = BASE64.encode(&compressed);
     let chunks: Vec<&[u8]> = payload.as_bytes().chunks(KITTY_CHUNK).collect();
@@ -699,19 +710,11 @@ fn write_kitty_frame(
     for (i, chunk) in chunks.iter().enumerate() {
         let more = u8::from(i != last);
         if i == 0 {
-            if place_first {
-                // Transmit + place: c= columns, C=1 keep cursor.
-                write!(
-                    out,
-                    "\x1b_Ga=T,f=32,o=z,s={width},v={height},t=d,i={image_id},p=1,c={place_cols},C=1,q=2,m={more};"
-                )?;
-            } else {
-                // Transmit only — existing placements refresh in place.
-                write!(
-                    out,
-                    "\x1b_Ga=t,f=32,o=z,s={width},v={height},t=d,i={image_id},q=2,m={more};"
-                )?;
-            }
+            // a=T transmit+display, c= columns (Kitty scales), C=1 keep cursor.
+            write!(
+                out,
+                "\x1b_Ga=T,f=32,o=z,s={width},v={height},t=d,i={image_id},p=1,c={place_cols},C=1,q=2,m={more};"
+            )?;
         } else {
             write!(out, "\x1b_Gm={more};")?;
         }
@@ -758,19 +761,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kitty_first_frame_places_later_only_transmits() {
+    fn kitty_frame_header_has_place_and_display() {
         let px = [255u8, 0, 0, 255];
         let mut out = Vec::new();
-        write_kitty_frame(&mut out, 1, 1, 1, &px, 80, true).unwrap();
-        let s = String::from_utf8(out.clone()).unwrap();
-        assert!(s.contains("c=80"), "{s}");
-        assert!(s.contains("a=T"));
-
-        out.clear();
-        write_kitty_frame(&mut out, 1, 1, 1, &px, 80, false).unwrap();
+        write_kitty_frame(&mut out, 1, 1, 1, &px, 80).unwrap();
         let s = String::from_utf8(out).unwrap();
-        assert!(s.contains("a=t"), "{s}");
-        assert!(!s.contains("a=T,"));
+        assert!(s.contains("c=80"), "{s}");
+        assert!(s.contains("a=T"), "{s}");
+        assert!(s.contains("i=1"), "{s}");
     }
 
     #[test]
