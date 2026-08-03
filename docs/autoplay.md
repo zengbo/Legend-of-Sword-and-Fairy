@@ -12,6 +12,9 @@ cargo run --release -- --ui-driver --offscreen
 cargo run --release -- --console --ui-driver
 cargo run --release -- --console=kitty --ui-driver=127.0.0.1:8765
 
+# Headless-style agent loop: virtual clock, single-frame steps
+cargo run --release -- --ui-driver --offscreen --ui-step --mute
+
 # Built-in pilot example, visible in the terminal
 cargo run --release --example autoplay -- record --console /tmp/ap 60
 ```
@@ -28,8 +31,12 @@ when terminal redraw is throttled.
 
 | Request | Purpose |
 | --- | --- |
-| `GET /v1/status` | Return `status`, logical frame size, and monotonically increasing `frame_id`. |
-| `GET /v1/frame.png` | Capture the latest logical 320×200 RGBA frame as PNG. |
+| `GET /v1/status` | `status`, size, `frame_id`, `step_mode`, virtual `ticks`. |
+| `GET /v1/state` | Structured game snapshot (scene, party, dialog, battle, …). |
+| `GET /v1/frame.png` | Latest logical 320×200 RGBA frame as PNG. |
+| `POST /v1/step` | Advance virtual clock (step mode only). Default +100 ms (one overworld frame). |
+| `POST /v1/step?frames=N` | Advance `N × 100` ms. |
+| `POST /v1/step?ms=N` | Advance `N` ms. |
 | `POST /v1/input/{key}/tap` | Press and release one game key. |
 | `POST /v1/input/{key}/press` | Hold one game key down. |
 | `POST /v1/input/{key}/release` | Release one held game key. |
@@ -37,6 +44,56 @@ when terminal redraw is throttled.
 Supported key names are `up`, `down`, `left`, `right`, `menu`, `confirm`,
 `space`, `page_up`, `page_down`, `home`, `end`, `repeat`, `auto`, `defend`,
 `use_item`, `throw_item`, `flee`, `force`, and `status`.
+
+### `GET /v1/state` fields
+
+JSON object (fields may grow; treat unknown keys as optional):
+
+| Field | Meaning |
+| --- | --- |
+| `frame_id` | Same counter as `/v1/status` (increments on present). |
+| `step_mode` | Whether the engine clock is virtual. |
+| `ticks` | Engine time (ms); virtual when step mode is on. |
+| `frame_num` | Overworld animation / logic frame counter. |
+| `scene` | Current scene number. |
+| `viewport` | `[x, y]` map viewport. |
+| `party_offset` | Party draw offset. |
+| `player` | Party feet position `viewport + party_offset`. |
+| `party_direction` | Facing (0–3). |
+| `in_main_game` | Past the opening menu. |
+| `entering_scene` | Scene transition in progress. |
+| `in_battle` | Battle active. |
+| `in_dialog` | Dialog box open. |
+| `dialog_line` | Current dialog line counter. |
+| `quit_requested` | Engine shutting down / ending. |
+| `cash` | Money. |
+| `party` | Array of `{slot, role, hp, max_hp, mp, max_mp, level}`. |
+
+### Step mode (`--ui-step` / `RUSTPAL_UI_STEP=1`)
+
+With step mode **on**, `Engine::ticks` no longer follows wall time. Delays and
+frame pacing wait until an agent calls `POST /v1/step`. This is the headless
+**single-frame** control loop for AI:
+
+```shell
+# Terminal 1 — engine blocks until stepped
+cargo run --release --no-default-features --features console -- \
+  --ui-driver --offscreen --ui-step --mute
+
+# Terminal 2 — agent
+curl -s http://127.0.0.1:8765/v1/state
+curl -s -X POST http://127.0.0.1:8765/v1/input/confirm/tap
+curl -s -X POST 'http://127.0.0.1:8765/v1/step?frames=1'
+curl -s http://127.0.0.1:8765/v1/frame.png -o frame.png
+```
+
+JSON body is also accepted: `{"frames":5}` or `{"ms":500}`.
+
+Boot (trademark / splash) still runs real delay loops; under step mode you must
+advance time through them (e.g. `POST /v1/step?frames=200` once after start) or
+use a small helper that steps until `in_main_game` is true.
+
+Without step mode the game runs in real time; HTTP input still works.
 
 For example, capture a checkpoint, advance dialogue, then walk:
 
@@ -53,9 +110,9 @@ curl http://127.0.0.1:8765/v1/frame.png \
 ```
 
 An autoplay client can poll `/v1/status`, fetch a frame after `frame_id`
-changes, decide its next action from the image, submit input, and save
-milestone frames. Physical keyboard input continues to work through the same
-engine input path.
+changes, decide its next action from the image and `/v1/state`, submit input,
+optionally `POST /v1/step`, and save milestone frames. Physical keyboard input
+continues to work through the same engine input path.
 
 ## Captured demo
 

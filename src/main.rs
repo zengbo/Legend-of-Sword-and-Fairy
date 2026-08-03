@@ -10,12 +10,18 @@ fn main() {
         let mut console_mode = "auto";
         #[cfg(any(feature = "gui", feature = "console"))]
         let mut ui_driver = None::<String>;
+        #[cfg(any(feature = "gui", feature = "console"))]
+        let mut ui_step = false;
 
         for argument in std::env::args().skip(1) {
             match argument.as_str() {
                 #[cfg(any(feature = "gui", feature = "console"))]
                 "--ui-driver" => {
                     ui_driver = Some(rustpal::ui_driver::DEFAULT_BIND.to_owned());
+                }
+                #[cfg(any(feature = "gui", feature = "console"))]
+                "--ui-step" => {
+                    ui_step = true;
                 }
                 "--offscreen" => offscreen = true,
                 "--mute" => mute = true,
@@ -54,6 +60,17 @@ fn main() {
         #[cfg(any(feature = "gui", feature = "console"))]
         if let Some(bind) = ui_driver {
             std::env::set_var("RUSTPAL_UI_DRIVER", bind);
+        }
+        #[cfg(any(feature = "gui", feature = "console"))]
+        if ui_step {
+            std::env::set_var("RUSTPAL_UI_STEP", "1");
+            // Step mode is useless without the control API; default the bind.
+            if std::env::var_os("RUSTPAL_UI_DRIVER").is_none() {
+                std::env::set_var(
+                    "RUSTPAL_UI_DRIVER",
+                    rustpal::ui_driver::DEFAULT_BIND,
+                );
+            }
         }
         if offscreen {
             std::env::set_var("RUSTPAL_OFFSCREEN", "1");
@@ -121,7 +138,8 @@ fn print_help() {
         "\n--ui-driver         Enable local control API at {}\n\
          --ui-driver=ADDR    Enable it at a loopback IP and port\n\
                            Works with GUI, --offscreen, or --console\n\
-                           (see docs/autoplay.md)",
+         --ui-step           Virtual clock: agent advances with POST /v1/step\n\
+                           (implies --ui-driver if unset; see docs/autoplay.md)",
         rustpal::ui_driver::DEFAULT_BIND
     );
     println!(

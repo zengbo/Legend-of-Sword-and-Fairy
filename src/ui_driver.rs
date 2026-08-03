@@ -2,23 +2,28 @@
 //!
 //! The server deliberately accepts loopback addresses only. It feeds key
 //! transitions into the same queue as the active video backend (GUI window or
-//! console) and captures the logical 320×200 RGBA frame presented by the
-//! engine.
+//! console), captures the logical 320×200 RGBA frame, publishes a structured
+//! game **state** snapshot, and optionally runs a **step clock** so an external
+//! agent can advance the engine one frame at a time.
 
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
 use crate::keys::KeyCode;
 
-use crate::game_loop::{render_rgba, PalColor};
+use crate::game_loop::{render_rgba, FRAME_TIME, PalColor};
 use crate::surface::{Surface, SCREEN_H, SCREEN_W};
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:8765";
 const TAP_DURATION: Duration = Duration::from_millis(75);
+
+/// Process-wide control plane installed when a UI driver starts (latest wins).
+static CONTROL: RwLock<Option<Arc<SharedControl>>> = RwLock::new(None);
 
 #[derive(Default)]
 struct LatestFrame {
@@ -26,11 +31,121 @@ struct LatestFrame {
     rgba: Vec<u8>,
 }
 
+struct SharedControl {
+    latest_frame: RwLock<LatestFrame>,
+    /// Latest JSON body for `GET /v1/state` (without trailing framing).
+    state_json: RwLock<String>,
+    step_enabled: AtomicBool,
+    /// Virtual millisecond clock used when step mode is on (`Engine::ticks`).
+    virtual_ms: AtomicU64,
+    step_pair: (Mutex<()>, Condvar),
+}
+
+impl SharedControl {
+    fn new(step_enabled: bool) -> Self {
+        Self {
+            latest_frame: RwLock::new(LatestFrame::default()),
+            state_json: RwLock::new(
+                "{\"status\":\"starting\",\"frame_id\":0,\"step_mode\":false}\n".into(),
+            ),
+            step_enabled: AtomicBool::new(step_enabled),
+            virtual_ms: AtomicU64::new(0),
+            step_pair: (Mutex::new(()), Condvar::new()),
+        }
+    }
+
+    fn step_enabled(&self) -> bool {
+        self.step_enabled.load(Ordering::SeqCst)
+    }
+
+    fn virtual_ms(&self) -> u64 {
+        self.virtual_ms.load(Ordering::SeqCst)
+    }
+
+    fn advance_ms(&self, ms: u64) {
+        if ms == 0 {
+            return;
+        }
+        self.virtual_ms.fetch_add(ms, Ordering::SeqCst);
+        self.step_pair.1.notify_all();
+    }
+
+    /// Block until `virtual_ms >= deadline` (or step mode is turned off).
+    fn wait_until_ms(&self, deadline: u64) {
+        if !self.step_enabled() {
+            return;
+        }
+        let (lock, cvar) = &self.step_pair;
+        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while self.step_enabled() && self.virtual_ms() < deadline {
+            let result = cvar
+                .wait_timeout(guard, Duration::from_secs(30))
+                .unwrap_or_else(|e| e.into_inner());
+            guard = result.0;
+            // Spurious wake / timeout: loop and re-check.
+        }
+    }
+}
+
+fn control() -> Option<Arc<SharedControl>> {
+    CONTROL.read().ok().and_then(|g| g.clone())
+}
+
+fn install_control(control: Arc<SharedControl>) {
+    if let Ok(mut slot) = CONTROL.write() {
+        *slot = Some(control);
+    }
+}
+
+/// True when the running UI driver was started with step mode
+/// (`RUSTPAL_UI_STEP` / `--ui-step`).
+pub(crate) fn step_mode_enabled() -> bool {
+    control().is_some_and(|c| c.step_enabled())
+}
+
+/// Virtual clock (ms) when step mode is active.
+pub(crate) fn virtual_ticks() -> u64 {
+    control().map(|c| c.virtual_ms()).unwrap_or(0)
+}
+
+/// Wait until the virtual clock reaches `deadline` (step mode only).
+pub(crate) fn wait_until_virtual(deadline: u64) {
+    if let Some(c) = control() {
+        c.wait_until_ms(deadline);
+    }
+}
+
+/// Replace the published `GET /v1/state` body.
+pub(crate) fn publish_state_json(json: String) {
+    if let Some(c) = control() {
+        if let Ok(mut slot) = c.state_json.write() {
+            *slot = json;
+        }
+    }
+}
+
+/// Current frame id from the last capture (0 if none).
+pub(crate) fn latest_frame_id() -> u64 {
+    control()
+        .and_then(|c| c.latest_frame.read().ok().map(|f| f.id))
+        .unwrap_or(0)
+}
+
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.trim();
+            !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false") || v == "no")
+        }
+        Err(_) => false,
+    }
+}
+
 /// Running UI driver. Dropping it disconnects the game from the server; the
 /// listener thread itself is intentionally process-scoped.
 pub(crate) struct UiDriver {
     input_rx: Receiver<(KeyCode, bool)>,
-    latest_frame: Arc<RwLock<LatestFrame>>,
+    control: Arc<SharedControl>,
     capture_rgba: Vec<u8>,
     #[cfg(test)]
     local_addr: SocketAddr,
@@ -71,20 +186,29 @@ impl UiDriver {
             ));
         }
 
+        let step_enabled = env_flag("RUSTPAL_UI_STEP");
+        let control = Arc::new(SharedControl::new(step_enabled));
+        install_control(Arc::clone(&control));
+
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
         let (input_tx, input_rx) = mpsc::channel();
-        let latest_frame = Arc::new(RwLock::new(LatestFrame::default()));
-        let server_frame = Arc::clone(&latest_frame);
+        let serve_control = Arc::clone(&control);
         thread::Builder::new()
             .name("rustpal-ui-driver".into())
-            .spawn(move || serve(listener, input_tx, server_frame))
+            .spawn(move || serve(listener, input_tx, serve_control))
             .map_err(|error| io::Error::other(format!("start UI driver thread: {error}")))?;
 
         eprintln!("rustpal: UI driver listening on http://{local_addr}");
+        if step_enabled {
+            eprintln!(
+                "rustpal: UI step mode ON — engine clock is virtual; POST /v1/step to advance \
+                 (default +{FRAME_TIME}ms per call)"
+            );
+        }
         Ok(Self {
             input_rx,
-            latest_frame,
+            control,
             capture_rgba: vec![0; SCREEN_W * SCREEN_H * 4],
             #[cfg(test)]
             local_addr,
@@ -102,7 +226,7 @@ impl UiDriver {
         shake: Option<(u16, u16)>,
     ) {
         render_rgba(surf, palette, shake, &mut self.capture_rgba);
-        if let Ok(mut frame) = self.latest_frame.write() {
+        if let Ok(mut frame) = self.control.latest_frame.write() {
             frame.id = frame.id.wrapping_add(1);
             if frame.rgba.len() == self.capture_rgba.len() {
                 frame.rgba.copy_from_slice(&self.capture_rgba);
@@ -116,18 +240,23 @@ impl UiDriver {
     fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
+
+    #[cfg(test)]
+    fn control_for_test(&self) -> &SharedControl {
+        &self.control
+    }
 }
 
 fn serve(
     listener: TcpListener,
     input_tx: Sender<(KeyCode, bool)>,
-    latest_frame: Arc<RwLock<LatestFrame>>,
+    control: Arc<SharedControl>,
 ) {
     for connection in listener.incoming() {
         match connection {
             Ok(mut stream) => {
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                if let Err(error) = handle_connection(&mut stream, &input_tx, &latest_frame) {
+                if let Err(error) = handle_connection(&mut stream, &input_tx, &control) {
                     eprintln!("rustpal: UI driver request failed: {error}");
                 }
             }
@@ -139,7 +268,7 @@ fn serve(
 fn handle_connection(
     stream: &mut TcpStream,
     input_tx: &Sender<(KeyCode, bool)>,
-    latest_frame: &Arc<RwLock<LatestFrame>>,
+    control: &SharedControl,
 ) -> io::Result<()> {
     let mut request = [0u8; 8192];
     let size = stream.read(&mut request)?;
@@ -152,27 +281,50 @@ fn handle_connection(
     else {
         return write_text(stream, 400, "Bad Request", "malformed request line\n");
     };
-    let path = path.split('?').next().unwrap_or(path);
+    let (path, query) = match path.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (path, ""),
+    };
 
     if method == "OPTIONS" {
         return write_response(stream, 204, "No Content", "text/plain", &[]);
     }
 
+    // Body after headers (for POST /v1/step JSON).
+    let body = request
+        .split("\r\n\r\n")
+        .nth(1)
+        .or_else(|| request.split("\n\n").nth(1))
+        .unwrap_or("");
+
     match (method, path) {
         ("GET", "/") => write_text(stream, 200, "OK", API_HELP),
         ("GET", "/v1/status") => {
-            let frame = latest_frame
+            let frame = control
+                .latest_frame
                 .read()
                 .map_err(|_| io::Error::other("frame lock poisoned"))?;
             let body = format!(
-                "{{\"status\":\"ok\",\"width\":{SCREEN_W},\"height\":{SCREEN_H},\"frame_id\":{}}}\n",
-                frame.id
+                "{{\"status\":\"ok\",\"width\":{SCREEN_W},\"height\":{SCREEN_H},\
+                 \"frame_id\":{},\"step_mode\":{},\"ticks\":{}}}\n",
+                frame.id,
+                control.step_enabled(),
+                control.virtual_ms(),
             );
             write_response(stream, 200, "OK", "application/json", body.as_bytes())
         }
+        ("GET", "/v1/state") => {
+            let json = control
+                .state_json
+                .read()
+                .map_err(|_| io::Error::other("state lock poisoned"))?
+                .clone();
+            write_response(stream, 200, "OK", "application/json", json.as_bytes())
+        }
         ("GET", "/v1/frame.png") => {
             let rgba = {
-                let frame = latest_frame
+                let frame = control
+                    .latest_frame
                     .read()
                     .map_err(|_| io::Error::other("frame lock poisoned"))?;
                 if frame.rgba.is_empty() {
@@ -183,9 +335,83 @@ fn handle_connection(
             let png = encode_png(&rgba)?;
             write_response(stream, 200, "OK", "image/png", &png)
         }
+        ("POST", "/v1/step") => handle_step(stream, control, query, body),
         ("POST", path) if path.starts_with("/v1/input/") => handle_input(stream, path, input_tx),
         _ => write_text(stream, 404, "Not Found", "not found\n"),
     }
+}
+
+/// Parse step advance: default one game frame (`FRAME_TIME` ms).
+///
+/// Accepts:
+/// - query `frames=N` or `ms=N`
+/// - JSON body `{"frames":N}` or `{"ms":N}`
+fn parse_step_ms(query: &str, body: &str) -> Result<u64, String> {
+    for part in query.split('&').filter(|p| !p.is_empty()) {
+        if let Some(v) = part.strip_prefix("frames=") {
+            let n: u64 = v
+                .parse()
+                .map_err(|_| format!("invalid frames={v}"))?;
+            return Ok(n.saturating_mul(FRAME_TIME).max(1));
+        }
+        if let Some(v) = part.strip_prefix("ms=") {
+            let n: u64 = v.parse().map_err(|_| format!("invalid ms={v}"))?;
+            return Ok(n.max(1));
+        }
+    }
+    let trimmed = body.trim();
+    if trimmed.starts_with('{') {
+        if let Some(n) = json_u64_field(trimmed, "frames") {
+            return Ok(n.saturating_mul(FRAME_TIME).max(1));
+        }
+        if let Some(n) = json_u64_field(trimmed, "ms") {
+            return Ok(n.max(1));
+        }
+    }
+    Ok(FRAME_TIME)
+}
+
+/// Tiny non-serde scanner for `"key": number`.
+fn json_u64_field(body: &str, key: &str) -> Option<u64> {
+    let pattern = format!("\"{key}\"");
+    let i = body.find(&pattern)?;
+    let after = &body[i + pattern.len()..];
+    let after = after.trim_start();
+    let after = after.strip_prefix(':')?.trim_start();
+    let num: String = after
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    num.parse().ok()
+}
+
+fn handle_step(
+    stream: &mut TcpStream,
+    control: &SharedControl,
+    query: &str,
+    body: &str,
+) -> io::Result<()> {
+    if !control.step_enabled() {
+        return write_response(
+            stream,
+            409,
+            "Conflict",
+            "application/json",
+            b"{\"error\":\"step mode not enabled; set RUSTPAL_UI_STEP=1 or pass --ui-step\"}\n",
+        );
+    }
+    let ms = match parse_step_ms(query, body) {
+        Ok(ms) => ms,
+        Err(msg) => {
+            return write_text(stream, 400, "Bad Request", &format!("{msg}\n"));
+        }
+    };
+    control.advance_ms(ms);
+    let ticks = control.virtual_ms();
+    let body = format!(
+        "{{\"accepted\":true,\"advanced_ms\":{ms},\"ticks\":{ticks},\"frame_time_ms\":{FRAME_TIME}}}\n"
+    );
+    write_response(stream, 202, "Accepted", "application/json", body.as_bytes())
 }
 
 fn handle_input(
@@ -321,10 +547,17 @@ const API_HELP: &str = "\
 rustpal UI driver
 
 GET  /v1/status
+GET  /v1/state
 GET  /v1/frame.png
+POST /v1/step                 advance virtual clock (step mode only)
+POST /v1/step?frames=N
+POST /v1/step?ms=N
 POST /v1/input/{key}/tap
 POST /v1/input/{key}/press
 POST /v1/input/{key}/release
+
+Step mode: RUSTPAL_UI_STEP=1 or --ui-step (requires --ui-driver).
+Default step advances one overworld frame (100ms virtual).
 
 Keys: up, down, left, right, menu, confirm, space, page_up, page_down,
       home, end, repeat, auto, defend, use_item, throw_item, flee,
@@ -387,5 +620,50 @@ mod tests {
         let mut events = Vec::new();
         driver.drain_input(&mut events);
         assert_eq!(events, [(KeyCode::Enter, true), (KeyCode::Enter, false)]);
+    }
+
+    #[test]
+    fn state_endpoint_returns_published_json() {
+        let driver = UiDriver::start("127.0.0.1:0").expect("start UI driver");
+        publish_state_json("{\"hello\":1,\"frame_id\":3}\n".into());
+        let response = request(
+            driver.local_addr(),
+            "GET /v1/state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+        let body = String::from_utf8_lossy(&response);
+        assert!(body.contains("\"hello\":1"));
+        assert!(body.contains("\"frame_id\":3"));
+    }
+
+    #[test]
+    fn step_advances_virtual_clock_when_enabled() {
+        std::env::set_var("RUSTPAL_UI_STEP", "1");
+        let driver = UiDriver::start("127.0.0.1:0").expect("start step driver");
+        assert!(driver.control_for_test().step_enabled());
+        assert_eq!(driver.control_for_test().virtual_ms(), 0);
+        let response = request(
+            driver.local_addr(),
+            "POST /v1/step?frames=2 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(
+            response.starts_with(b"HTTP/1.1 202"),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(driver.control_for_test().virtual_ms(), FRAME_TIME * 2);
+        std::env::remove_var("RUSTPAL_UI_STEP");
+    }
+
+    #[test]
+    fn parse_step_ms_defaults_and_fields() {
+        assert_eq!(parse_step_ms("", "").unwrap(), FRAME_TIME);
+        assert_eq!(parse_step_ms("frames=3", "").unwrap(), FRAME_TIME * 3);
+        assert_eq!(parse_step_ms("ms=50", "").unwrap(), 50);
+        assert_eq!(
+            parse_step_ms("", "{\"frames\": 2}").unwrap(),
+            FRAME_TIME * 2
+        );
+        assert_eq!(parse_step_ms("", "{\"ms\":12}").unwrap(), 12);
     }
 }

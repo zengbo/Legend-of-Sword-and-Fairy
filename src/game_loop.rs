@@ -38,7 +38,7 @@ use crate::keys::KeyCode;
 
 use crate::data::DataDir;
 use crate::font::Font;
-use crate::global::Globals;
+use crate::global::{Globals, MAX_PLAYABLE_PLAYER_ROLES, MAX_PLAYER_ROLES};
 use crate::input::InputState;
 use crate::mkf::Mkf;
 use crate::res::Resources;
@@ -908,8 +908,99 @@ impl Engine {
     }
 
     /// Milliseconds since engine start (SDL_GetTicks equivalent).
+    ///
+    /// When the UI driver is in **step mode** (`RUSTPAL_UI_STEP` / `--ui-step`),
+    /// this is a virtual clock advanced only by `POST /v1/step`.
     pub fn ticks(&self) -> u64 {
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            any(feature = "gui", feature = "console")
+        ))]
+        if crate::ui_driver::step_mode_enabled() {
+            return crate::ui_driver::virtual_ticks().saturating_mul(self.tick_scale.max(1));
+        }
         (self.start.elapsed().as_millis() as u64).saturating_mul(self.tick_scale)
+    }
+
+    /// Publish a structured snapshot for `GET /v1/state` (no-op without driver).
+    pub fn publish_ui_driver_state(&self) {
+        #[cfg(all(
+            not(target_arch = "wasm32"),
+            any(feature = "gui", feature = "console")
+        ))]
+        {
+            crate::ui_driver::publish_state_json(self.ui_driver_state_json());
+        }
+    }
+
+    /// JSON body for the UI driver state endpoint.
+    #[cfg(all(
+        not(target_arch = "wasm32"),
+        any(feature = "gui", feature = "console")
+    ))]
+    fn ui_driver_state_json(&self) -> String {
+        let frame_id = crate::ui_driver::latest_frame_id();
+        let step_mode = crate::ui_driver::step_mode_enabled();
+        let player_x = self.globals.viewport.0 + self.globals.partyoffset.0;
+        let player_y = self.globals.viewport.1 + self.globals.partyoffset.1;
+        let in_dialog = self.ui.in_dialog || self.ui.current_dialog_line > 0;
+        let in_battle = self.globals.in_battle || self.battle.is_some();
+        let mut party = String::from("[");
+        let n = (self.globals.max_party_member_index as usize + 1).min(MAX_PLAYABLE_PLAYER_ROLES);
+        for i in 0..n {
+            let role = (self.globals.party[i].player_role as usize).min(MAX_PLAYER_ROLES.saturating_sub(1));
+            if i > 0 {
+                party.push(',');
+            }
+            let roles = &self.globals.game.player_roles;
+            let hp = roles.hp[role];
+            let max_hp = roles.max_hp[role];
+            let mp = roles.mp[role];
+            let max_mp = roles.max_mp[role];
+            let level = roles.level[role];
+            party.push_str(&format!(
+                "{{\"slot\":{i},\"role\":{role},\"hp\":{hp},\"max_hp\":{max_hp},\
+                 \"mp\":{mp},\"max_mp\":{max_mp},\"level\":{level}}}"
+            ));
+        }
+        party.push(']');
+        format!(
+            "{{\
+             \"status\":\"ok\",\
+             \"frame_id\":{frame_id},\
+             \"step_mode\":{step_mode},\
+             \"ticks\":{},\
+             \"frame_num\":{},\
+             \"scene\":{},\
+             \"viewport\":[{},{}],\
+             \"party_offset\":[{},{}],\
+             \"player\":[{player_x},{player_y}],\
+             \"party_direction\":{},\
+             \"in_main_game\":{},\
+             \"entering_scene\":{},\
+             \"in_battle\":{in_battle},\
+             \"in_dialog\":{in_dialog},\
+             \"dialog_line\":{},\
+             \"quit_requested\":{},\
+             \"cash\":{},\
+             \"max_party_member_index\":{},\
+             \"party\":{party}\
+             }}\n",
+            self.ticks(),
+            self.globals.frame_num,
+            self.globals.num_scene,
+            self.globals.viewport.0,
+            self.globals.viewport.1,
+            self.globals.partyoffset.0,
+            self.globals.partyoffset.1,
+            self.globals.party_direction,
+            self.globals.in_main_game,
+            self.globals.entering_scene,
+            self.ui.current_dialog_line,
+            self.quit_requested,
+            self.globals.cash,
+            self.globals.max_party_member_index,
+        )
     }
 
     /// PAL_ProcessEvent: pump window events and update the input state.
@@ -937,28 +1028,38 @@ impl Engine {
             }
         }
         self.input.update_keyboard_state(now);
+        self.publish_ui_driver_state();
     }
 
     /// UTIL_Delay: wait while still pumping events.
     pub fn delay(&mut self, ms: u64) {
         let end = self.ticks() + ms;
-        loop {
-            self.process_event();
-            if self.ticks() >= end {
-                break;
-            }
-            sleep_ms(5.min(end - self.ticks()));
-        }
+        self.delay_until(end);
     }
 
     /// Wait until the given tick deadline, pumping events (the common
     /// `while (!SDL_TICKS_PASSED(...)) { PAL_ProcessEvent(); SDL_Delay(5); }`
     /// pattern).
+    ///
+    /// In UI **step mode**, this blocks on the virtual clock (`POST /v1/step`)
+    /// instead of wall-clock sleep.
     pub fn delay_until(&mut self, deadline: u64) {
         self.process_event();
         while self.ticks() < deadline {
+            if self.quit_requested {
+                break;
+            }
+            #[cfg(all(
+                not(target_arch = "wasm32"),
+                any(feature = "gui", feature = "console")
+            ))]
+            if crate::ui_driver::step_mode_enabled() {
+                crate::ui_driver::wait_until_virtual(deadline);
+                self.process_event();
+                continue;
+            }
             self.process_event();
-            sleep_ms(5);
+            sleep_ms(5.min(deadline.saturating_sub(self.ticks()).max(1)));
         }
     }
 
@@ -975,6 +1076,7 @@ impl Engine {
         if let Some(video) = self.video.as_mut() {
             video.present(&self.screen, &self.palette, shake);
         }
+        self.publish_ui_driver_state();
     }
 
     /// Feed the frame sink (if any) with the surface about to be presented.
