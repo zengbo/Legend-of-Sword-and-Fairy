@@ -84,37 +84,25 @@ RUSTPAL_UI_STEP_STRICT=1 ./target/release/rustpal --console --ui-driver --ui-ste
 | 字段 | 含义与用法 |
 | --- | --- |
 | `phase` | `boot` / `dialog` / `menu` / `battle` / `scene_transition` / `overworld` |
-| `in_dialog` | `true` → 优先 `confirm`；见 **`dialog`** |
-| `in_menu` | `true` → 有可选项列表；见 **`menu`** |
-| `in_battle` | `true` → 用战斗键；见 `battle` 对象 |
-| `in_main_game` | `false` → 片头/开场菜单 |
-| `entering_scene` | 切场景中 |
-| `player` / `viewport` | 地图坐标 `[x,y]` |
-| `walk` | `{up,right,down,left}` 下一步是否可走 |
-| `dialog` | 见下；无对话时为 `null` |
-| `menu` | 见下；无菜单时为 `null` |
-| `scene` / `scene_info` | 场景号与 map/传送脚本/事件数量 |
-| `party[]` | 队员：姓名、HP/MP、攻防、装备、法术 |
-| `inventory[]` | 物品列表 |
-| `events[]` | 附近事件对象 |
-| `battle` | 战斗详情或 `null` |
-| `keys_hint` / `actions` | 建议键 / 合法键 |
-| `quit_requested` | 结束循环 |
+| `dialog` | **单字符串**或 `null`（见下）；非 null → 优先 `confirm` |
+| `menu` | 菜单对象或 `null`（见下）；非 null → 选选项 |
+| `in_battle` | 战斗中；见 `battle` |
+| `player` / `viewport` / `walk` | 坐标与四向可走 |
+| `events` / `inventory` / `party` / `battle` | 世界与战斗信息 |
+| `keys_hint` | 短建议键列表（动作表见本文档，**不在 state 里重复**） |
+| `quit_requested` | 结束 |
 
-#### `dialog`（对话正文）
+**Token 原则：** 有信息量、不重复。布尔 `in_dialog`/`in_menu` 已去掉——用 `dialog`/`menu` 是否为 null 即可。
+
+#### `dialog`（对话正文，单字段）
 
 ```json
-{
-  "speaker": "李大娘",
-  "lines": ["李逍遙！你皮癢啊？", "敢說老娘是什麼鬼婆！"],
-  "text": "李大娘：李逍遙！你皮癢啊？\n敢說老娘是什麼鬼婆！"
-}
+"dialog": "李大娘：李逍遙！你皮癢啊？\n敢說老娘是什麼鬼婆！"
 ```
 
-- `speaker`：角色名行（标题「某某：」）  
-- `lines`：当前页对白正文行  
-- `text`：拼好的可读全文（方便直接塞进 LLM）  
-- 翻页后 `lines` 会清空再积累；对话结束为 `null`
+- 有说话人时为 `说话人：正文…`（多行用 `\n`）  
+- 无对话：`null`  
+- **不要**再拆 speaker/lines/text 三份（省 token）
 
 #### `menu`（菜单选项）
 
@@ -122,23 +110,18 @@ RUSTPAL_UI_STEP_STRICT=1 ./target/release/rustpal --console --ui-driver --ui-ste
 {
   "kind": "menu",
   "index": 1,
-  "selected_value": 1,
-  "selected_label": "讀取進度",
   "items": [
-    {"index": 0, "value": 0, "label": "新的故事", "enabled": true, "selected": false},
-    {"index": 1, "value": 1, "label": "讀取進度", "enabled": true, "selected": true}
+    {"value": 0, "label": "新的故事"},
+    {"value": 1, "label": "讀取進度"}
   ]
 }
 ```
 
-| `kind` | 来源 |
-| --- | --- |
-| `menu` | 通用 `read_menu`（开场/系统/战斗杂项等） |
-| `item` | 道具选择 |
-| `magic` | 法术选择 |
-| `battle_main` / `battle_misc` / `battle_item_sub` | 战斗指令（合成） |
+- 当前选中 = `items[index]`（不再单独输出 selected_label）  
+- `enabled: false` 的项才会带 `"enabled":false`（默认可用省略）  
+- `kind`：`menu` / `item` / `magic` / `battle_main` / `battle_misc` / …
 
-操作：方向键改 `index`，`confirm` 确认当前项，`menu` 取消。
+操作：方向键改光标，`confirm` 确认，`menu` 取消。
 
 #### `events[]` 条目（过场/找 NPC 用）
 
@@ -307,14 +290,13 @@ loop:
 
 ### 4.3 策略启发式（省 token）
 
-1. **`dialog` 非 null** → 读 `dialog.text`，`confirm` 推进  
-2. **`menu` 非 null** → 用 `items[]`/`selected_label` 决策；上下左右移动，`confirm` 选中，`menu` 取消  
-3. **`in_battle`** → 读 `battle` + 可能的 `menu`；`force`/`auto`/`confirm`  
-4. **找人/出口** → `events[]` 的 `dist` / `can_search_now` / `delta` + `walk`  
-5. **走路** → 仅 `walk.* == true`  
-6. **道具/法术** → `menu.kind` 为 `item`/`magic` 时从列表选 `value`  
+1. **`dialog != null`** → 读该字符串，`confirm`  
+2. **`menu != null`** → 看 `items[index]`；方向移动，`confirm` / `menu`  
+3. **`in_battle`** → 读 `battle`（及可能的 menu）  
+4. **overworld** → `walk` + `events`  
+5. 尽量只依赖 state；PNG 仅在看不懂时取  
 
-不要每帧塞整张 PNG；**优先 `/v1/state` 的 dialog/menu**。
+键名表见本文档，**不要**指望 state 每帧带完整 actions 列表。
 
 ---
 
@@ -426,14 +408,12 @@ while True:
 ## 9. 系统提示词摘要（可直接贴进 Agent）
 
 ```
-你在控制 rustpal（仙剑 DOS 引擎）。基址 http://127.0.0.1:8765。
-观察：GET /v1/state（含 dialog 正文、menu 选项、walk/events/inventory/party/battle）。
-动作：POST /v1/input/{key}/tap|press|release；
-键：up down left right confirm space menu force auto defend use_item throw_item flee status。
-step_mode=true 时决策后 POST /v1/step?frames=1。
-策略：dialog 非 null→读 text 后 confirm；menu 非 null→按 items 选择（方向+confirm，取消用 menu）；
-battle→读 battle+menu；overworld→walk+events。只用 walk 为 true 的方向。
-先 input 再 step。忽略未知字段。无鼠标。
+你在控制 rustpal。基址 http://127.0.0.1:8765。
+观察：GET /v1/state。dialog 为单字符串或 null；menu 为 {kind,index,items} 或 null。
+动作：POST /v1/input/{key}/tap|press|release；键 up/down/left/right/confirm/space/menu/force/auto/defend/…
+step_mode 时决策后 POST /v1/step?frames=1。
+策略：dialog≠null→confirm；menu≠null→items[index]+方向/confirm；battle→battle 字段；overworld→walk+events。
+先 input 再 step。省 token：勿重复请求 frame.png，除非 state 不够。
 ```
 
 ---

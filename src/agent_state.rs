@@ -78,8 +78,6 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
     out.push(',');
     push_pair(&mut out, "viewport", g.viewport.0, g.viewport.1);
     out.push(',');
-    push_pair(&mut out, "party_offset", g.partyoffset.0, g.partyoffset.1);
-    out.push(',');
     push_pair(&mut out, "player", player.0, player.1);
     out.push(',');
     push_u64(&mut out, "party_direction", g.party_direction as u64);
@@ -94,19 +92,11 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
     out.push(',');
     push_bool(&mut out, "auto_battle", g.auto_battle);
     out.push(',');
-    push_bool(&mut out, "in_dialog", in_dialog);
-    out.push(',');
-    push_bool(&mut out, "in_menu", in_menu);
-    out.push(',');
-    push_i64(&mut out, "dialog_line", engine.ui.current_dialog_line as i64);
-    out.push(',');
-    push_u64(&mut out, "dialog_position", engine.ui.dialog_position as u64);
-    out.push(',');
-    // Live dialog text (UTF-8).
+    // Live dialog: single UTF-8 string (or null). Prefer this over in_dialog.
     out.push_str("\"dialog\":");
     append_dialog(&mut out, engine);
     out.push(',');
-    // Live menu (null when none).
+    // Live menu (null when none). Prefer this over in_menu.
     out.push_str("\"menu\":");
     append_menu(&mut out, engine);
     out.push(',');
@@ -182,24 +172,18 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
         out.push_str("null");
     }
 
-    // Suggested keys for the current phase (hints only).
+    // Short key hints only (static action vocab lives in docs/ai-control.md).
     out.push(',');
     out.push_str("\"keys_hint\":");
     append_keys_hint(&mut out, phase, in_dialog, in_battle, in_menu);
-
-    // Compact action vocabulary reminder.
-    out.push(',');
-    out.push_str(
-        "\"actions\":[\"up\",\"down\",\"left\",\"right\",\"confirm\",\"space\",\"menu\",\
-         \"force\",\"auto\",\"defend\",\"use_item\",\"throw_item\",\"flee\",\"status\",\
-         \"repeat\",\"page_up\",\"page_down\"]",
-    );
 
     out.push('}');
     out.push('\n');
     out
 }
 
+/// One UTF-8 string for the current dialog page, or `null`.
+/// Format: `"Speaker：line1\nline2"` or just body lines if no speaker.
 fn append_dialog(out: &mut String, engine: &Engine) {
     let speaker = &engine.ui.agent_dialog_speaker;
     let lines = &engine.ui.agent_dialog_lines;
@@ -207,18 +191,6 @@ fn append_dialog(out: &mut String, engine: &Engine) {
         out.push_str("null");
         return;
     }
-    out.push('{');
-    push_str(out, "speaker", speaker);
-    out.push(',');
-    out.push_str("\"lines\":[");
-    for (i, line) in lines.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        push_json_string(out, line);
-    }
-    out.push_str("],");
-    // Convenience: speaker + body joined for LLM prompts.
     let mut full = String::new();
     if !speaker.is_empty() {
         full.push_str(speaker);
@@ -230,8 +202,7 @@ fn append_dialog(out: &mut String, engine: &Engine) {
         }
         full.push_str(line);
     }
-    push_str(out, "text", &full);
-    out.push('}');
+    push_json_string(out, &full);
 }
 
 fn append_menu(out: &mut String, engine: &Engine) {
@@ -254,29 +225,23 @@ fn write_menu_obj(out: &mut String, kind: &str, index: usize, items: &[AgentMenu
     out.push('{');
     push_str(out, "kind", kind);
     out.push(',');
+    // Cursor only; selected item is items[index] (no duplicated label/value).
     push_u64(out, "index", index as u64);
     out.push(',');
-    if let Some(sel) = items.get(index) {
-        push_u64(out, "selected_value", sel.value as u64);
-        out.push(',');
-        push_str(out, "selected_label", &sel.label);
-        out.push(',');
-    }
     out.push_str("\"items\":[");
     for (i, it) in items.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
         out.push('{');
-        push_u64(out, "index", i as u64);
-        out.push(',');
+        // Omit redundant "index"/"selected" — use array position + top-level index.
         push_u64(out, "value", it.value as u64);
         out.push(',');
         push_str(out, "label", &it.label);
-        out.push(',');
-        push_bool(out, "enabled", it.enabled);
-        out.push(',');
-        push_bool(out, "selected", i == index);
+        if !it.enabled {
+            out.push(',');
+            push_bool(out, "enabled", false);
+        }
         out.push('}');
     }
     out.push(']');
@@ -470,12 +435,18 @@ fn append_party(out: &mut String, engine: &Engine) {
         push_pair(out, "sprite_pos", g.party[i].x as i32, g.party[i].y as i32);
         out.push(',');
         // Equipment object ids + names.
+        // Equipment: only non-empty slots.
         out.push_str("\"equipment\":[");
+        let mut first_e = true;
         for e in 0..MAX_PLAYER_EQUIPMENTS {
-            if e > 0 {
+            let item = roles.equipment[e][role];
+            if item == 0 {
+                continue;
+            }
+            if !first_e {
                 out.push(',');
             }
-            let item = roles.equipment[e][role];
+            first_e = false;
             out.push('{');
             push_u64(out, "slot", e as u64);
             out.push(',');
@@ -503,16 +474,30 @@ fn append_party(out: &mut String, engine: &Engine) {
             push_str(out, "name", &word_utf8(engine, mid as usize));
             out.push('}');
         }
-        out.push_str("],");
-        // Status timers (poison etc. — raw array).
-        out.push_str("\"status\":[");
+        out.push(']');
+        // Status: only non-zero timers (s=status type index).
+        let mut first_s = true;
         for s in 0..crate::global::STATUS_ALL {
-            if s > 0 {
+            let v = g.player_status[role][s];
+            if v == 0 {
+                continue;
+            }
+            if first_s {
+                out.push(',');
+                out.push_str("\"status\":[");
+                first_s = false;
+            } else {
                 out.push(',');
             }
-            out.push_str(&g.player_status[role][s].to_string());
+            out.push('{');
+            push_u64(out, "id", s as u64);
+            out.push(',');
+            push_u64(out, "t", v as u64);
+            out.push('}');
         }
-        out.push(']');
+        if !first_s {
+            out.push(']');
+        }
         out.push('}');
     }
     out.push(']');
@@ -547,22 +532,37 @@ fn append_inventory(out: &mut String, engine: &Engine) {
         push_str(out, "name", &word_utf8(engine, inv.item as usize));
         out.push(',');
         push_u64(out, "amount", inv.amount as u64);
-        out.push(',');
-        push_u64(out, "amount_in_use", inv.amount_in_use as u64);
-        out.push(',');
-        push_u64(out, "flags", flags as u64);
-        out.push(',');
-        push_bool(out, "usable", flags & ITEMFLAG_USABLE != 0);
-        out.push(',');
-        push_bool(out, "equipable", flags & ITEMFLAG_EQUIPABLE != 0);
-        out.push(',');
-        push_bool(out, "throwable", flags & ITEMFLAG_THROWABLE != 0);
-        out.push(',');
-        push_bool(out, "consuming", flags & ITEMFLAG_CONSUMING != 0);
-        out.push(',');
-        push_bool(out, "apply_to_all", flags & ITEMFLAG_APPLY_TO_ALL != 0);
-        out.push(',');
-        push_bool(out, "sellable", flags & ITEMFLAG_SELLABLE != 0);
+        // Compact flag tags instead of six booleans + raw flags word.
+        let mut tags: Vec<&str> = Vec::new();
+        if flags & ITEMFLAG_USABLE != 0 {
+            tags.push("use");
+        }
+        if flags & ITEMFLAG_EQUIPABLE != 0 {
+            tags.push("eq");
+        }
+        if flags & ITEMFLAG_THROWABLE != 0 {
+            tags.push("throw");
+        }
+        if flags & ITEMFLAG_CONSUMING != 0 {
+            tags.push("consume");
+        }
+        if flags & ITEMFLAG_APPLY_TO_ALL != 0 {
+            tags.push("all");
+        }
+        if flags & ITEMFLAG_SELLABLE != 0 {
+            tags.push("sell");
+        }
+        if !tags.is_empty() {
+            out.push(',');
+            out.push_str("\"tags\":[");
+            for (ti, t) in tags.iter().enumerate() {
+                if ti > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, t);
+            }
+            out.push(']');
+        }
         out.push('}');
     }
     out.push(']');
