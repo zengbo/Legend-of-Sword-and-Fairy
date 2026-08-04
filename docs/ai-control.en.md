@@ -161,7 +161,7 @@ Do not map `delta` signs to screen arrows. Use `nav` / `events[].keys` / `hint`.
 Top-level `facing` is the key name for current facing (`down`/`left`/`up`/`right`).
 
 **Target selection (engine already ranks `nav` this way):**  
-Prefer `item_use` / scripts that grant items or mutate quest state → scene exits → other; **pure dialog loops** (`events[].loop=true`, `progress=dialog`) are deprioritized so agents do not stick on repeating NPCs.
+Prefer `item_use` / scripts that grant items or mutate quest state → scene exits → other; **pure dialog loops** are deprioritized; **walk-unreachable targets are skipped** (e.g. kitchen cannot path to upstairs delivery — nav points at a reachable door with `progress=scene`/`bridge` instead of spinning on `reachable:false`).
 
 - `nav.item_use` set → **use that item from the menu** on the target (do not only confirm dialog)  
 - `can_act` → `confirm` / `space` now  

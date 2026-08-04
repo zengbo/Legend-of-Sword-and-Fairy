@@ -34,9 +34,13 @@ const MAX_EVENTS: usize = 48;
 /// Max inventory rows listed.
 const MAX_INV_LIST: usize = 64;
 /// BFS node budget for short path hints (per state build).
-const PATH_BFS_LIMIT: usize = 12_000;
+/// Inn maps need ~15k+ nodes to cross a floor; keep headroom.
+const PATH_BFS_LIMIT: usize = 40_000;
 /// Max path steps published in `nav.path`.
-const PATH_MAX_STEPS: usize = 24;
+const PATH_MAX_STEPS: usize = 32;
+/// Max interactable candidates to path-check when picking nav (cheap skip of
+/// unreachable high-progress targets behind walls / other floors).
+const NAV_PATH_CANDIDATES: usize = 16;
 /// Status short names (STATUS_* index).
 const STATUS_NAMES: [&str; STATUS_ALL] = [
     "conf", "para", "sleep", "silence", "puppet", "brave", "prot", "haste", "dual",
@@ -830,97 +834,120 @@ fn build_events_and_nav(
             dialog_loop: rank.rank >= 5,
         });
     }
-    // Near first for the published list, but nav uses progress-aware ranking.
+    // Near first for the published list; nav re-orders by progress + walk path.
     rows.sort_by_key(|r| (r.dist, r.event_id));
     rows.truncate(MAX_EVENTS);
 
-    // Prefer story progress over nearby dialog-loop NPCs (e.g. 婶婶 after
-    // quest line advances: skip #20 loop, go #16 stairs to deliver 酒菜).
+    // Prefer story progress, but skip targets with **no walk path**. Delivery
+    // stairs #16 are behind a wall from the kitchen — must leave via door
+    // #13/#19 → scene 3 → re-enter hall. Greedy "press up" alone spins forever.
     let mut nav = NavInfo::default();
-    if let Some(best) = rows
-        .iter()
-        .filter(|r| r.interactable)
-        .min_by_key(|r| {
+    let mut path_keys: Vec<&'static str> = Vec::new();
+    {
+        let mut ordered: Vec<&Row> = rows.iter().filter(|r| r.interactable).collect();
+        ordered.sort_by_key(|r| {
             let act_pen = if r.search_ok || r.in_touch {
-                0
+                0u8
             } else if r.face.is_some() {
-                1 // almost — just need to face
-            } else {
-                2
-            };
-            let near = if r.dist <= 160 {
-                0
-            } else if r.dist <= 320 {
                 1
-            } else if r.dist <= 640 {
-                2
-            } else if r.dist <= 1280 {
-                3
             } else {
-                4
+                2
             };
-            // Soft role bias only after progress rank.
             let role_pen = match r.role {
-                "npc" | "search" => 0,
+                "npc" | "search" => 0u8,
                 "exit" => 1,
                 "trigger" => 2,
                 _ => 4,
             };
-            let sprite_pen = if r.has_sprite { 0 } else { 1 };
-            (
-                r.progress_rank,
-                act_pen,
-                near,
-                role_pen,
-                sprite_pen,
-                r.dist,
-                r.event_id,
-            )
-        })
-    {
-        let can_act = best.search_ok || best.in_touch;
-        let in_search_range = best.search_ok || best.face.is_some();
-        // If only wrong face: preferred key is face (tap to turn).
-        let key = if can_act {
-            None
-        } else if let Some(f) = best.face {
-            Some(f)
-        } else {
-            best.key
-        };
-        nav = NavInfo {
-            event_id: best.event_id,
-            role: best.role,
-            key,
-            face: best.face,
-            can_act,
-            in_search_range,
-            dist: best.dist,
-            dest_scene: best.dest_scene,
-            progress: best.progress,
-            item_use: best.item_use,
-        };
-    }
+            let sprite_pen = if r.has_sprite { 0u8 } else { 1 };
+            (r.progress_rank, act_pen, role_pen, sprite_pen, r.dist, r.event_id)
+        });
 
-    // Short path BFS toward nav target (only when not in search/touch range).
-    let mut path_keys: Vec<&'static str> = Vec::new();
-    if nav.event_id != 0 && !nav.can_act && !nav.in_search_range {
-        if let Some(ev) = g
-            .game
-            .event_objects
-            .get(nav.event_id as usize - 1)
-            .copied()
-        {
-            path_keys = path_to_event(
-                engine,
-                player,
-                ev,
-                party_dir,
-                PATH_BFS_LIMIT,
-                PATH_MAX_STEPS,
-            );
-            if let Some(&first) = path_keys.first() {
-                nav.key = Some(first);
+        let mut fallback: Option<&Row> = None;
+        for (i, best) in ordered.into_iter().enumerate() {
+            if i >= NAV_PATH_CANDIDATES {
+                break;
+            }
+            let can_act = best.search_ok || best.in_touch;
+            let in_search_range = best.search_ok || best.face.is_some();
+            if can_act || in_search_range {
+                nav = NavInfo {
+                    event_id: best.event_id,
+                    role: best.role,
+                    key: if can_act {
+                        None
+                    } else {
+                        best.face.or(best.key)
+                    },
+                    face: best.face,
+                    can_act,
+                    in_search_range,
+                    dist: best.dist,
+                    dest_scene: best.dest_scene,
+                    progress: best.progress,
+                    item_use: best.item_use,
+                };
+                path_keys.clear();
+                break;
+            }
+            if let Some(ev) = g.game.event_objects.get(best.index).copied() {
+                let path = path_to_event(
+                    engine,
+                    player,
+                    ev,
+                    party_dir,
+                    PATH_BFS_LIMIT,
+                    PATH_MAX_STEPS,
+                );
+                if !path.is_empty() {
+                    nav = NavInfo {
+                        event_id: best.event_id,
+                        role: best.role,
+                        key: path.first().copied().or(best.key),
+                        face: best.face,
+                        can_act: false,
+                        in_search_range: false,
+                        dist: best.dist,
+                        dest_scene: best.dest_scene,
+                        progress: best.progress,
+                        item_use: best.item_use,
+                    };
+                    path_keys = path;
+                    break;
+                }
+            }
+            if fallback.is_none() {
+                fallback = Some(best);
+            }
+        }
+
+        if nav.event_id == 0 {
+            if let Some(target) = fallback {
+                let target_pos = g
+                    .game
+                    .event_objects
+                    .get(target.index)
+                    .map(|e| (e.x as i32, e.y as i32))
+                    .unwrap_or(player);
+                if let Some((bridge_nav, bridge_path)) =
+                    find_bridge_exit(engine, player, party_dir, target.event_id, target_pos)
+                {
+                    nav = bridge_nav;
+                    path_keys = bridge_path;
+                } else {
+                    nav = NavInfo {
+                        event_id: target.event_id,
+                        role: target.role,
+                        key: target.key,
+                        face: target.face,
+                        can_act: target.search_ok || target.in_touch,
+                        in_search_range: target.search_ok || target.face.is_some(),
+                        dist: target.dist,
+                        dest_scene: target.dest_scene,
+                        progress: target.progress,
+                        item_use: target.item_use,
+                    };
+                }
             }
         }
     }
@@ -1217,21 +1244,157 @@ fn can_search_from(position: (i32, i32), event: (i32, i32), mode: u16) -> bool {
 }
 
 fn script_destination_scene(engine: &Engine, script: u16) -> Option<u16> {
+    script_exit_info(engine, script).map(|(scene, _)| scene)
+}
+
+/// First scene-change in a trigger script, with optional spawn world position
+/// from a preceding 0x0046 (set party position) opcode.
+fn script_exit_info(engine: &Engine, script: u16) -> Option<(u16, Option<(i32, i32)>)> {
     if script == 0 {
         return None;
     }
     let start = script as usize;
+    let mut spawn: Option<(i32, i32)> = None;
     for index in start..start.saturating_add(24) {
         let entry = engine.globals.game.script_entries.get(index)?;
-        // 0x0059 = teleport / change scene (classic).
+        if entry.operation == 0x0046 {
+            // Tile (op0, op1) + half (op2) → world coords (same as script 0x0046).
+            let x = entry.operand[0] as i32 * 32 + entry.operand[2] as i32 * 16;
+            let y = entry.operand[1] as i32 * 16 + entry.operand[2] as i32 * 8;
+            spawn = Some((x, y));
+        }
         if entry.operation == 0x0059 && entry.operand[0] != 0 {
-            return Some(entry.operand[0]);
+            return Some((entry.operand[0], spawn));
         }
         if entry.operation == 0x0000 {
             break;
         }
     }
     None
+}
+
+/// When the best progress target is walk-unreachable, pick a **reachable door**
+/// that leads to a scene which has a portal landing near that target (one hop
+/// out and back). Example: kitchen → door #13 → scene 3 → door #52 → hall #16.
+fn find_bridge_exit(
+    engine: &Engine,
+    player: (i32, i32),
+    party_dir: u16,
+    target_event: u16,
+    target_pos: (i32, i32),
+) -> Option<(NavInfo, Vec<&'static str>)> {
+    let cur_scene = engine.globals.num_scene;
+    if cur_scene == 0 {
+        return None;
+    }
+
+    // Mid scenes that can drop us near the unreachable target in `cur_scene`.
+    let mut useful_mid: HashSet<u16> = HashSet::new();
+    let n_scenes = engine.globals.game.scenes.len();
+    for scene in 1..n_scenes {
+        let scene_u = scene as u16;
+        if scene_u == cur_scene {
+            continue;
+        }
+        let start = engine.globals.game.scenes[scene - 1].event_object_index as usize;
+        let end = engine.globals.game.scenes[scene].event_object_index as usize;
+        for index in start..end.min(engine.globals.game.event_objects.len()) {
+            let ev = engine.globals.game.event_objects[index];
+            if ev.state <= 0 || ev.trigger_script == 0 {
+                continue;
+            }
+            if let Some((dest, spawn)) = script_exit_info(engine, ev.trigger_script) {
+                if dest == cur_scene {
+                    if let Some(sp) = spawn {
+                        if metric(sp, target_pos) < 320 {
+                            useful_mid.insert(scene_u);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if useful_mid.is_empty() {
+        return None;
+    }
+
+    // Reachable exit in the *current* scene that goes to a useful mid scene.
+    let start = engine.globals.game.scenes[cur_scene as usize - 1].event_object_index as usize;
+    let end = engine.globals.game.scenes[cur_scene as usize].event_object_index as usize;
+    let mut best: Option<(i32, u16, usize, Vec<&'static str>, Option<u16>)> = None;
+    for index in start..end.min(engine.globals.game.event_objects.len()) {
+        let ev = engine.globals.game.event_objects[index];
+        if ev.state <= 0 || ev.trigger_script == 0 {
+            continue;
+        }
+        let event_id = (index + 1) as u16;
+        if event_id == target_event {
+            continue;
+        }
+        let Some((dest, _)) = script_exit_info(engine, ev.trigger_script) else {
+            continue;
+        };
+        if !useful_mid.contains(&dest) {
+            continue;
+        }
+        let pos = (ev.x as i32, ev.y as i32);
+        let dist = metric(player, pos);
+        let path = path_to_event(
+            engine,
+            player,
+            ev,
+            party_dir,
+            PATH_BFS_LIMIT,
+            PATH_MAX_STEPS,
+        );
+        let touch_r = if ev.trigger_mode >= 4 {
+            ((ev.trigger_mode - 4) as i32 * 32 + 16).max(16)
+        } else {
+            0
+        };
+        let in_range = touch_r > 0 && dist < touch_r;
+        if path.is_empty() && !in_range {
+            continue;
+        }
+        let better = best
+            .as_ref()
+            .map(|(d, id, ..)| (dist, event_id) < (*d, *id))
+            .unwrap_or(true);
+        if better {
+            best = Some((dist, event_id, index, path, Some(dest)));
+        }
+    }
+    let (dist, event_id, _index, path, dest_scene) = best?;
+    let bridge_pos = engine
+        .globals
+        .game
+        .event_objects
+        .get(event_id as usize - 1)
+        .map(|e| (e.x as i32, e.y as i32))
+        .unwrap_or(target_pos);
+    let key = path.first().copied().or_else(|| {
+        best_key_toward(
+            player,
+            bridge_pos,
+            &compute_walk(engine, player),
+            dir_to_key(party_dir),
+        )
+    });
+    Some((
+        NavInfo {
+            event_id,
+            role: "exit",
+            key,
+            face: None,
+            can_act: false,
+            in_search_range: false,
+            dist,
+            dest_scene,
+            progress: "bridge",
+            item_use: None,
+        },
+        path,
+    ))
 }
 
 /// Scan a trigger script (until first hard stop) for story-progress signals.
@@ -2132,8 +2295,8 @@ mod tests {
         // nearby free-loot chests already cleared (state 0).
         e.globals.num_scene = 1;
         e.globals.in_main_game = true;
-        e.globals.viewport = (336, 1080);
-        e.globals.partyoffset = (160, 112); // player = (496, 1192)
+        e.globals.load_flags |= crate::global::LOAD_SCENE | crate::global::LOAD_PLAYER_SPRITE;
+        e.load_resources();
         e.globals.game.event_objects[19].state = 2; // #20 aunt
         e.globals.game.event_objects[19].trigger_script = 4981;
         e.globals.game.event_objects[20].state = 0; // #21 table gone
@@ -2143,18 +2306,30 @@ mod tests {
             e.globals.game.event_objects[id as usize - 1].state = 0;
         }
 
+        // Kitchen-side position (walk-disconnected from #16 stairs).
+        e.globals.viewport = (608, 1024);
+        e.globals.partyoffset = (160, 112); // player ≈ (768, 1136)
         let json = build_state_json(&e);
         let nav_snip = json
             .find("\"nav\"")
-            .map(|i| &json[i.. (i + 220).min(json.len())])
+            .map(|i| &json[i.. (i + 280).min(json.len())])
             .unwrap_or(&json);
+        // #16 is walk-unreachable from the kitchen; nav must pick a door
+        // (#13/#19) instead of spinning on greedy "up" toward the stairs.
         assert!(
-            nav_snip.contains("\"event\":16"),
-            "nav should prefer stairs #16 over aunt loop, got: {nav_snip}"
+            !nav_snip.contains("\"event\":16") || nav_snip.contains("\"reachable\":true"),
+            "must not lock onto unreachable #16: {nav_snip}"
         );
         assert!(
-            nav_snip.contains("\"progress\":\"item\"") || nav_snip.contains("progress\":\"item"),
-            "stairs should be ranked as item progress: {nav_snip}"
+            nav_snip.contains("\"event\":19")
+                || nav_snip.contains("\"event\":13")
+                || nav_snip.contains("\"progress\":\"bridge\"")
+                || nav_snip.contains("\"progress\":\"scene\""),
+            "nav should route via a hall door, got: {nav_snip}"
+        );
+        assert!(
+            nav_snip.contains("\"reachable\":true") || nav_snip.contains("\"path\":"),
+            "door route should publish a path: {nav_snip}"
         );
         // Aunt remains listed as a dialog loop for clients that scan events[].
         assert!(json.contains("\"loop\":true") || json.contains("\"progress\":\"dialog\""));

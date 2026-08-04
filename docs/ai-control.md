@@ -161,7 +161,7 @@
 顶层还有 `facing`：当前朝向对应的键名（`down`/`left`/`up`/`right`）。
 
 **选目标规则（引擎已按此排序 `nav`）：**  
-优先 `item_use` / 会给物品·改状态的 `quest`·`item` 脚本 → 切场景 `scene` → 其它；**纯对话循环 `dialog`（`events[].loop=true`）会被降权**，避免卡在婶婶等重复台词 NPC。
+优先 `item_use` / 会给物品·改状态的 `quest`·`item` 脚本 → 切场景 `scene` → 其它；**纯对话循环 `dialog`（`events[].loop=true`）会被降权**；**走不过去的目标会被跳过**（例如厨房到楼上送菜点中间有墙，会先指向可达的门 `progress=scene`/`bridge`，而不是对着 `reachable:false` 空转）。
 
 - `nav.item_use` 有值 → **菜单使用该物品**对准目标（不要只 confirm 对话）  
 - `can_act` → 立刻 `confirm` / `space`  
