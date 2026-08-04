@@ -689,6 +689,20 @@ struct NavInfo {
     in_search_range: bool,
     dist: i32,
     dest_scene: Option<u16>,
+    /// Script progress class for hints: item/quest/scene/dialog/…
+    progress: &'static str,
+    /// Inventory item that can be used on this event (field item-use).
+    item_use: Option<u16>,
+}
+
+/// How promising a trigger script looks for story progress (lower = better).
+/// 0 item-use target · 1 grants item/cash/battle · 2 mutates world · 3 scene
+/// change · 4 mild · 5 pure dialog loop · 6 empty.
+#[derive(Clone, Copy)]
+struct ScriptRank {
+    rank: u8,
+    label: &'static str,
+    grants_item: Option<u16>,
 }
 
 fn compute_walk(engine: &Engine, player: (i32, i32)) -> [bool; 4] {
@@ -737,6 +751,13 @@ fn build_events_and_nav(
         key: Option<&'static str>,
         interactable: bool,
         has_sprite: bool,
+        /// Lower = better story progress (see ScriptRank).
+        progress_rank: u8,
+        progress: &'static str,
+        /// Field-usable inventory item targeting this event (0x0081).
+        item_use: Option<u16>,
+        /// Pure dialog with no world side-effects (safe to skip when stuck).
+        dialog_loop: bool,
     }
 
     let mut rows: Vec<Row> = Vec::new();
@@ -774,6 +795,22 @@ fn build_events_and_nav(
         let interactable =
             ev.trigger_script != 0 && (ev.trigger_mode > 0 || dest_scene.is_some());
         let key = best_key_toward(player, pos, walk, prefer_key);
+        let item_use = story_item_for_event(engine, event_id);
+        let mut rank = analyze_script_progress(engine, ev.trigger_script);
+        if item_use.is_some() {
+            rank = ScriptRank {
+                rank: 0,
+                label: "item",
+                grants_item: item_use,
+            };
+        } else if dest_scene.is_some() && rank.rank > 3 {
+            // Scene-change exits that our short scan missed still beat dialog loops.
+            rank = ScriptRank {
+                rank: 3,
+                label: "scene",
+                grants_item: None,
+            };
+        }
         rows.push(Row {
             dist,
             event_id,
@@ -787,12 +824,18 @@ fn build_events_and_nav(
             key,
             interactable,
             has_sprite: ev.sprite_num != 0,
+            progress_rank: rank.rank,
+            progress: rank.label,
+            item_use,
+            dialog_loop: rank.rank >= 5,
         });
     }
+    // Near first for the published list, but nav uses progress-aware ranking.
     rows.sort_by_key(|r| (r.dist, r.event_id));
     rows.truncate(MAX_EVENTS);
 
-    // Choose best nav target: prefer actable / in-range NPCs with sprites.
+    // Prefer story progress over nearby dialog-loop NPCs (e.g. 婶婶 after
+    // quest line advances: skip #20 loop, go #16 stairs to deliver 酒菜).
     let mut nav = NavInfo::default();
     if let Some(best) = rows
         .iter()
@@ -811,18 +854,28 @@ fn build_events_and_nav(
                 1
             } else if r.dist <= 640 {
                 2
-            } else {
+            } else if r.dist <= 1280 {
                 3
+            } else {
+                4
             };
-            // Visible NPCs/searchables >> exits >> invisible triggers.
+            // Soft role bias only after progress rank.
             let role_pen = match r.role {
                 "npc" | "search" => 0,
-                "exit" => 2,
-                "trigger" => 4,
-                _ => 5,
+                "exit" => 1,
+                "trigger" => 2,
+                _ => 4,
             };
             let sprite_pen = if r.has_sprite { 0 } else { 1 };
-            (act_pen, near, role_pen, sprite_pen, r.dist, r.event_id)
+            (
+                r.progress_rank,
+                act_pen,
+                near,
+                role_pen,
+                sprite_pen,
+                r.dist,
+                r.event_id,
+            )
         })
     {
         let can_act = best.search_ok || best.in_touch;
@@ -844,6 +897,8 @@ fn build_events_and_nav(
             in_search_range,
             dist: best.dist,
             dest_scene: best.dest_scene,
+            progress: best.progress,
+            item_use: best.item_use,
         };
     }
 
@@ -906,6 +961,16 @@ fn build_events_and_nav(
         push_bool(&mut events, "can_search_now", row.search_ok);
         events.push(',');
         push_bool(&mut events, "in_touch_range", row.in_touch);
+        events.push(',');
+        push_str(&mut events, "progress", row.progress);
+        if row.dialog_loop {
+            events.push(',');
+            push_bool(&mut events, "loop", true);
+        }
+        if let Some(item) = row.item_use {
+            events.push(',');
+            push_u64(&mut events, "item_use", item as u64);
+        }
         if let Some(f) = row.face {
             events.push(',');
             push_str(&mut events, "face", f);
@@ -1006,6 +1071,14 @@ fn append_nav(out: &mut String, nav: &NavInfo, path: &[&'static str]) {
     push_i64(out, "dist", nav.dist as i64);
     out.push(',');
     push_bool(out, "can_act", nav.can_act);
+    if !nav.progress.is_empty() {
+        out.push(',');
+        push_str(out, "progress", nav.progress);
+    }
+    if let Some(item) = nav.item_use {
+        out.push(',');
+        push_u64(out, "item_use", item as u64);
+    }
     if nav.in_search_range {
         out.push(',');
         push_bool(out, "in_search_range", true);
@@ -1156,6 +1229,171 @@ fn script_destination_scene(engine: &Engine, script: u16) -> Option<u16> {
         }
         if entry.operation == 0x0000 {
             break;
+        }
+    }
+    None
+}
+
+/// Scan a trigger script (until first hard stop) for story-progress signals.
+/// Used so nav skips pure dialog loops and prefers item/quest scripts.
+fn analyze_script_progress(engine: &Engine, script: u16) -> ScriptRank {
+    analyze_script_progress_depth(engine, script, 0)
+}
+
+fn analyze_script_progress_depth(engine: &Engine, script: u16, depth: u8) -> ScriptRank {
+    if script == 0 {
+        return ScriptRank {
+            rank: 6,
+            label: "none",
+            grants_item: None,
+        };
+    }
+    let entries = &engine.globals.game.script_entries;
+    let mut grants_item: Option<u16> = None;
+    let mut has_item = false;
+    let mut has_cash = false;
+    let mut has_battle = false;
+    let mut has_scene = false;
+    let mut mutates_world = false;
+    let mut mild = false;
+    let mut saw_dialog = false;
+    let mut ip = script as usize;
+    let mut steps = 0usize;
+    while steps < 96 {
+        steps += 1;
+        let Some(entry) = entries.get(ip) else {
+            break;
+        };
+        let op = entry.operation;
+        let a = entry.operand;
+        match op {
+            // Hard stop for this interaction (next press starts at next_script).
+            0x0000 | 0x0001 => break,
+            // Stop & jump entry — end of this run.
+            0x0002 => break,
+            // Unconditional jump (follow once).
+            0x0003 => {
+                if a[0] != 0 {
+                    ip = a[0] as usize;
+                    continue;
+                }
+            }
+            // Call — peek callee briefly for side effects.
+            0x0004 => {
+                if a[0] != 0 && depth < 2 {
+                    let sub = analyze_script_progress_depth(engine, a[0], depth + 1);
+                    if sub.rank <= 1 {
+                        return sub;
+                    }
+                    if sub.rank <= 2 {
+                        mutates_world = true;
+                    }
+                    if sub.grants_item.is_some() {
+                        grants_item = sub.grants_item;
+                        has_item = true;
+                    }
+                }
+            }
+            0x0006 => has_battle = true, // start battle
+            0x001E => has_cash = true,
+            0x001F => {
+                has_item = true;
+                if a[0] != 0 {
+                    grants_item = Some(a[0]);
+                }
+            }
+            0x0020 => has_item = true, // remove item
+            // Set trigger/auto/mode/state on objects — quest progression.
+            0x0024 | 0x0025 | 0x0040 | 0x0049 => mutates_world = true,
+            0x0059 if a[0] != 0 => has_scene = true,
+            // Dialog ops.
+            0x003B | 0x003C | 0x003D | 0x003E | 0xFFFF => saw_dialog = true,
+            // Movement / wait / redraw — mild.
+            0x0005 | 0x0008 | 0x0009 | 0x000B..=0x0016 | 0x006C | 0x006E | 0x0070 => {
+                mild = true;
+            }
+            _ => {
+                // Unknown opcode: treat as mild progress so we don't skip it.
+                mild = true;
+            }
+        }
+        ip = ip.saturating_add(1);
+    }
+
+    if has_item || has_cash || has_battle {
+        ScriptRank {
+            rank: 1,
+            label: if has_item {
+                "item"
+            } else if has_battle {
+                "battle"
+            } else {
+                "cash"
+            },
+            grants_item,
+        }
+    } else if mutates_world {
+        ScriptRank {
+            rank: 2,
+            label: "quest",
+            grants_item: None,
+        }
+    } else if has_scene {
+        ScriptRank {
+            rank: 3,
+            label: "scene",
+            grants_item: None,
+        }
+    } else if mild && !saw_dialog {
+        ScriptRank {
+            rank: 4,
+            label: "mild",
+            grants_item: None,
+        }
+    } else if saw_dialog || mild {
+        ScriptRank {
+            rank: 5,
+            label: "dialog",
+            grants_item: None,
+        }
+    } else {
+        ScriptRank {
+            rank: 6,
+            label: "none",
+            grants_item: None,
+        }
+    }
+}
+
+/// Inventory item whose use-script checks event via opcode 0x0081.
+fn story_item_for_event(engine: &Engine, event_id: u16) -> Option<u16> {
+    for entry in engine.globals.inventory.iter() {
+        if entry.item == 0 || entry.amount == 0 {
+            continue;
+        }
+        let Some(object) = engine.globals.game.objects.get(entry.item as usize) else {
+            continue;
+        };
+        let flags = object.item_flags();
+        if flags & ITEMFLAG_USABLE == 0 {
+            continue;
+        }
+        let use_script = object.item_script_on_use();
+        if use_script == 0 {
+            continue;
+        }
+        // Item use scripts often start with a redraw (0x0005) then 0x0081.
+        let start = use_script as usize;
+        for index in start..start.saturating_add(8) {
+            let Some(e) = engine.globals.game.script_entries.get(index) else {
+                break;
+            };
+            if e.operation == 0x0081 && e.operand[0] == event_id {
+                return Some(entry.item);
+            }
+            if e.operation == 0x0000 {
+                break;
+            }
         }
     }
     None
@@ -1602,28 +1840,40 @@ fn build_hint(
     }
     // Overworld.
     if nav.event_id != 0 {
+        let prog = if nav.progress.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", nav.progress)
+        };
+        if let Some(item) = nav.item_use {
+            let name = word_utf8(engine, item as usize);
+            return format!(
+                "use item {item}({name}) on #{} ({}{prog}) — menu→item→use, face target",
+                nav.event_id, nav.role
+            );
+        }
         if nav.can_act {
             return format!(
-                "at event #{} ({}) — confirm/space to interact",
+                "at event #{} ({}{prog}) — confirm/space to interact",
                 nav.event_id, nav.role
             );
         }
         if nav.in_search_range {
             if let Some(f) = nav.face {
                 return format!(
-                    "in range of #{} ({}) — face {} then confirm",
+                    "in range of #{} ({}{prog}) — face {} then confirm",
                     nav.event_id, nav.role, f
                 );
             }
             return format!(
-                "in range of #{} ({}) — confirm/space",
+                "in range of #{} ({}{prog}) — confirm/space",
                 nav.event_id, nav.role
             );
         }
         if !path.is_empty() {
             let preview: Vec<&str> = path.iter().copied().take(6).collect();
             return format!(
-                "go to #{} ({}) path={}… — press {}",
+                "go to #{} ({}{prog}) path={}… — press {}",
                 nav.event_id,
                 nav.role,
                 preview.join(">"),
@@ -1632,7 +1882,7 @@ fn build_hint(
         }
         if let Some(k) = nav.key {
             return format!(
-                "approach #{} ({}) — press {}",
+                "approach #{} ({}{prog}) — press {}",
                 nav.event_id, nav.role, k
             );
         }
@@ -1645,12 +1895,12 @@ fn build_hint(
             .collect();
         if open.is_empty() {
             return format!(
-                "blocked near #{} ({}) — try menu or other event",
+                "blocked near #{} ({}{prog}) — try menu or other event",
                 nav.event_id, nav.role
             );
         }
         return format!(
-            "approach #{} ({}) — try {}",
+            "approach #{} ({}{prog}) — try {}",
             nav.event_id,
             nav.role,
             open.join("/")
@@ -1845,4 +2095,76 @@ fn push_pair(out: &mut String, key: &str, a: i32, b: i32) {
     out.push(',');
     out.push_str(&b.to_string());
     out.push(']');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game_loop::Engine;
+
+    fn engine() -> Engine {
+        std::env::set_var("PAL_DATA_DIR", concat!(env!("CARGO_MANIFEST_DIR"), "/pal"));
+        Engine::new(true).expect("headless engine")
+    }
+
+    #[test]
+    fn script_rank_dialog_loop_vs_item_delivery() {
+        let e = engine();
+        // Aunt "别愣在这里" pure dialog.
+        let aunt = analyze_script_progress(&e, 4981);
+        assert_eq!(aunt.label, "dialog");
+        assert!(aunt.rank >= 5, "aunt loop rank {}", aunt.rank);
+
+        // Stairs delivery grants 桂花酒 (item 272).
+        let stairs = analyze_script_progress(&e, 4885);
+        assert_eq!(stairs.label, "item");
+        assert!(stairs.rank <= 1, "stairs rank {}", stairs.rank);
+        assert_eq!(stairs.grants_item, Some(272));
+
+        // Nav must prefer item script over nearer dialog loop.
+        assert!(stairs.rank < aunt.rank);
+    }
+
+    #[test]
+    fn inn_delivery_nav_prefers_stairs_over_aunt() {
+        let mut e = engine();
+        // Reproduce live kitchen progress: aunt loop, dishes taken, stairs open,
+        // nearby free-loot chests already cleared (state 0).
+        e.globals.num_scene = 1;
+        e.globals.in_main_game = true;
+        e.globals.viewport = (336, 1080);
+        e.globals.partyoffset = (160, 112); // player = (496, 1192)
+        e.globals.game.event_objects[19].state = 2; // #20 aunt
+        e.globals.game.event_objects[19].trigger_script = 4981;
+        e.globals.game.event_objects[20].state = 0; // #21 table gone
+        e.globals.game.event_objects[15].state = 1; // #16 stairs
+        e.globals.game.event_objects[15].trigger_script = 4885;
+        for id in [22u16, 23, 24] {
+            e.globals.game.event_objects[id as usize - 1].state = 0;
+        }
+
+        let json = build_state_json(&e);
+        let nav_snip = json
+            .find("\"nav\"")
+            .map(|i| &json[i.. (i + 220).min(json.len())])
+            .unwrap_or(&json);
+        assert!(
+            nav_snip.contains("\"event\":16"),
+            "nav should prefer stairs #16 over aunt loop, got: {nav_snip}"
+        );
+        assert!(
+            nav_snip.contains("\"progress\":\"item\"") || nav_snip.contains("progress\":\"item"),
+            "stairs should be ranked as item progress: {nav_snip}"
+        );
+        // Aunt remains listed as a dialog loop for clients that scan events[].
+        assert!(json.contains("\"loop\":true") || json.contains("\"progress\":\"dialog\""));
+    }
+
+    #[test]
+    fn osmanthus_wine_targets_drunkard() {
+        let mut e = engine();
+        e.globals.add_item_to_inventory(272, 1);
+        assert_eq!(story_item_for_event(&e, 63), Some(272));
+        assert_eq!(story_item_for_event(&e, 20), None);
+    }
 }

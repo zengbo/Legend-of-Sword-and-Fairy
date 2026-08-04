@@ -131,15 +131,15 @@ Do not map `delta` signs to screen arrows. Use `nav` / `events[].keys` / `hint`.
 
 ```json
 "nav": {
-  "event": 54,
+  "event": 16,
   "role": "exit",
-  "dist": 256,
+  "dist": 960,
   "can_act": false,
+  "progress": "item",
   "keys": ["up"],
-  "steps": 5,
-  "path": ["up", "up", "right", "up", "right"],
-  "reachable": true,
-  "dest_scene": 5
+  "steps": 12,
+  "path": ["up", "right", "up"],
+  "reachable": true
 }
 ```
 
@@ -147,6 +147,8 @@ Do not map `delta` signs to screen arrows. Use `nav` / `events[].keys` / `hint`.
 | --- | --- |
 | `event` | Recommended event id |
 | `role` | Coarse class: `npc` / `exit` / `search` / `trigger` / `decor` |
+| `progress` | Script rank: `item` / `quest` / `scene` / `dialog` / `battle` / `cash` / `mild` / `none` |
+| `item_use` | Optional inventory item id to **use** on this event (menu → item → use) |
 | `can_act` | Confirm works **with current facing**, or in touch range |
 | `in_search_range` | Inside search tiles (may need to turn) |
 | `face` | Face this key, then `confirm` |
@@ -158,18 +160,24 @@ Do not map `delta` signs to screen arrows. Use `nav` / `events[].keys` / `hint`.
 
 Top-level `facing` is the key name for current facing (`down`/`left`/`up`/`right`).
 
+**Target selection (engine already ranks `nav` this way):**  
+Prefer `item_use` / scripts that grant items or mutate quest state → scene exits → other; **pure dialog loops** (`events[].loop=true`, `progress=dialog`) are deprioritized so agents do not stick on repeating NPCs.
+
+- `nav.item_use` set → **use that item from the menu** on the target (do not only confirm dialog)  
 - `can_act` → `confirm` / `space` now  
 - `in_search_range` + `face` → tap `face`, then `confirm`  
 - else press **only** `key` / `path[0]` — do not alternate directions  
-- no target → `nav` is `null`
+- no target → `nav` is `null`  
+- if still stuck: pick `events[]` with `progress` in `item`/`quest`/`scene` and no `loop`
 
 #### Natural-language `hint`
 
 One line per turn, e.g.:
 
 - `"dialog — confirm (…)"`
-- `"go to #54 (exit) path=up>up>right… — press up"`
-- `"at event #68 (search) — confirm/space to interact"`
+- `"go to #16 (exit/item) path=up>right… — press up"`
+- `"use item 272(…) on #63 (npc/item) — menu→item→use, face target"`
+- `"at event #68 (search/quest) — confirm/space to interact"`
 - `"select enemy target index=1 (…) — left/right, confirm"`
 
 **Read `hint` first, then drill into fields.**
@@ -181,6 +189,9 @@ One line per turn, e.g.:
 | `id` | Object id |
 | `kind` | `search` / `touch` / `scenery` |
 | `role` | Coarse class (same as `nav.role`) |
+| `progress` | Script rank (same labels as `nav.progress`) |
+| `loop` | Optional; `true` = pure dialog loop (safe to skip) |
+| `item_use` | Optional usable item id for this event |
 | `pos` / `delta` / `dist` | Position and distance |
 | `can_search_now` | Confirm hits with **current facing** (engine tile match) |
 | `in_search_range` | Search works for some facing |
@@ -191,7 +202,8 @@ One line per turn, e.g.:
 | `trigger_script` etc. | Advanced script/sprite ids |
 
 Search uses the engine’s facing cone + map tiles. mode=1 needs you almost on the same tile.  
-`can_search_now` / `in_touch_range` → `confirm`/`space`; only `face` → turn first, then confirm.
+`can_search_now` / `in_touch_range` → `confirm`/`space`; only `face` → turn first, then confirm.  
+Table dishes / delivery stairs may be `search` or sprite-less `exit`/`touch` — follow `progress` and `nav`, not a “table” label.
 
 #### Party `party[]`
 
@@ -290,10 +302,13 @@ Each turn, decide in this priority:
 6. **`phase` is `boot` or `in_main_game` is false** → use `confirm` for intro/title; in step mode also advance many steps.  
 7. **Overworld**  
    - Read `hint` / `nav` first  
+   - Read `hint` / `nav` first (`nav` prefers `item`/`quest` and deprioritizes dialog loops)  
+   - `nav.item_use` set → **menu-use that item** on `nav.event`  
    - `nav.can_act` → `confirm`/`space`  
    - `nav.in_search_range` + `face` → tap `face`, then `confirm`  
    - else press **only** `nav.key` (= `path[0]`); hold that one direction until `can_act` / `hint` changes  
    - no `nav`: explore only where `walk` is true  
+   - if still spinning: pick `events[]` with `progress` in `item`/`quest`/`scene` and no `loop`
 
 Use `keys_hint` as soft guidance; **`actions` is the hard list of legal keys.**
 

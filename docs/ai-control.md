@@ -131,15 +131,15 @@
 
 ```json
 "nav": {
-  "event": 54,
+  "event": 16,
   "role": "exit",
-  "dist": 256,
+  "dist": 960,
   "can_act": false,
+  "progress": "item",
   "keys": ["up"],
-  "steps": 5,
-  "path": ["up", "up", "right", "up", "right"],
-  "reachable": true,
-  "dest_scene": 5
+  "steps": 12,
+  "path": ["up", "right", "up"],
+  "reachable": true
 }
 ```
 
@@ -147,6 +147,8 @@
 | --- | --- |
 | `event` | 推荐接近/交互的事件 id |
 | `role` | 粗分类：`npc` / `exit` / `search` / `trigger` / `decor` |
+| `progress` | 脚本进度等级：`item` / `quest` / `scene` / `dialog` / `battle` / `cash` / `mild` / `none` |
+| `item_use` | 可选；背包中可对该事件「使用」的物品 id（需菜单→物品→使用） |
 | `can_act` | 当前朝向已可调查，或已在触碰范围 |
 | `in_search_range` | 已进入调查格（可能还要转身） |
 | `face` | 需要面向的方向键；先 tap 该键再 `confirm` |
@@ -158,18 +160,24 @@
 
 顶层还有 `facing`：当前朝向对应的键名（`down`/`left`/`up`/`right`）。
 
+**选目标规则（引擎已按此排序 `nav`）：**  
+优先 `item_use` / 会给物品·改状态的 `quest`·`item` 脚本 → 切场景 `scene` → 其它；**纯对话循环 `dialog`（`events[].loop=true`）会被降权**，避免卡在婶婶等重复台词 NPC。
+
+- `nav.item_use` 有值 → **菜单使用该物品**对准目标（不要只 confirm 对话）  
 - `can_act` → 立刻 `confirm` / `space`  
 - `in_search_range` 且有 `face` → 先 tap `face` 转身，再 `confirm`  
 - 否则 **只按 `key`（或 `path[0]`）一个方向**，不要在多个方向间切换  
-- 无目标时 `nav` 为 `null`
+- 无目标时 `nav` 为 `null`  
+- 若仍空转：可读 `events[]` 里 `progress!=dialog` 且无 `loop` 的目标，用其 `key` 走（一般不必，`nav` 已避开循环）
 
 #### 自然语言 `hint`
 
 每拍一句，例如：
 
 - `"dialog — confirm (李大娘：李逍遙！…)"`
-- `"go to #54 (exit) path=up>up>right… — press up"`
-- `"at event #68 (search) — confirm/space to interact"`
+- `"go to #16 (exit/item) path=up>right… — press up"`
+- `"use item 272(桂花酒) on #63 (npc/item) — menu→item→use, face target"`
+- `"at event #68 (search/quest) — confirm/space to interact"`
 - `"select enemy target index=1 (蛇妖) — left/right, confirm"`
 
 **可先读 `hint`，再读细节字段。**
@@ -181,6 +189,9 @@
 | `id` | 对象编号 |
 | `kind` | `search` / `touch` / `scenery` |
 | `role` | 粗分类（同上） |
+| `progress` | 脚本进度：`item`/`quest`/`scene`/`dialog`/…（同 `nav`） |
+| `loop` | 可选；`true` 表示当前脚本是纯对话循环，可跳过 |
+| `item_use` | 可选；可用物品 id |
 | `pos` / `delta` / `dist` | 位置与距离 |
 | `can_search_now` | **当前朝向**下按 confirm 能否命中（引擎格匹配） |
 | `in_search_range` | 任一方位下可调查 |
@@ -191,7 +202,8 @@
 | `trigger_script` 等 | 脚本/精灵编号（高级） |
 
 调查判定与引擎一致：朝向锥 + 地图格子。mode=1 时几乎要站在目标格旁。  
-`can_search_now` / `in_touch_range` → `confirm`/`space`；仅有 `face` → 先转身再确认。
+`can_search_now` / `in_touch_range` → `confirm`/`space`；仅有 `face` → 先转身再确认。  
+**桌上酒菜 / 楼梯送菜** 等可能是 `search` 或无精灵的 `exit`/`touch`，不一定叫「桌子」；看 `progress=item|quest` 与 `nav` 即可。
 
 #### 队伍 `party[]`
 
@@ -289,11 +301,13 @@
 5. **`entering_scene` 或 `phase` 为 `scene_transition`** → 少操作，步进或短暂等待。  
 6. **`phase` 为 `boot` 或 `in_main_game` 为 false** → 多用 `confirm` 过片头/主菜单；步进模式下配合大量 `step`。  
 7. **大地图 `overworld`**  
-   - 先读 `hint` / `nav`  
+   - 先读 `hint` / `nav`（`nav` 已优先 `item`/`quest`，并避开 `dialog` 循环 NPC）  
+   - `nav.item_use` 有值 → **菜单使用该物品**对准 `nav.event`（如桂花酒对醉道士）  
    - `nav.can_act` → `confirm`/`space`  
    - `nav.in_search_range` + `face` → tap `face` 转身 → `confirm`  
    - 否则 **只** 按 `nav.key`（= `path[0]`）一个方向；长按该方向直到 `can_act` 或 `hint` 变化  
    - 无 `nav`：只在 `walk` 为 true 的方向探索  
+   - 仍空转时：在 `events[]` 选 `progress` 为 `item`/`quest`/`scene` 且无 `loop` 的目标  
 
 `keys_hint` 可作辅助，**以 `actions` 为合法键范围**。
 
