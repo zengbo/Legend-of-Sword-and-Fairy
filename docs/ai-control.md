@@ -147,14 +147,20 @@
 | --- | --- |
 | `event` | 推荐接近/交互的事件 id |
 | `role` | 粗分类：`npc` / `exit` / `search` / `trigger` / `decor` |
-| `can_act` | 已可调查或已在触碰范围 |
-| `keys` | 当前一步应优先按的方向（已过滤不可走） |
-| `path` | 短路径（最多约 16 步）；有则按 `path[0]` 走 |
-| `reachable` | BFS 是否找到路径；`false` 时换目标或绕路 |
+| `can_act` | 当前朝向已可调查，或已在触碰范围 |
+| `in_search_range` | 已进入调查格（可能还要转身） |
+| `face` | 需要面向的方向键；先 tap 该键再 `confirm` |
+| `key` | **唯一**推荐下一步方向（稳定，避免左右抖） |
+| `keys` | 与 `key` 相同的单元素数组（兼容旧客户端） |
+| `path` | 短路径；有则按 `path[0]`（= `key`）走 |
+| `reachable` | BFS 是否找到路径 |
 | `dest_scene` | 若脚本会切场景，目标场景号 |
 
-- `can_act == true` → 立刻 `confirm` / `space`  
-- 否则优先 `path[0]`，没有 path 再用 `keys[0]`  
+顶层还有 `facing`：当前朝向对应的键名（`down`/`left`/`up`/`right`）。
+
+- `can_act` → 立刻 `confirm` / `space`  
+- `in_search_range` 且有 `face` → 先 tap `face` 转身，再 `confirm`  
+- 否则 **只按 `key`（或 `path[0]`）一个方向**，不要在多个方向间切换  
 - 无目标时 `nav` 为 `null`
 
 #### 自然语言 `hint`
@@ -176,13 +182,16 @@
 | `kind` | `search` / `touch` / `scenery` |
 | `role` | 粗分类（同上） |
 | `pos` / `delta` / `dist` | 位置与距离 |
-| `can_search_now` | 是否已可调查 |
+| `can_search_now` | **当前朝向**下按 confirm 能否命中（引擎格匹配） |
+| `in_search_range` | 任一方位下可调查 |
+| `face` | 需要面向的方向 |
 | `in_touch_range` | 是否已在触碰范围内 |
-| `keys` | 走近该事件的推荐方向（过滤撞墙） |
+| `key` | 走近该事件的**单一**推荐方向 |
 | `dest_scene` | 可选；脚本切场景目标 |
 | `trigger_script` 等 | 脚本/精灵编号（高级） |
 
-`can_search_now` 或 `in_touch_range` 为 true 时用 `confirm` / `space`。
+调查判定与引擎一致：朝向锥 + 地图格子。mode=1 时几乎要站在目标格旁。  
+`can_search_now` / `in_touch_range` → `confirm`/`space`；仅有 `face` → 先转身再确认。
 
 #### 队伍 `party[]`
 
@@ -282,7 +291,8 @@
 7. **大地图 `overworld`**  
    - 先读 `hint` / `nav`  
    - `nav.can_act` → `confirm`/`space`  
-   - 否则按 `nav.path[0]` 或 `nav.keys[0]` 移动（再 `step`）  
+   - `nav.in_search_range` + `face` → tap `face` 转身 → `confirm`  
+   - 否则 **只** 按 `nav.key`（= `path[0]`）一个方向；长按该方向直到 `can_act` 或 `hint` 变化  
    - 无 `nav`：只在 `walk` 为 true 的方向探索  
 
 `keys_hint` 可作辅助，**以 `actions` 为合法键范围**。

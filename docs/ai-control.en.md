@@ -147,14 +147,20 @@ Do not map `delta` signs to screen arrows. Use `nav` / `events[].keys` / `hint`.
 | --- | --- |
 | `event` | Recommended event id |
 | `role` | Coarse class: `npc` / `exit` / `search` / `trigger` / `decor` |
-| `can_act` | Can inspect or already in touch range |
-| `keys` | Preferred one-step keys (walk-filtered) |
-| `path` | Short BFS path (≤ ~16 steps); press `path[0]` |
+| `can_act` | Confirm works **with current facing**, or in touch range |
+| `in_search_range` | Inside search tiles (may need to turn) |
+| `face` | Face this key, then `confirm` |
+| `key` | **Single** next walk key (stable; avoids left/right flip) |
+| `keys` | One-element array = `[key]` (compat) |
+| `path` | Short BFS path; press `path[0]` (= `key`) |
 | `reachable` | Whether BFS found a path |
 | `dest_scene` | Scene change target if the script teleports |
 
-- `can_act == true` → `confirm` / `space` now  
-- else prefer `path[0]`, else `keys[0]`  
+Top-level `facing` is the key name for current facing (`down`/`left`/`up`/`right`).
+
+- `can_act` → `confirm` / `space` now  
+- `in_search_range` + `face` → tap `face`, then `confirm`  
+- else press **only** `key` / `path[0]` — do not alternate directions  
 - no target → `nav` is `null`
 
 #### Natural-language `hint`
@@ -176,13 +182,16 @@ One line per turn, e.g.:
 | `kind` | `search` / `touch` / `scenery` |
 | `role` | Coarse class (same as `nav.role`) |
 | `pos` / `delta` / `dist` | Position and distance |
-| `can_search_now` | Close enough to inspect |
+| `can_search_now` | Confirm hits with **current facing** (engine tile match) |
+| `in_search_range` | Search works for some facing |
+| `face` | Required facing key |
 | `in_touch_range` | Inside touch trigger radius |
-| `keys` | Keys that reduce distance (walk-filtered) |
+| `key` | Single preferred walk key toward this event |
 | `dest_scene` | Optional scene-change target |
 | `trigger_script` etc. | Advanced script/sprite ids |
 
-When `can_search_now` or `in_touch_range`, press `confirm` or `space`.
+Search uses the engine’s facing cone + map tiles. mode=1 needs you almost on the same tile.  
+`can_search_now` / `in_touch_range` → `confirm`/`space`; only `face` → turn first, then confirm.
 
 #### Party `party[]`
 
@@ -282,7 +291,8 @@ Each turn, decide in this priority:
 7. **Overworld**  
    - Read `hint` / `nav` first  
    - `nav.can_act` → `confirm`/`space`  
-   - else press `nav.path[0]` or `nav.keys[0]` (then step)  
+   - `nav.in_search_range` + `face` → tap `face`, then `confirm`  
+   - else press **only** `nav.key` (= `path[0]`); hold that one direction until `can_act` / `hint` changes  
    - no `nav`: explore only where `walk` is true  
 
 Use `keys_hint` as soft guidance; **`actions` is the hard list of legal keys.**

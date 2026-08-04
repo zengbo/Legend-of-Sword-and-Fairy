@@ -17,23 +17,26 @@ use crate::global::{
 use crate::ui::{agent_text_from_bytes, AgentMenuItem};
 use crate::ui_driver;
 
-/// Overworld step deltas matching `play` / `fullgame_autoplay` key mapping:
-/// up / right / down / left.
+/// Overworld step deltas matching `play` / key mapping:
+/// key order is NOT party_direction order — see `DIR_KEYS`.
 const WALK_DELTA: [((i32, i32), &str); 4] = [
-    ((16, -8), "up"),
-    ((16, 8), "right"),
-    ((-16, 8), "down"),
-    ((-16, -8), "left"),
+    ((16, -8), "up"),    // DIR_NORTH = 2
+    ((16, 8), "right"),  // DIR_EAST  = 3
+    ((-16, 8), "down"),  // DIR_SOUTH = 0
+    ((-16, -8), "left"), // DIR_WEST  = 1
 ];
+
+/// party_direction → key name (DIR_SOUTH/WEST/NORTH/EAST = 0..3).
+const DIR_KEYS: [&str; 4] = ["down", "left", "up", "right"];
 
 /// Max nearby event objects listed (sorted by distance).
 const MAX_EVENTS: usize = 48;
 /// Max inventory rows listed.
 const MAX_INV_LIST: usize = 64;
 /// BFS node budget for short path hints (per state build).
-const PATH_BFS_LIMIT: usize = 6_000;
+const PATH_BFS_LIMIT: usize = 12_000;
 /// Max path steps published in `nav.path`.
-const PATH_MAX_STEPS: usize = 16;
+const PATH_MAX_STEPS: usize = 24;
 /// Status short names (STATUS_* index).
 const STATUS_NAMES: [&str; STATUS_ALL] = [
     "conf", "para", "sleep", "silence", "puppet", "brave", "prot", "haste", "dual",
@@ -98,6 +101,9 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
     push_pair(&mut out, "player", player.0, player.1);
     out.push(',');
     push_u64(&mut out, "party_direction", g.party_direction as u64);
+    out.push(',');
+    // Key name for current facing (down/left/up/right).
+    push_str(&mut out, "facing", dir_to_key(g.party_direction));
     out.push(',');
     push_bool(&mut out, "in_main_game", g.in_main_game);
     out.push(',');
@@ -674,8 +680,13 @@ fn append_inventory(out: &mut String, engine: &Engine) {
 struct NavInfo {
     event_id: u16,
     role: &'static str,
-    keys: Vec<&'static str>,
+    /// Single preferred step key (stable).
+    key: Option<&'static str>,
+    /// Face key needed for search (when in range but wrong facing).
+    face: Option<&'static str>,
     can_act: bool,
+    /// In search range for some facing (may still need to turn).
+    in_search_range: bool,
     dist: i32,
     dest_scene: Option<u16>,
 }
@@ -707,6 +718,8 @@ fn build_events_and_nav(
         .get(scene_i)
         .map(|s| s.event_object_index as usize)
         .unwrap_or(g.game.event_objects.len());
+    let party_dir = g.party_direction;
+    let prefer_key = dir_to_key(party_dir);
 
     struct Row {
         dist: i32,
@@ -714,11 +727,16 @@ fn build_events_and_nav(
         index: usize,
         role: &'static str,
         kind: &'static str,
+        /// confirm would hit with **current** facing.
         search_ok: bool,
+        /// confirm would hit if facing `face` (any dir).
+        face: Option<&'static str>,
         in_touch: bool,
         dest_scene: Option<u16>,
-        keys: Vec<&'static str>,
+        /// Single best walk key toward this event.
+        key: Option<&'static str>,
         interactable: bool,
+        has_sprite: bool,
     }
 
     let mut rows: Vec<Row> = Vec::new();
@@ -742,10 +760,10 @@ fn build_events_and_nav(
         };
         let dest_scene = script_destination_scene(engine, ev.trigger_script);
         let role = classify_event_role(ev.trigger_mode, ev.sprite_num, ev.trigger_script, dest_scene);
-        let search_ok = if ev.trigger_mode > 0 && ev.trigger_mode < 4 {
-            can_search_from(player, pos, ev.trigger_mode)
+        let (search_ok, face) = if ev.trigger_mode > 0 && ev.trigger_mode < 4 {
+            search_status(player, pos, ev.trigger_mode, party_dir)
         } else {
-            false
+            (false, None)
         };
         let touch_radius = if ev.trigger_mode >= 4 {
             ((ev.trigger_mode - 4) as i32 * 32 + 16).max(16)
@@ -753,9 +771,9 @@ fn build_events_and_nav(
             0
         };
         let in_touch = touch_radius > 0 && dist < touch_radius;
-        let interactable = ev.trigger_script != 0
-            && (ev.trigger_mode > 0 || dest_scene.is_some());
-        let keys = keys_toward(player, pos, walk);
+        let interactable =
+            ev.trigger_script != 0 && (ev.trigger_mode > 0 || dest_scene.is_some());
+        let key = best_key_toward(player, pos, walk, prefer_key);
         rows.push(Row {
             dist,
             event_id,
@@ -763,61 +781,91 @@ fn build_events_and_nav(
             role,
             kind,
             search_ok,
+            face,
             in_touch,
             dest_scene,
-            keys,
+            key,
             interactable,
+            has_sprite: ev.sprite_num != 0,
         });
     }
     rows.sort_by_key(|r| (r.dist, r.event_id));
     rows.truncate(MAX_EVENTS);
 
-    // Choose best nav target: nearest interactable that is not pure scenery.
+    // Choose best nav target: prefer actable / in-range NPCs with sprites.
     let mut nav = NavInfo::default();
     if let Some(best) = rows
         .iter()
         .filter(|r| r.interactable)
         .min_by_key(|r| {
-            // Prefer actable now, then nearby, then search/npc over far exits.
-            let act_pen = if r.search_ok || r.in_touch { 0 } else { 1 };
-            let near = if r.dist <= 320 {
+            let act_pen = if r.search_ok || r.in_touch {
                 0
-            } else if r.dist <= 640 {
-                1
+            } else if r.face.is_some() {
+                1 // almost — just need to face
             } else {
                 2
             };
+            let near = if r.dist <= 160 {
+                0
+            } else if r.dist <= 320 {
+                1
+            } else if r.dist <= 640 {
+                2
+            } else {
+                3
+            };
+            // Visible NPCs/searchables >> exits >> invisible triggers.
             let role_pen = match r.role {
                 "npc" | "search" => 0,
-                "exit" | "trigger" => 1,
-                _ => 2,
+                "exit" => 2,
+                "trigger" => 4,
+                _ => 5,
             };
-            (act_pen, near, role_pen, r.dist, r.event_id)
+            let sprite_pen = if r.has_sprite { 0 } else { 1 };
+            (act_pen, near, role_pen, sprite_pen, r.dist, r.event_id)
         })
     {
+        let can_act = best.search_ok || best.in_touch;
+        let in_search_range = best.search_ok || best.face.is_some();
+        // If only wrong face: preferred key is face (tap to turn).
+        let key = if can_act {
+            None
+        } else if let Some(f) = best.face {
+            Some(f)
+        } else {
+            best.key
+        };
         nav = NavInfo {
             event_id: best.event_id,
             role: best.role,
-            keys: best.keys.clone(),
-            can_act: best.search_ok || best.in_touch,
+            key,
+            face: best.face,
+            can_act,
+            in_search_range,
             dist: best.dist,
             dest_scene: best.dest_scene,
         };
     }
 
-    // Short path BFS toward nav target (only when not already actable).
+    // Short path BFS toward nav target (only when not in search/touch range).
     let mut path_keys: Vec<&'static str> = Vec::new();
-    if nav.event_id != 0 && !nav.can_act {
+    if nav.event_id != 0 && !nav.can_act && !nav.in_search_range {
         if let Some(ev) = g
             .game
             .event_objects
             .get(nav.event_id as usize - 1)
             .copied()
         {
-            path_keys = path_to_event(engine, player, ev, PATH_BFS_LIMIT, PATH_MAX_STEPS);
-            // If BFS found a path, first key(s) override keys_toward for nav.
+            path_keys = path_to_event(
+                engine,
+                player,
+                ev,
+                party_dir,
+                PATH_BFS_LIMIT,
+                PATH_MAX_STEPS,
+            );
             if let Some(&first) = path_keys.first() {
-                nav.keys = vec![first];
+                nav.key = Some(first);
             }
         }
     }
@@ -858,20 +906,21 @@ fn build_events_and_nav(
         push_bool(&mut events, "can_search_now", row.search_ok);
         events.push(',');
         push_bool(&mut events, "in_touch_range", row.in_touch);
+        if let Some(f) = row.face {
+            events.push(',');
+            push_str(&mut events, "face", f);
+            // True when any facing works (including current).
+            events.push(',');
+            push_bool(&mut events, "in_search_range", true);
+        }
         if let Some(ds) = row.dest_scene {
             events.push(',');
             push_u64(&mut events, "dest_scene", ds as u64);
         }
-        if !row.keys.is_empty() {
+        // Single stable key (not a multi-key array — avoids left/right flip).
+        if let Some(k) = row.key {
             events.push(',');
-            events.push_str("\"keys\":[");
-            for (ki, k) in row.keys.iter().enumerate() {
-                if ki > 0 {
-                    events.push(',');
-                }
-                push_json_string(&mut events, k);
-            }
-            events.push(']');
+            push_str(&mut events, "key", k);
         }
         events.push('}');
     }
@@ -903,26 +952,45 @@ fn classify_event_role(
     } else if sprite_num == 0 {
         "trigger"
     } else {
-        "search"
+        // Visible inspectable — NPC / object / floor character.
+        "npc"
     }
 }
 
-/// Keys among currently-walkable directions that reduce isometric distance.
-fn keys_toward(player: (i32, i32), target: (i32, i32), walk: &[bool; 4]) -> Vec<&'static str> {
+fn dir_to_key(dir: u16) -> &'static str {
+    DIR_KEYS[(dir as usize) % 4]
+}
+
+fn key_to_walk_index(key: &str) -> Option<usize> {
+    WALK_DELTA.iter().position(|(_, n)| *n == key)
+}
+
+/// Single best walkable key that reduces isometric distance.
+/// Prefer continuing current facing when tied (reduces left/right shake).
+fn best_key_toward(
+    player: (i32, i32),
+    target: (i32, i32),
+    walk: &[bool; 4],
+    prefer_key: &str,
+) -> Option<&'static str> {
     let cur = metric(player, target);
-    let mut scored: Vec<(i32, usize, &'static str)> = Vec::new();
+    let mut best: Option<(i32, u8, usize, &'static str)> = None;
     for (i, &((dx, dy), name)) in WALK_DELTA.iter().enumerate() {
         if !walk[i] {
             continue;
         }
         let next = (player.0 + dx, player.1 + dy);
         let d = metric(next, target);
-        if d < cur {
-            scored.push((d, i, name));
+        if d >= cur {
+            continue;
+        }
+        let prefer = if name == prefer_key { 0u8 } else { 1u8 };
+        let score = (d, prefer, i, name);
+        if best.map(|b| (score.0, score.1, score.2) < (b.0, b.1, b.2)).unwrap_or(true) {
+            best = Some(score);
         }
     }
-    scored.sort_by_key(|&(d, i, _)| (d, i));
-    scored.into_iter().map(|(_, _, n)| n).collect()
+    best.map(|s| s.3)
 }
 
 fn append_nav(out: &mut String, nav: &NavInfo, path: &[&'static str]) {
@@ -938,19 +1006,26 @@ fn append_nav(out: &mut String, nav: &NavInfo, path: &[&'static str]) {
     push_i64(out, "dist", nav.dist as i64);
     out.push(',');
     push_bool(out, "can_act", nav.can_act);
+    if nav.in_search_range {
+        out.push(',');
+        push_bool(out, "in_search_range", true);
+    }
+    if let Some(f) = nav.face {
+        out.push(',');
+        push_str(out, "face", f);
+    }
     if let Some(ds) = nav.dest_scene {
         out.push(',');
         push_u64(out, "dest_scene", ds as u64);
     }
-    if !nav.keys.is_empty() {
+    // Single key (stable). Prefer path[0] already folded into nav.key.
+    if let Some(k) = nav.key {
+        out.push(',');
+        push_str(out, "key", k);
+        // Keep keys:[] as one-element for older agents.
         out.push(',');
         out.push_str("\"keys\":[");
-        for (i, k) in nav.keys.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            push_json_string(out, k);
-        }
+        push_json_string(out, k);
         out.push(']');
     }
     if !path.is_empty() {
@@ -967,7 +1042,7 @@ fn append_nav(out: &mut String, nav: &NavInfo, path: &[&'static str]) {
         out.push(']');
         out.push(',');
         push_bool(out, "reachable", true);
-    } else if !nav.can_act {
+    } else if !nav.can_act && !nav.in_search_range {
         out.push(',');
         push_bool(out, "reachable", false);
     }
@@ -978,34 +1053,94 @@ fn metric(a: (i32, i32), b: (i32, i32)) -> i32 {
     (a.0 - b.0).abs() + (a.1 - b.1).abs() * 2
 }
 
-/// Accurate search range (mirrors fullgame_autoplay / classic engine).
+/// Map position → (tile_x, tile_y, half) matching `play::search`.
+fn tile_of(pos: (i32, i32)) -> (i32, i32, i32) {
+    (
+        pos.0 / 32,
+        pos.1 / 16,
+        if pos.0 % 32 != 0 { 1 } else { 0 },
+    )
+}
+
+/// Search-cone offsets for a party facing (DIR_SOUTH/WEST/NORTH/EAST).
+fn dir_step_offsets(direction: u16) -> (i32, i32) {
+    // Matches `play::get_search_trigger_range`.
+    let x_offset = if direction == 2 || direction == 3 {
+        // NORTH or EAST
+        16
+    } else {
+        -16
+    };
+    let y_offset = if direction == 3 || direction == 0 {
+        // EAST or SOUTH
+        8
+    } else {
+        -8
+    };
+    (x_offset, y_offset)
+}
+
+fn search_range(position: (i32, i32), direction: u16) -> [(i32, i32); 13] {
+    let (x_offset, y_offset) = dir_step_offsets(direction);
+    let mut x = position.0;
+    let mut y = position.1;
+    let mut range = [(0i32, 0i32); 13];
+    range[0] = position;
+    for i in 0..4 {
+        range[i * 3 + 1] = (x + x_offset, y + y_offset);
+        range[i * 3 + 2] = (x, y + y_offset * 2);
+        range[i * 3 + 3] = (x + 2 * x_offset, y);
+        x += x_offset;
+        y += y_offset;
+    }
+    range
+}
+
+/// Engine-accurate search check (tile match + facing cone).
+/// Returns `(can_search_now, face_key_if_any_dir_works)`.
+fn search_status(
+    player: (i32, i32),
+    event: (i32, i32),
+    mode: u16,
+    party_dir: u16,
+) -> (bool, Option<&'static str>) {
+    if mode == 0 || mode >= 4 {
+        return (false, None);
+    }
+    let et = tile_of(event);
+    let mut face: Option<&'static str> = None;
+    let mut now = false;
+    // Prefer current facing first so `face` matches party when both work.
+    let order = [
+        party_dir % 4,
+        (party_dir + 1) % 4,
+        (party_dir + 2) % 4,
+        (party_dir + 3) % 4,
+    ];
+    for d in order {
+        let range = search_range(player, d);
+        for (i, p) in range.iter().enumerate() {
+            // `play::search`: skip when (mode * 6 - 4) <= i
+            if (mode as i32) * 6 - 4 <= i as i32 {
+                continue;
+            }
+            if tile_of(*p) == et {
+                if face.is_none() {
+                    face = Some(dir_to_key(d));
+                }
+                if d == party_dir % 4 {
+                    now = true;
+                }
+                break;
+            }
+        }
+    }
+    (now, face)
+}
+
+/// Any-facing search range (path goal).
 fn can_search_from(position: (i32, i32), event: (i32, i32), mode: u16) -> bool {
-    let limit = (mode as usize * 6).saturating_sub(4).min(13);
-    if limit == 0 {
-        return false;
-    }
-    for direction in 0..4 {
-        let (x_offset, y_offset) = match direction {
-            0 => (-16, 8),
-            1 => (-16, -8),
-            2 => (16, -8),
-            _ => (16, 8),
-        };
-        let (mut x, mut y) = position;
-        let mut range = [(0i32, 0i32); 13];
-        range[0] = position;
-        for index in 0..4 {
-            range[index * 3 + 1] = (x + x_offset, y + y_offset);
-            range[index * 3 + 2] = (x, y + y_offset * 2);
-            range[index * 3 + 3] = (x + x_offset * 2, y);
-            x += x_offset;
-            y += y_offset;
-        }
-        if range[..limit].contains(&event) {
-            return true;
-        }
-    }
-    false
+    search_status(position, event, mode, 0).1.is_some()
 }
 
 fn script_destination_scene(engine: &Engine, script: u16) -> Option<u16> {
@@ -1027,13 +1162,47 @@ fn script_destination_scene(engine: &Engine, script: u16) -> Option<u16> {
 }
 
 /// BFS short path; returns key names (up/right/down/left), truncated.
+/// Prefer expanding current facing first to reduce path flip-flop.
 fn path_to_event(
     engine: &Engine,
     start: (i32, i32),
     event: crate::global::EventObject,
+    party_dir: u16,
     bfs_limit: usize,
     max_steps: usize,
 ) -> Vec<&'static str> {
+    path_to_event_with(
+        engine,
+        start,
+        event,
+        party_dir,
+        bfs_limit,
+        max_steps,
+        true,
+    )
+    .or_else(|| {
+        path_to_event_with(
+            engine,
+            start,
+            event,
+            party_dir,
+            bfs_limit / 2,
+            max_steps,
+            false,
+        )
+    })
+    .unwrap_or_default()
+}
+
+fn path_to_event_with(
+    engine: &Engine,
+    start: (i32, i32),
+    event: crate::global::EventObject,
+    party_dir: u16,
+    bfs_limit: usize,
+    max_steps: usize,
+    check_event_objects: bool,
+) -> Option<Vec<&'static str>> {
     let goal = (event.x as i32, event.y as i32);
     let trigger_distance = if event.trigger_mode >= 4 {
         ((event.trigger_mode - 4) as i32 * 32 + 16).max(16)
@@ -1050,7 +1219,14 @@ fn path_to_event(
         }
     };
     if reached(start) {
-        return Vec::new();
+        return Some(Vec::new());
+    }
+
+    // Expand preferred facing first for stable paths.
+    let prefer = dir_to_key(party_dir);
+    let mut dir_order: [usize; 4] = [0, 1, 2, 3];
+    if let Some(pi) = key_to_walk_index(prefer) {
+        dir_order.swap(0, pi);
     }
 
     let mut queue = VecDeque::from([start]);
@@ -1066,7 +1242,8 @@ fn path_to_event(
         if seen.len() > bfs_limit {
             break;
         }
-        for (di, &((dx, dy), _)) in WALK_DELTA.iter().enumerate() {
+        for &di in &dir_order {
+            let ((dx, dy), _) = WALK_DELTA[di];
             let next = (position.0 + dx, position.1 + dy);
             if !(0..8192).contains(&next.0) || !(0..4096).contains(&next.1) {
                 continue;
@@ -1074,7 +1251,7 @@ fn path_to_event(
             if seen.contains(&next) {
                 continue;
             }
-            if engine.check_obstacle_with_range(next, true, 0, true) {
+            if engine.check_obstacle_with_range(next, check_event_objects, 0, true) {
                 continue;
             }
             seen.insert(next);
@@ -1083,92 +1260,16 @@ fn path_to_event(
         }
     }
 
-    let Some(mut at) = found else {
-        // Fallback: try ignoring event-object collision once.
-        return path_to_event_loose(engine, start, event, bfs_limit / 2, max_steps);
-    };
+    let mut at = found?;
     let mut rev: Vec<usize> = Vec::new();
     while at != start {
-        let Some(&(before, di)) = previous.get(&at) else {
-            break;
-        };
+        let &(before, di) = previous.get(&at)?;
         rev.push(di);
         at = before;
     }
     rev.reverse();
     rev.truncate(max_steps);
-    rev.into_iter()
-        .map(|di| WALK_DELTA[di].1)
-        .collect()
-}
-
-fn path_to_event_loose(
-    engine: &Engine,
-    start: (i32, i32),
-    event: crate::global::EventObject,
-    bfs_limit: usize,
-    max_steps: usize,
-) -> Vec<&'static str> {
-    let goal = (event.x as i32, event.y as i32);
-    let trigger_distance = if event.trigger_mode >= 4 {
-        ((event.trigger_mode - 4) as i32 * 32 + 16).max(16)
-    } else {
-        0
-    };
-    let reached = |position: (i32, i32)| {
-        if event.trigger_mode > 0 && event.trigger_mode < 4 {
-            can_search_from(position, goal, event.trigger_mode)
-        } else if event.trigger_mode >= 4 {
-            metric(position, goal) < trigger_distance
-        } else {
-            metric(position, goal) < 24
-        }
-    };
-    let mut queue = VecDeque::from([start]);
-    let mut previous: HashMap<(i32, i32), ((i32, i32), usize)> = HashMap::new();
-    let mut seen = HashSet::from([start]);
-    let mut found = None;
-    while let Some(position) = queue.pop_front() {
-        if reached(position) {
-            found = Some(position);
-            break;
-        }
-        if seen.len() > bfs_limit {
-            break;
-        }
-        for (di, &((dx, dy), _)) in WALK_DELTA.iter().enumerate() {
-            let next = (position.0 + dx, position.1 + dy);
-            if !(0..8192).contains(&next.0) || !(0..4096).contains(&next.1) {
-                continue;
-            }
-            if seen.contains(&next) {
-                continue;
-            }
-            // Ignore event objects as blockers.
-            if engine.check_obstacle_with_range(next, false, 0, true) {
-                continue;
-            }
-            seen.insert(next);
-            previous.insert(next, (position, di));
-            queue.push_back(next);
-        }
-    }
-    let Some(mut at) = found else {
-        return Vec::new();
-    };
-    let mut rev: Vec<usize> = Vec::new();
-    while at != start {
-        let Some(&(before, di)) = previous.get(&at) else {
-            break;
-        };
-        rev.push(di);
-        at = before;
-    }
-    rev.reverse();
-    rev.truncate(max_steps);
-    rev.into_iter()
-        .map(|di| WALK_DELTA[di].1)
-        .collect()
+    Some(rev.into_iter().map(|di| WALK_DELTA[di].1).collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -1507,6 +1608,18 @@ fn build_hint(
                 nav.event_id, nav.role
             );
         }
+        if nav.in_search_range {
+            if let Some(f) = nav.face {
+                return format!(
+                    "in range of #{} ({}) — face {} then confirm",
+                    nav.event_id, nav.role, f
+                );
+            }
+            return format!(
+                "in range of #{} ({}) — confirm/space",
+                nav.event_id, nav.role
+            );
+        }
         if !path.is_empty() {
             let preview: Vec<&str> = path.iter().copied().take(6).collect();
             return format!(
@@ -1517,13 +1630,10 @@ fn build_hint(
                 path[0]
             );
         }
-        if !nav.keys.is_empty() {
+        if let Some(k) = nav.key {
             return format!(
-                "approach #{} ({}) keys={} — press {}",
-                nav.event_id,
-                nav.role,
-                nav.keys.join("/"),
-                nav.keys[0]
+                "approach #{} ({}) — press {}",
+                nav.event_id, nav.role, k
             );
         }
         // Walkable dirs as fallback.
@@ -1580,13 +1690,15 @@ fn append_keys_hint(
         hints.push("confirm");
     } else if nav.can_act {
         hints.extend_from_slice(&["confirm", "space"]);
+    } else if nav.in_search_range {
+        if let Some(f) = nav.face {
+            hints.push(f);
+        }
+        hints.extend_from_slice(&["confirm", "space"]);
     } else if let Some(&k) = path.first() {
         hints.push(k);
-    } else if !nav.keys.is_empty() {
-        for k in &nav.keys {
-            hints.push(k);
-        }
-        hints.push("confirm");
+    } else if let Some(k) = nav.key {
+        hints.push(k);
     } else {
         hints.extend_from_slice(&["up", "down", "left", "right", "confirm", "space", "menu"]);
     }
