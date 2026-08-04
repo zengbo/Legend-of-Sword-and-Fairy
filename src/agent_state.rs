@@ -1,11 +1,13 @@
-//! Observation JSON for `GET /v1/state` (AI / HTTP driver).
+//! Observation JSON for AI / HTTP driver.
 //!
-//! **Facts only** — position, nearby events, dialogue, inventory, battle.
-//! No recommended path, ranked target, or "press this" strategy fields.
+//! - `GET /v1/state` — lightweight: position, walk, map (dirs/exits/obstacles/
+//!   mechanisms), nearby events, dialog/menu/battle.
+//! - `GET /v1/party` / `GET /v1/inventory` — on demand (not every poll).
+//!
+//! **Facts only** — no recommended path or "press this" strategy.
 //! Strategy is the AI client's job.
-//!
-//! Kept out of `game_loop.rs` so the observe surface can grow without
-//! cluttering the engine core.
+
+use std::sync::Mutex;
 
 use crate::battle::{BattleMenuState, BattlePhase, BattleUiState, FighterState};
 use crate::game_loop::Engine;
@@ -14,10 +16,14 @@ use crate::global::{
     ITEMFLAG_THROWABLE, ITEMFLAG_USABLE, MAGICFLAG_APPLY_TO_ALL, MAGICFLAG_USABLE_IN_BATTLE,
     MAGICFLAG_USABLE_OUTSIDE_BATTLE, MAGICFLAG_USABLE_TO_ENEMY, MAX_ENEMIES_IN_TEAM,
     MAX_INVENTORY, MAX_LEVELS, MAX_PLAYABLE_PLAYER_ROLES, MAX_PLAYER_EQUIPMENTS, MAX_PLAYER_MAGICS,
-    MAX_PLAYER_ROLES, MAX_PLAYERS_IN_PARTY, STATUS_ALL,
+    MAX_PLAYER_ROLES, MAX_PLAYERS_IN_PARTY, OBJSTATE_BLOCKER, STATUS_ALL,
 };
+use crate::map::{MAP_HEIGHT, MAP_WIDTH};
 use crate::ui::{agent_text_from_bytes, AgentMenuItem};
 use crate::ui_driver;
+
+/// Cached blocked-tile list for the current map_num (rebuilt on map change).
+static OBSTACLE_TILE_CACHE: Mutex<Option<(usize, String)>> = Mutex::new(None);
 
 /// Overworld step deltas matching `play` / key mapping:
 /// key order is NOT party_direction order — see `DIR_KEYS`.
@@ -158,7 +164,7 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
     out.push_str("\"scene_info\":");
     append_scene_info(&mut out, engine);
 
-    // Four-way walkability.
+    // Four-way walkability from current tile.
     out.push(',');
     out.push_str("\"walk\":{");
     for (i, &((_, _), name)) in WALK_DELTA.iter().enumerate() {
@@ -169,17 +175,12 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
     }
     out.push('}');
 
-    // Party (rich).
+    // Scene geometry: key→world steps, exits, mechanisms, obstacles.
     out.push(',');
-    out.push_str("\"party\":");
-    append_party(&mut out, engine);
+    out.push_str("\"map\":");
+    append_map(&mut out, engine, player);
 
-    // Inventory.
-    out.push(',');
-    out.push_str("\"inventory\":");
-    append_inventory(&mut out, engine);
-
-    // Nearby event objects — facts only (pos/search/scripts). No recommended path.
+    // Nearby event objects — facts only.
     out.push(',');
     out.push_str("\"events\":");
     out.push_str(&build_events_json(engine, player));
@@ -193,6 +194,10 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
         out.push_str("null");
     }
 
+    // Pointers to heavy on-demand resources.
+    out.push(',');
+    out.push_str("\"resources\":{\"party\":\"/v1/party\",\"inventory\":\"/v1/inventory\"}");
+
     // Legal input vocabulary (not a suggestion of what to press).
     out.push(',');
     out.push_str(
@@ -201,6 +206,36 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
          \"repeat\",\"page_up\",\"page_down\",\"home\",\"end\"]",
     );
 
+    out.push('}');
+    out.push('\n');
+    out
+}
+
+/// `GET /v1/party` body.
+pub(crate) fn build_party_json(engine: &Engine) -> String {
+    let mut out = String::with_capacity(4 << 10);
+    out.push('{');
+    push_str(&mut out, "status", "ok");
+    out.push(',');
+    push_u64(&mut out, "frame_id", ui_driver::latest_frame_id());
+    out.push(',');
+    out.push_str("\"party\":");
+    append_party(&mut out, engine);
+    out.push('}');
+    out.push('\n');
+    out
+}
+
+/// `GET /v1/inventory` body.
+pub(crate) fn build_inventory_json(engine: &Engine) -> String {
+    let mut out = String::with_capacity(2 << 10);
+    out.push('{');
+    push_str(&mut out, "status", "ok");
+    out.push(',');
+    push_u64(&mut out, "frame_id", ui_driver::latest_frame_id());
+    out.push(',');
+    out.push_str("\"inventory\":");
+    append_inventory(&mut out, engine);
     out.push('}');
     out.push('\n');
     out
@@ -416,6 +451,273 @@ fn append_scene_info(out: &mut String, engine: &Engine) {
     out.push(',');
     push_u64(out, "event_count", event_count as u64);
     out.push('}');
+}
+
+/// Current-scene geometry for pathfinding (facts only).
+///
+/// - `dirs`: what each move key does in world coords (isometric).
+/// - `exits`: doors/teleports **of this scene only** (not other rooms of a maze).
+/// - `mechanisms`: switches / inspectables that need walk-to + confirm (not pure decor).
+/// - `obstacles`: blocked map tiles + event objects that block walking.
+fn append_map(out: &mut String, engine: &Engine, player: (i32, i32)) {
+    let g = &engine.globals;
+    out.push('{');
+
+    // --- dirs: key → world step (same as walk / play) ---
+    out.push_str(
+        "\"dirs\":{\
+         \"up\":{\"dx\":16,\"dy\":-8,\"world\":\"(+16,-8)\"},\
+         \"right\":{\"dx\":16,\"dy\":8,\"world\":\"(+16,+8)\"},\
+         \"down\":{\"dx\":-16,\"dy\":8,\"world\":\"(-16,+8)\"},\
+         \"left\":{\"dx\":-16,\"dy\":-8,\"world\":\"(-16,-8)\"}\
+         }",
+    );
+    out.push(',');
+    push_str(
+        out,
+        "coord_note",
+        "player/events/exits use world [x,y]. One walk key moves by dirs[key]. \
+         Not screen pixels. dist metric = |dx|+2*|dy|.",
+    );
+
+    // --- current scene event range ---
+    let scene_i = g.num_scene as usize;
+    let (start, end) = if scene_i >= 1 && scene_i <= g.game.scenes.len() {
+        let s = g.game.scenes[scene_i - 1].event_object_index as usize;
+        let e = g
+            .game
+            .scenes
+            .get(scene_i)
+            .map(|sc| sc.event_object_index as usize)
+            .unwrap_or(g.game.event_objects.len());
+        (s, e.min(g.game.event_objects.len()))
+    } else {
+        (0, 0)
+    };
+    let party_dir = g.party_direction;
+
+    // --- exits (this scene only) ---
+    out.push(',');
+    out.push_str("\"exits\":[");
+    let mut first_exit = true;
+    for index in start..end {
+        let ev = g.game.event_objects[index];
+        if ev.state <= 0 || ev.vanish_time != 0 || ev.trigger_script == 0 {
+            continue;
+        }
+        let Some(dest) = script_destination_scene(engine, ev.trigger_script) else {
+            continue;
+        };
+        if !first_exit {
+            out.push(',');
+        }
+        first_exit = false;
+        let event_id = (index + 1) as u16;
+        let pos = (ev.x as i32, ev.y as i32);
+        let kind = if ev.trigger_mode >= 4 {
+            "touch"
+        } else if ev.trigger_mode == 0 {
+            "scenery"
+        } else {
+            "search"
+        };
+        out.push('{');
+        push_u64(out, "id", event_id as u64);
+        out.push(',');
+        push_str(out, "kind", kind);
+        out.push(',');
+        push_pair(out, "pos", pos.0, pos.1);
+        out.push(',');
+        push_pair(out, "delta", pos.0 - player.0, pos.1 - player.1);
+        out.push(',');
+        push_i64(out, "dist", metric(player, pos) as i64);
+        out.push(',');
+        push_u64(out, "dest_scene", dest as u64);
+        out.push(',');
+        push_u64(out, "trigger_mode", ev.trigger_mode as u64);
+        out.push(',');
+        push_str(out, "how", if kind == "touch" { "walk_into" } else { "face_and_confirm" });
+        out.push('}');
+    }
+    out.push(']');
+
+    // --- mechanisms: interactable non-exit (switches, chests, levers, NPCs to talk) ---
+    out.push(',');
+    out.push_str("\"mechanisms\":[");
+    let mut first_m = true;
+    for index in start..end {
+        let ev = g.game.event_objects[index];
+        if ev.state <= 0 || ev.vanish_time != 0 || ev.trigger_script == 0 {
+            continue;
+        }
+        if script_destination_scene(engine, ev.trigger_script).is_some() {
+            continue; // exits listed separately
+        }
+        // Skip pure scenery with no useful trigger mode.
+        if ev.trigger_mode == 0 {
+            continue;
+        }
+        let rank = analyze_script_progress(engine, ev.trigger_script);
+        let event_id = (index + 1) as u16;
+        let item_use = story_item_for_event(engine, event_id);
+        // Keep dialog NPCs as mechanisms too (talk = confirm); tag progress.
+        let pos = (ev.x as i32, ev.y as i32);
+        let kind = if ev.trigger_mode >= 4 {
+            "touch"
+        } else {
+            "search"
+        };
+        let (search_ok, face) = if ev.trigger_mode > 0 && ev.trigger_mode < 4 {
+            search_status(player, pos, ev.trigger_mode, party_dir)
+        } else {
+            (false, None)
+        };
+        let touch_radius = if ev.trigger_mode >= 4 {
+            ((ev.trigger_mode - 4) as i32 * 32 + 16).max(16)
+        } else {
+            0
+        };
+        let in_touch = touch_radius > 0 && metric(player, pos) < touch_radius;
+        if !first_m {
+            out.push(',');
+        }
+        first_m = false;
+        out.push('{');
+        push_u64(out, "id", event_id as u64);
+        out.push(',');
+        push_str(out, "kind", kind);
+        out.push(',');
+        let role = classify_event_role(ev.trigger_mode, ev.sprite_num, ev.trigger_script, None);
+        push_str(out, "role", role);
+        out.push(',');
+        push_pair(out, "pos", pos.0, pos.1);
+        out.push(',');
+        push_pair(out, "delta", pos.0 - player.0, pos.1 - player.1);
+        out.push(',');
+        push_i64(out, "dist", metric(player, pos) as i64);
+        out.push(',');
+        push_str(out, "progress", if item_use.is_some() { "item" } else { rank.label });
+        out.push(',');
+        push_str(
+            out,
+            "how",
+            if kind == "touch" {
+                "walk_into"
+            } else {
+                "face_and_confirm"
+            },
+        );
+        out.push(',');
+        push_bool(out, "can_search_now", search_ok);
+        out.push(',');
+        push_bool(out, "in_touch_range", in_touch);
+        if let Some(f) = face {
+            out.push(',');
+            push_str(out, "face", f);
+            out.push(',');
+            push_bool(out, "in_search_range", true);
+        }
+        if let Some(item) = item_use {
+            out.push(',');
+            push_u64(out, "item_use", item as u64);
+        }
+        if rank.rank >= 5 {
+            out.push(',');
+            push_bool(out, "loop", true);
+        }
+        out.push('}');
+    }
+    out.push(']');
+
+    // --- obstacles: map tiles + event blockers ---
+    out.push(',');
+    out.push_str("\"obstacles\":{");
+    // Tile blocks (cached per map_num).
+    out.push_str("\"tiles\":");
+    append_blocked_tiles(out, engine);
+    out.push(',');
+    // Event objects that act as solid blockers (NPCs standing in the way, etc.).
+    out.push_str("\"event_blockers\":[");
+    let mut first_b = true;
+    for index in start..end {
+        let ev = g.game.event_objects[index];
+        if ev.state < OBJSTATE_BLOCKER || ev.vanish_time != 0 {
+            continue;
+        }
+        if !first_b {
+            out.push(',');
+        }
+        first_b = false;
+        out.push('{');
+        push_u64(out, "id", (index + 1) as u64);
+        out.push(',');
+        push_pair(out, "pos", ev.x as i32, ev.y as i32);
+        out.push(',');
+        push_i64(out, "state", ev.state as i64);
+        out.push('}');
+    }
+    out.push(']');
+    out.push(',');
+    push_str(
+        out,
+        "tile_note",
+        "tiles are map [x,y,h] (x:0..63 y:0..127 h:0|1). \
+         world ≈ (x*32+h*16, y*16+h*8). Event blockers solid when state>=2.",
+    );
+    out.push('}');
+
+    out.push('}');
+}
+
+fn append_blocked_tiles(out: &mut String, engine: &Engine) {
+    let Some(map) = engine.res.map.as_ref() else {
+        out.push_str("[]");
+        return;
+    };
+    let map_num = map.num;
+    // Reuse cache when map unchanged.
+    if let Ok(guard) = OBSTACLE_TILE_CACHE.lock() {
+        if let Some((n, ref s)) = *guard {
+            if n == map_num {
+                out.push_str(s);
+                return;
+            }
+        }
+    }
+    let mut tiles = String::from("[");
+    let mut first = true;
+    let mut count = 0usize;
+    // Cap to keep JSON reasonable; full maps rarely need every blocked cell
+    // beyond ~8k. Prefer dense blocked listing over open cells.
+    const MAX_BLOCKED: usize = 12_000;
+    for y in 0..MAP_HEIGHT {
+        for x in 0..MAP_WIDTH {
+            for h in 0u8..2 {
+                if map.tile_is_blocked(x as u8, y as u8, h) {
+                    if count >= MAX_BLOCKED {
+                        break;
+                    }
+                    if !first {
+                        tiles.push(',');
+                    }
+                    first = false;
+                    tiles.push('[');
+                    tiles.push_str(&x.to_string());
+                    tiles.push(',');
+                    tiles.push_str(&y.to_string());
+                    tiles.push(',');
+                    tiles.push_str(&h.to_string());
+                    tiles.push(']');
+                    count += 1;
+                }
+            }
+        }
+    }
+    tiles.push(']');
+    if let Ok(mut guard) = OBSTACLE_TILE_CACHE.lock() {
+        *guard = Some((map_num, tiles.clone()));
+    }
+    out.push_str(&tiles);
 }
 
 fn append_party(out: &mut String, engine: &Engine) {
@@ -1540,16 +1842,49 @@ mod tests {
         e.globals.viewport = (608, 1024);
         e.globals.partyoffset = (160, 112);
         let json = build_state_json(&e);
-        // No recommended path / nav / press-hints for the agent to follow blindly.
         assert!(!json.contains("\"nav\""), "nav must not be published");
-        assert!(!json.contains("\"path\":"), "path must not be published");
-        assert!(!json.contains("\"keys_hint\""), "keys_hint must not be published");
-        assert!(!json.contains("\"hint\""), "hint must not be published");
-        // Still expose facts.
+        assert!(!json.contains("\"keys_hint\""));
+        assert!(!json.contains("\"hint\""));
+        // Party/inventory moved to separate endpoints.
+        assert!(!json.contains("\"party\":[") && !json.contains("\"party\": ["));
+        assert!(!json.contains("\"inventory\":[") && !json.contains("\"inventory\": ["));
+        assert!(json.contains("\"resources\""));
+        assert!(json.contains("/v1/party"));
+        assert!(json.contains("\"map\":"));
+        assert!(json.contains("\"dirs\""));
+        assert!(json.contains("\"exits\""));
+        assert!(json.contains("\"mechanisms\""));
+        assert!(json.contains("\"obstacles\""));
         assert!(json.contains("\"events\":"));
         assert!(json.contains("\"player\":"));
         assert!(json.contains("\"walk\":"));
-        assert!(json.contains("\"actions\":"));
+    }
+
+    #[test]
+    fn party_and_inventory_endpoints_json() {
+        let mut e = engine();
+        e.globals.in_main_game = true;
+        e.globals.add_item_to_inventory(92, 1);
+        let p = build_party_json(&e);
+        assert!(p.contains("\"party\":"));
+        assert!(p.contains("李逍遙") || p.contains("\"name\""));
+        let inv = build_inventory_json(&e);
+        assert!(inv.contains("\"inventory\":"));
+        assert!(inv.contains("\"item\":92") || inv.contains("水果"));
+    }
+
+    #[test]
+    fn map_dirs_match_walk_deltas() {
+        let mut e = engine();
+        e.globals.num_scene = 1;
+        e.globals.in_main_game = true;
+        e.globals.load_flags |= crate::global::LOAD_SCENE | crate::global::LOAD_PLAYER_SPRITE;
+        e.load_resources();
+        let json = build_state_json(&e);
+        assert!(json.contains("\"up\":{\"dx\":16,\"dy\":-8"));
+        assert!(json.contains("\"right\":{\"dx\":16,\"dy\":8"));
+        assert!(json.contains("\"down\":{\"dx\":-16,\"dy\":8"));
+        assert!(json.contains("\"left\":{\"dx\":-16,\"dy\":-8"));
     }
 
     #[test]

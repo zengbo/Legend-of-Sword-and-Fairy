@@ -67,12 +67,12 @@ Prefer this every turn. Use the PNG only when the state is not enough.
 | `player` | Party world position `[x, y]` |
 | `viewport` | Camera world position `[x, y]` |
 | `party_direction` | Facing 0–3 |
-| `walk` | Can take one step: `{up,right,down,left}` |
-| `events` | Nearby objects (facts: pos, search, scripts — not ranked goals) |
-| `party` | Party (names, HP/MP, exp, gear, magic) |
-| `inventory` | Items |
+| `walk` | Can take one step from here: `{up,right,down,left}` |
+| **`map`** | **This scene**: `dirs`, `exits`, `mechanisms`, `obstacles` (see below) |
+| `events` | Nearby objects (distance-capped facts) |
 | `battle` | Battle details, or `null` |
-| `actions` | **All legal key names** (input vocabulary, not suggestions) |
+| `resources` | `{party,inventory}` on-demand paths |
+| `actions` | Legal key names (vocabulary, not suggestions) |
 | `cash` | Money |
 | `playtime_secs` | Cumulative real-world play seconds for this save lineage (includes open session) |
 | `quit_requested` | Stop when true |
@@ -126,9 +126,19 @@ Only move in directions that are `true`.
 | `down` | `(-16, +8)` |
 | `left` | `(-16, -8)` |
 
-Keys are **isometric world steps**, not screen pixels. Plan routes from `player`, `events[].pos` / `delta`, and `walk`.
+Keys are **isometric world steps**, not screen pixels.
 
-Top-level `facing` is the current facing key name (`down`/`left`/`up`/`right`).
+#### Map `map` (this scene only — geometry facts)
+
+| Field | Meaning |
+| --- | --- |
+| **`dirs`** | Key → world `{dx,dy}`: `up=(+16,-8)`, `right=(+16,+8)`, `down=(-16,+8)`, `left=(-16,-8)` |
+| **`exits`** | Doors/teleports **in the current scene only** (`dest_scene`, `pos`, `how`) |
+| **`mechanisms`** | Switches / chests / NPCs / inspectables (`how`: `walk_into` or `face_and_confirm`) |
+| **`obstacles.tiles`** | Blocked map tiles `[x,y,h]` (world ≈ `x*32+h*16`, `y*16+h*8`) |
+| **`obstacles.event_blockers`** | Solid NPCs/objects (`state>=2`) |
+
+Mazes: only **this room’s** exits are listed, not the whole maze graph. No recommended path is published.
 
 #### Events `events[]` (nearby objects — facts, not a ranked to-do list)
 
@@ -152,17 +162,6 @@ Sorted by distance (cap ~48). There is **no** engine-chosen “you should go her
 
 Search matches the engine (facing cone + tiles). How to approach and when to act is **your** call.
 
-#### Party `party[]`
-
-| Field | Meaning |
-| --- | --- |
-| `name` / `level` / `hp` / `max_hp` / `mp` / `max_mp` | Basics |
-| `exp` / `next_exp` | Current / next-level experience |
-| `equipment[]` | Gear |
-| `magics[]` | `id`, `name`, `mp` cost, `tgt` (`enemy`/`ally`), optional `all`, `ok:false` (can't afford), `battle:false` / `field:false` |
-| `status[]` | `name`: `conf`/`para`/`sleep`/`silence`/`puppet`/`brave`/`prot`/`haste`/`dual`; `t` rounds left |
-| `screen_pos` | Screen coords (**not** world; use top-level `player` for walking) |
-
 #### Battle `battle` (`null` when not fighting)
 
 | Field | Meaning |
@@ -176,19 +175,23 @@ Search matches the engine (facing cone + tiles). How to approach and when to act
 On `select_target_enemy*` / `select_target_player*`, use `target` / `selected`, left/right, then `confirm`.  
 A `menu` may also open (magic/items). Use `actions` for legal key names.
 
-#### Inventory `inventory[]`
+### 2.3 `GET /v1/party` — party (on demand)
 
-Includes `item`, `name`, `amount`; capability tags in `tags` (e.g. `use`, `eq`, `throw`).
+Not included in `/v1/state`. Fields: name, HP/MP, exp, equipment, magics, status, `screen_pos` (screen only).
+
+### 2.4 `GET /v1/inventory` — inventory (on demand)
+
+`item`, `name`, `amount`, `tags` (`use`/`eq`/`throw`/…).
 
 ---
 
-### 2.3 `GET /v1/frame.png` — screen image
+### 2.5 `GET /v1/frame.png` — screen image
 
 - 320×200 pixels  
 - May return 503 if no frame yet: wait or step first  
 - **Prefer state; fetch the image only when needed**
 
-### 2.4 `POST /v1/input/{key}/{action}` — keys
+### 2.6 `POST /v1/input/{key}/{action}` — keys
 
 | action | Meaning |
 | --- | --- |
@@ -219,7 +222,7 @@ Aliases: `enter`/`search`→confirm; `esc`→menu; `f`→force; `a`→auto; `d`�
 **Walking:** `press` a direction → hold (time or several steps) → `release`.  
 **In step mode: send input first, then step**, so the press is seen this beat.
 
-### 2.5 `POST /v1/step` — advance time (step mode only)
+### 2.7 `POST /v1/step` — advance time (step mode only)
 
 When `step_mode` is `true`, the clock does not run by itself.
 
@@ -246,7 +249,7 @@ The engine does **not** publish “press this next”. UI facts only:
 3. **`menu` is not null** → use `items`/`index`; arrows, `confirm`, `menu`.  
 4. **`phase` is `battle`** → use `battle` + menus; keys in `actions`.  
 5. **`scene_transition` / boot** → few inputs or skip intros.  
-6. **`overworld`** → plan from `player`, `walk`, `events[]`, `inventory`, and your own story goals.
+6. **`overworld`** → plan from `player`, `map.dirs` / `exits` / `mechanisms` / `obstacles`, `walk`, `events[]`; fetch `/v1/party` and `/v1/inventory` only when needed.
 
 Legal key names: `actions`. Isometric move keys: see `walk` table above.
 
@@ -285,6 +288,8 @@ Do not rely on /v1/step
 ```http
 GET /v1/status
 GET /v1/state
+GET /v1/party
+GET /v1/inventory
 GET /v1/frame.png
 
 POST /v1/input/confirm/tap
@@ -298,6 +303,8 @@ POST /v1/step?ms=500
 
 ```bash
 curl -s http://127.0.0.1:8765/v1/state
+curl -s http://127.0.0.1:8765/v1/party
+curl -s http://127.0.0.1:8765/v1/inventory
 curl -s -X POST http://127.0.0.1:8765/v1/input/confirm/tap
 curl -s -X POST 'http://127.0.0.1:8765/v1/step?frames=1'
 ```

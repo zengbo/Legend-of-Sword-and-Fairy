@@ -956,24 +956,19 @@ impl Engine {
         (self.start.elapsed().as_millis() as u64).saturating_mul(self.tick_scale)
     }
 
-    /// Publish a structured snapshot for `GET /v1/state` (no-op without driver).
+    /// Publish structured snapshots for UI-driver GET endpoints (no-op without driver).
     pub fn publish_ui_driver_state(&self) {
         #[cfg(all(
             not(target_arch = "wasm32"),
             any(feature = "gui", feature = "console")
         ))]
         {
-            crate::ui_driver::publish_state_json(self.ui_driver_state_json());
+            crate::ui_driver::publish_state_json(crate::agent_state::build_state_json(self));
+            crate::ui_driver::publish_party_inventory_json(
+                crate::agent_state::build_party_json(self),
+                crate::agent_state::build_inventory_json(self),
+            );
         }
-    }
-
-    /// JSON body for the UI driver state endpoint (rich AI snapshot).
-    #[cfg(all(
-        not(target_arch = "wasm32"),
-        any(feature = "gui", feature = "console")
-    ))]
-    fn ui_driver_state_json(&self) -> String {
-        crate::agent_state::build_state_json(self)
     }
 
     /// PAL_ProcessEvent: pump window events and update the input state.

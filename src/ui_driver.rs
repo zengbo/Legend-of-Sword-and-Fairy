@@ -35,6 +35,10 @@ struct SharedControl {
     latest_frame: RwLock<LatestFrame>,
     /// Latest JSON body for `GET /v1/state` (without trailing framing).
     state_json: RwLock<String>,
+    /// On-demand: party roster (not every state poll).
+    party_json: RwLock<String>,
+    /// On-demand: inventory (not every state poll).
+    inventory_json: RwLock<String>,
     step_enabled: AtomicBool,
     /// Virtual millisecond clock used when step mode is on (`Engine::ticks`).
     virtual_ms: AtomicU64,
@@ -48,6 +52,8 @@ impl SharedControl {
             state_json: RwLock::new(
                 "{\"status\":\"starting\",\"frame_id\":0,\"step_mode\":false}\n".into(),
             ),
+            party_json: RwLock::new("{\"status\":\"starting\",\"party\":[]}\n".into()),
+            inventory_json: RwLock::new("{\"status\":\"starting\",\"inventory\":[]}\n".into()),
             step_enabled: AtomicBool::new(step_enabled),
             virtual_ms: AtomicU64::new(0),
             step_pair: (Mutex::new(()), Condvar::new()),
@@ -144,6 +150,18 @@ pub(crate) fn publish_state_json(json: String) {
     if let Some(c) = control() {
         if let Ok(mut slot) = c.state_json.write() {
             *slot = json;
+        }
+    }
+}
+
+/// Publish on-demand party / inventory snapshots (updated each engine tick).
+pub(crate) fn publish_party_inventory_json(party: String, inventory: String) {
+    if let Some(c) = control() {
+        if let Ok(mut slot) = c.party_json.write() {
+            *slot = party;
+        }
+        if let Ok(mut slot) = c.inventory_json.write() {
+            *slot = inventory;
         }
     }
 }
@@ -358,6 +376,22 @@ fn handle_connection(
                 .state_json
                 .read()
                 .map_err(|_| io::Error::other("state lock poisoned"))?
+                .clone();
+            write_response(stream, 200, "OK", "application/json", json.as_bytes())
+        }
+        ("GET", "/v1/party") => {
+            let json = control
+                .party_json
+                .read()
+                .map_err(|_| io::Error::other("party lock poisoned"))?
+                .clone();
+            write_response(stream, 200, "OK", "application/json", json.as_bytes())
+        }
+        ("GET", "/v1/inventory") => {
+            let json = control
+                .inventory_json
+                .read()
+                .map_err(|_| io::Error::other("inventory lock poisoned"))?
                 .clone();
             write_response(stream, 200, "OK", "application/json", json.as_bytes())
         }
@@ -589,7 +623,9 @@ const API_HELP: &str = "\
 rustpal UI driver
 
 GET  /v1/status
-GET  /v1/state
+GET  /v1/state                lightweight observe (no party/inventory)
+GET  /v1/party                party roster (on demand)
+GET  /v1/inventory            inventory (on demand)
 GET  /v1/frame.png
 POST /v1/step                 advance virtual clock (step mode only)
 POST /v1/step?frames=N
@@ -667,7 +703,12 @@ mod tests {
     #[test]
     fn state_endpoint_returns_published_json() {
         let driver = UiDriver::start("127.0.0.1:0").expect("start UI driver");
-        publish_state_json("{\"hello\":1,\"frame_id\":3}\n".into());
+        // Write this driver's slot directly (global CONTROL may race with parallel tests).
+        *driver
+            .control_for_test()
+            .state_json
+            .write()
+            .expect("state lock") = "{\"hello\":1,\"frame_id\":3}\n".into();
         let response = request(
             driver.local_addr(),
             "GET /v1/state HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -676,6 +717,28 @@ mod tests {
         let body = String::from_utf8_lossy(&response);
         assert!(body.contains("\"hello\":1"));
         assert!(body.contains("\"frame_id\":3"));
+    }
+
+    #[test]
+    fn party_and_inventory_endpoints_return_published_json() {
+        let driver = UiDriver::start("127.0.0.1:0").expect("start UI driver");
+        *driver.control_for_test().party_json.write().expect("lock") =
+            "{\"status\":\"ok\",\"party\":[{\"name\":\"X\"}]}\n".into();
+        *driver
+            .control_for_test()
+            .inventory_json
+            .write()
+            .expect("lock") = "{\"status\":\"ok\",\"inventory\":[]}\n".into();
+        let party = request(
+            driver.local_addr(),
+            "GET /v1/party HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        let inv = request(
+            driver.local_addr(),
+            "GET /v1/inventory HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(String::from_utf8_lossy(&party).contains("\"name\":\"X\""));
+        assert!(String::from_utf8_lossy(&inv).contains("\"inventory\":[]"));
     }
 
     #[test]
