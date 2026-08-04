@@ -34,6 +34,11 @@ pub mod ui;
     any(feature = "gui", feature = "console")
 ))]
 pub mod ui_driver;
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "gui", feature = "console")
+))]
+pub(crate) mod agent_state;
 pub mod uibattle;
 pub mod uigame;
 #[cfg(all(not(target_arch = "wasm32"), feature = "console"))]

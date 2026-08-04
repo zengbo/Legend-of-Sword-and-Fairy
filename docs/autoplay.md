@@ -50,27 +50,19 @@ Supported key names are `up`, `down`, `left`, `right`, `menu`, `confirm`,
 
 ### `GET /v1/state` fields
 
-JSON object (fields may grow; treat unknown keys as optional):
+Rich JSON for agents (fields may grow; ignore unknowns). Full field guide:
+[`docs/ai-control.md`](ai-control.md). Highlights:
 
 | Field | Meaning |
 | --- | --- |
-| `frame_id` | Same counter as `/v1/status` (increments on present). |
-| `step_mode` | Whether the engine clock is virtual. |
-| `ticks` | Engine time (ms); virtual when step mode is on. |
-| `frame_num` | Overworld animation / logic frame counter. |
-| `scene` | Current scene number. |
-| `viewport` | `[x, y]` map viewport. |
-| `party_offset` | Party draw offset. |
-| `player` | Party feet position `viewport + party_offset`. |
-| `party_direction` | Facing (0–3). |
-| `in_main_game` | Past the opening menu. |
-| `entering_scene` | Scene transition in progress. |
-| `in_battle` | Battle active. |
-| `in_dialog` | Dialog box open. |
-| `dialog_line` | Current dialog line counter. |
-| `quit_requested` | Engine shutting down / ending. |
-| `cash` | Money. |
-| `party` | Array of `{slot, role, hp, max_hp, mp, max_mp, level}`. |
+| `phase` | `boot` / `dialog` / `battle` / `overworld` / `scene_transition` |
+| `walk` | `{up,right,down,left}` next-step free (collision) |
+| `events` | Nearby scene event objects (pos, dist, scripts, search/touch) |
+| `inventory` | Items with UTF-8 names and usable/equipable flags |
+| `party` | Stats, equipment, magics (names decoded Big5→UTF-8) |
+| `battle` | `null` or enemies/UI menu state |
+| `keys_hint` / `actions` | Suggested keys / vocabulary |
+| `frame_id`, `scene`, `player`, `in_*`, `cash`, … | Core scalars (as before) |
 
 ### Step mode (`--ui-step` / `RUSTPAL_UI_STEP=1`)
 

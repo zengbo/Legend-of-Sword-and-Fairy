@@ -32,6 +32,8 @@ pollster = { version = "0.4", optional = true }
 base64 = { version = "0.22", optional = true }
 miniz_oxide = { version = "0.8", optional = true }
 libc = { version = "0.2", optional = true }
+# Big5 → UTF-8 for AI-facing /v1/state name fields (pure Rust).
+encoding_rs = "0.8"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

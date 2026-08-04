@@ -77,47 +77,79 @@ RUSTPAL_UI_STEP_STRICT=1 ./target/release/rustpal --console --ui-driver --ui-ste
 
 ### 3.2 `GET /v1/state`
 
-结构化状态（字段可能增加，**忽略未知字段**）。
+**丰富结构化状态**（字段会增加，**忽略未知字段**）。名称类字符串已从游戏 Big5 转成 UTF-8。
 
-```json
-{
-  "status": "ok",
-  "frame_id": 12,
-  "step_mode": true,
-  "step_configured": true,
-  "ticks": 1200,
-  "frame_num": 42,
-  "scene": 1,
-  "viewport": [2200, 1280],
-  "party_offset": [160, 112],
-  "player": [2360, 1392],
-  "party_direction": 0,
-  "in_main_game": true,
-  "entering_scene": false,
-  "in_battle": false,
-  "in_dialog": true,
-  "dialog_line": 2,
-  "quit_requested": false,
-  "cash": 0,
-  "max_party_member_index": 0,
-  "party": [
-    {"slot": 0, "role": 0, "hp": 100, "max_hp": 100, "mp": 20, "max_mp": 20, "level": 1}
-  ]
-}
-```
+#### 顶层常用字段
 
 | 字段 | 含义与用法 |
 | --- | --- |
-| `in_dialog` | `true` → 优先 `confirm` 推进对话 |
-| `in_battle` | `true` → 用战斗键（如 `force` / `auto`），勿乱走地图 |
-| `in_main_game` | `false` → 可能在片头/菜单；多 `confirm` 或大量 `step` 跳过开场 |
-| `entering_scene` | 切场景中，少操作，多 step/等待 |
-| `player` / `viewport` | 地图坐标，用于是否在移动、相对目标 |
-| `scene` | 场景编号，换场景说明进度变化 |
-| `party[].hp` | 战斗/生存判断 |
+| `phase` | `boot` / `dialog` / `battle` / `scene_transition` / `overworld` |
+| `in_dialog` | `true` → 优先 `confirm` |
+| `in_battle` | `true` → 用战斗键；见 `battle` 对象 |
+| `in_main_game` | `false` → 片头/菜单；多 `confirm` 或大量 `step` |
+| `entering_scene` | 切场景中 |
+| `player` / `viewport` | 地图坐标 `[x,y]`（等距格子像素） |
+| `walk` | `{up,right,down,left: bool}` **下一步是否可走**（引擎碰撞） |
+| `scene` / `scene_info` | 场景号与 map/传送脚本/事件数量 |
+| `party[]` | 队员：姓名、HP/MP、攻防、装备、法术列表 |
+| `inventory[]` | 物品：id、中文名、数量、usable/equipable/throwable 等 |
+| `events[]` | 当前场景附近/活跃事件（最多 48）：坐标、距离、脚本、是否可调查/触碰 |
+| `battle` | 非战斗为 `null`；否则含敌人/UI 菜单状态 |
+| `keys_hint` | 当前阶段建议键（仅提示） |
+| `actions` | 合法键名列表 |
 | `quit_requested` | 结束循环 |
 
-状态在 `process_event` / `video_update` 时刷新；若刚启动可能短暂为 `"starting"` 类占位。
+#### `events[]` 条目（过场/找 NPC 用）
+
+| 字段 | 含义 |
+| --- | --- |
+| `id` | 事件对象 id（脚本用） |
+| `kind` | `search` / `touch` / `scenery` |
+| `pos` / `delta` / `dist` | 绝对坐标、相对玩家、曼哈顿距离（y×2） |
+| `trigger_mode` / `trigger_script` / `auto_script` | 触发方式与脚本入口 |
+| `can_search_now` | 是否已在调查范围内 |
+| `in_touch_range` | 是否已在触碰半径内 |
+
+#### `walk` 用法
+
+```json
+"walk": {"up": true, "right": false, "down": true, "left": true}
+```
+
+只对 `true` 的方向 `press`/`tap`，避免怼墙。
+
+#### `battle` 对象（战斗中）
+
+| 字段 | 含义 |
+| --- | --- |
+| `phase` | `select_action` / `perform_action` |
+| `ui_state` | `wait` / `select_move` / `select_target_enemy` … |
+| `menu_state` | `main` / `magic_select` / `use_item_select` … |
+| `enemies[]` | `name`, `hp`, `level`, `state`, `time_meter` |
+| `players[]` | 战斗槽状态、`defending` |
+| `force` / `flee` / `auto_attack` | 战斗标志 |
+
+#### 精简示例
+
+```json
+{
+  "phase": "overworld",
+  "scene": 1,
+  "player": [2360, 1392],
+  "walk": {"up": true, "right": true, "down": false, "left": true},
+  "in_dialog": false,
+  "in_battle": false,
+  "party": [{"slot": 0, "name": "李逍遙", "hp": 100, "max_hp": 100, "magics": []}],
+  "inventory": [{"item": 12, "name": "黃連", "amount": 3, "usable": true}],
+  "events": [
+    {"id": 5, "kind": "search", "dist": 32, "can_search_now": true, "trigger_script": 1200}
+  ],
+  "battle": null,
+  "keys_hint": ["up", "down", "left", "right", "confirm", "space", "menu"]
+}
+```
+
+状态在 `process_event` / `video_update` 时刷新；启动瞬间可能仍是占位 JSON。
 
 ### 3.3 `GET /v1/frame.png`
 
@@ -234,13 +266,14 @@ loop:
 
 ### 4.3 策略启发式（省 token）
 
-1. **`in_dialog`** → `confirm` tap（可连点 1–3 次 + step）  
-2. **`in_battle`** → 优先 `force` 或 `auto`；观察 `party[].hp`  
-3. **`entering_scene`** → 少操作，只 step / 短等  
-4. **自由走动** → 方向 press/release；调查用 `confirm` 或 `space`  
-5. **卡住不动**（`player`/`frame_num` 长期不变）→ 换方向、或 `confirm`、或 `menu` 再取消  
+1. **`phase` / `in_dialog`** → `confirm`  
+2. **`in_battle`** → 读 `battle.ui_state` / `enemies[]`；`force`/`auto`/`confirm`  
+3. **找人/出口** → 在 `events[]` 里按 `dist` 选目标；`can_search_now` 则 `confirm`/`space`；否则朝 `delta` 在 `walk` 允许的方向移动  
+4. **走路** → 仅 `walk.* == true` 的方向；长按用 `press` + 多帧 `step` + `release`  
+5. **道具** → `inventory[]` 里 `usable`/`name`；战斗外菜单路径仍需你自己按键导航  
+6. **卡住** → `player`/`frame_num` 不变则换方向，或交互最近 `events`  
 
-不要每帧把整张 PNG base64 打进超长上下文；优先 `/v1/state`，画面按需。
+不要每帧把整张 PNG 塞进上下文；**优先完整 `/v1/state`**，画面按需。
 
 ---
 
@@ -353,12 +386,12 @@ while True:
 
 ```
 你在控制 rustpal（仙剑 DOS 引擎）。基址 http://127.0.0.1:8765。
-观察：GET /v1/state（优先）、GET /v1/frame.png（320x200）、GET /v1/status。
+观察：GET /v1/state（优先，含 walk/events/inventory/party/battle）、GET /v1/frame.png、GET /v1/status。
 动作：POST /v1/input/{key}/tap|press|release；
 键：up down left right confirm space menu force auto defend use_item throw_item flee status。
-若 status.step_mode 为 true：每次决策后必须 POST /v1/step?frames=1（可先 frames=200 跳过片头）。
-对话 in_dialog=true 时按 confirm；战斗 in_battle=true 时用 force/auto；quit_requested 时停止。
-先 input 再 step。忽略 JSON 未知字段。不要假设有鼠标。
+step_mode=true 时每次决策后 POST /v1/step?frames=1（开场可 frames=200）。
+策略：in_dialog→confirm；in_battle→读 battle 对象再用 force/auto；overworld→用 walk 与 events[].delta/dist 寻路与交互；只用 walk 为 true 的方向。
+先 input 再 step。忽略未知 JSON 字段。无鼠标。
 ```
 
 ---
