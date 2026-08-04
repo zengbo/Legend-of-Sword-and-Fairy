@@ -83,21 +83,62 @@ RUSTPAL_UI_STEP_STRICT=1 ./target/release/rustpal --console --ui-driver --ui-ste
 
 | 字段 | 含义与用法 |
 | --- | --- |
-| `phase` | `boot` / `dialog` / `battle` / `scene_transition` / `overworld` |
-| `in_dialog` | `true` → 优先 `confirm` |
+| `phase` | `boot` / `dialog` / `menu` / `battle` / `scene_transition` / `overworld` |
+| `in_dialog` | `true` → 优先 `confirm`；见 **`dialog`** |
+| `in_menu` | `true` → 有可选项列表；见 **`menu`** |
 | `in_battle` | `true` → 用战斗键；见 `battle` 对象 |
-| `in_main_game` | `false` → 片头/菜单；多 `confirm` 或大量 `step` |
+| `in_main_game` | `false` → 片头/开场菜单 |
 | `entering_scene` | 切场景中 |
-| `player` / `viewport` | 地图坐标 `[x,y]`（等距格子像素） |
-| `walk` | `{up,right,down,left: bool}` **下一步是否可走**（引擎碰撞） |
+| `player` / `viewport` | 地图坐标 `[x,y]` |
+| `walk` | `{up,right,down,left}` 下一步是否可走 |
+| `dialog` | 见下；无对话时为 `null` |
+| `menu` | 见下；无菜单时为 `null` |
 | `scene` / `scene_info` | 场景号与 map/传送脚本/事件数量 |
-| `party[]` | 队员：姓名、HP/MP、攻防、装备、法术列表 |
-| `inventory[]` | 物品：id、中文名、数量、usable/equipable/throwable 等 |
-| `events[]` | 当前场景附近/活跃事件（最多 48）：坐标、距离、脚本、是否可调查/触碰 |
-| `battle` | 非战斗为 `null`；否则含敌人/UI 菜单状态 |
-| `keys_hint` | 当前阶段建议键（仅提示） |
-| `actions` | 合法键名列表 |
+| `party[]` | 队员：姓名、HP/MP、攻防、装备、法术 |
+| `inventory[]` | 物品列表 |
+| `events[]` | 附近事件对象 |
+| `battle` | 战斗详情或 `null` |
+| `keys_hint` / `actions` | 建议键 / 合法键 |
 | `quit_requested` | 结束循环 |
+
+#### `dialog`（对话正文）
+
+```json
+{
+  "speaker": "李大娘",
+  "lines": ["李逍遙！你皮癢啊？", "敢說老娘是什麼鬼婆！"],
+  "text": "李大娘：李逍遙！你皮癢啊？\n敢說老娘是什麼鬼婆！"
+}
+```
+
+- `speaker`：角色名行（标题「某某：」）  
+- `lines`：当前页对白正文行  
+- `text`：拼好的可读全文（方便直接塞进 LLM）  
+- 翻页后 `lines` 会清空再积累；对话结束为 `null`
+
+#### `menu`（菜单选项）
+
+```json
+{
+  "kind": "menu",
+  "index": 1,
+  "selected_value": 1,
+  "selected_label": "讀取進度",
+  "items": [
+    {"index": 0, "value": 0, "label": "新的故事", "enabled": true, "selected": false},
+    {"index": 1, "value": 1, "label": "讀取進度", "enabled": true, "selected": true}
+  ]
+}
+```
+
+| `kind` | 来源 |
+| --- | --- |
+| `menu` | 通用 `read_menu`（开场/系统/战斗杂项等） |
+| `item` | 道具选择 |
+| `magic` | 法术选择 |
+| `battle_main` / `battle_misc` / `battle_item_sub` | 战斗指令（合成） |
+
+操作：方向键改 `index`，`confirm` 确认当前项，`menu` 取消。
 
 #### `events[]` 条目（过场/找 NPC 用）
 
@@ -266,14 +307,14 @@ loop:
 
 ### 4.3 策略启发式（省 token）
 
-1. **`phase` / `in_dialog`** → `confirm`  
-2. **`in_battle`** → 读 `battle.ui_state` / `enemies[]`；`force`/`auto`/`confirm`  
-3. **找人/出口** → 在 `events[]` 里按 `dist` 选目标；`can_search_now` 则 `confirm`/`space`；否则朝 `delta` 在 `walk` 允许的方向移动  
-4. **走路** → 仅 `walk.* == true` 的方向；长按用 `press` + 多帧 `step` + `release`  
-5. **道具** → `inventory[]` 里 `usable`/`name`；战斗外菜单路径仍需你自己按键导航  
-6. **卡住** → `player`/`frame_num` 不变则换方向，或交互最近 `events`  
+1. **`dialog` 非 null** → 读 `dialog.text`，`confirm` 推进  
+2. **`menu` 非 null** → 用 `items[]`/`selected_label` 决策；上下左右移动，`confirm` 选中，`menu` 取消  
+3. **`in_battle`** → 读 `battle` + 可能的 `menu`；`force`/`auto`/`confirm`  
+4. **找人/出口** → `events[]` 的 `dist` / `can_search_now` / `delta` + `walk`  
+5. **走路** → 仅 `walk.* == true`  
+6. **道具/法术** → `menu.kind` 为 `item`/`magic` 时从列表选 `value`  
 
-不要每帧把整张 PNG 塞进上下文；**优先完整 `/v1/state`**，画面按需。
+不要每帧塞整张 PNG；**优先 `/v1/state` 的 dialog/menu**。
 
 ---
 
@@ -386,12 +427,13 @@ while True:
 
 ```
 你在控制 rustpal（仙剑 DOS 引擎）。基址 http://127.0.0.1:8765。
-观察：GET /v1/state（优先，含 walk/events/inventory/party/battle）、GET /v1/frame.png、GET /v1/status。
+观察：GET /v1/state（含 dialog 正文、menu 选项、walk/events/inventory/party/battle）。
 动作：POST /v1/input/{key}/tap|press|release；
 键：up down left right confirm space menu force auto defend use_item throw_item flee status。
-step_mode=true 时每次决策后 POST /v1/step?frames=1（开场可 frames=200）。
-策略：in_dialog→confirm；in_battle→读 battle 对象再用 force/auto；overworld→用 walk 与 events[].delta/dist 寻路与交互；只用 walk 为 true 的方向。
-先 input 再 step。忽略未知 JSON 字段。无鼠标。
+step_mode=true 时决策后 POST /v1/step?frames=1。
+策略：dialog 非 null→读 text 后 confirm；menu 非 null→按 items 选择（方向+confirm，取消用 menu）；
+battle→读 battle+menu；overworld→walk+events。只用 walk 为 true 的方向。
+先 input 再 step。忽略未知字段。无鼠标。
 ```
 
 ---

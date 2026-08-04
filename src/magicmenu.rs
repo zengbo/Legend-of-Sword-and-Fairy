@@ -8,8 +8,9 @@ use crate::global::{
     MAGICFLAG_USABLE_IN_BATTLE, MAGICFLAG_USABLE_OUTSIDE_BATTLE, MAX_PLAYER_MAGICS,
 };
 use crate::ui::{
-    NumAlign, NumColor, MENUITEM_COLOR, MENUITEM_COLOR_CONFIRMED, MENUITEM_COLOR_INACTIVE,
-    MENUITEM_COLOR_SELECTED_INACTIVE, SPRITENUM_CURSOR, SPRITENUM_SLASH,
+    agent_text_from_bytes, AgentMenuItem, NumAlign, NumColor, MENUITEM_COLOR,
+    MENUITEM_COLOR_CONFIRMED, MENUITEM_COLOR_INACTIVE, MENUITEM_COLOR_SELECTED_INACTIVE,
+    SPRITENUM_CURSOR, SPRITENUM_SLASH,
 };
 
 /// Word number of the CASH label (ui.h CASH_LABEL).
@@ -123,6 +124,7 @@ impl Engine {
         } else if self.input.pressed(KEY_END) {
             num_magic - ctx.current as i32 - 1
         } else if self.input.pressed(KEY_MENU) {
+            self.agent_clear_menu();
             return 0;
         } else {
             0
@@ -136,6 +138,24 @@ impl Engine {
         } else {
             (cur + item_delta) as usize
         };
+
+        // AI observe.
+        {
+            let items: Vec<AgentMenuItem> = ctx
+                .items
+                .iter()
+                .map(|it| AgentMenuItem {
+                    value: it.magic,
+                    label: format!(
+                        "{} (MP {})",
+                        agent_text_from_bytes(&self.texts.word(it.magic as usize)),
+                        it.mp
+                    ),
+                    enabled: it.enabled,
+                })
+                .collect();
+            self.agent_set_menu("magic", ctx.current, items);
+        }
 
         // The magic list box.
         self.create_box_with_shadow((10, 42 + box_y_offset), lines_per_page - 1, 16, 1, false, 0);
@@ -233,7 +253,9 @@ impl Engine {
             let word = self.texts.word(ctx.items[ctx.current].magic as usize);
             self.draw_text(&word, (jx, ky), MENUITEM_COLOR_CONFIRMED, false, true);
             self.draw_ui_sprite(SPRITENUM_CURSOR, jx + cursor_x_offset, ky + 10);
-            return ctx.items[ctx.current].magic;
+            let magic = ctx.items[ctx.current].magic;
+            self.agent_clear_menu();
+            return magic;
         }
 
         0xFFFF

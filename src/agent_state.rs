@@ -11,6 +11,7 @@ use crate::global::{
     MAX_PLAYABLE_PLAYER_ROLES, MAX_PLAYER_EQUIPMENTS, MAX_PLAYER_MAGICS, MAX_PLAYER_ROLES,
     MAX_PLAYERS_IN_PARTY,
 };
+use crate::ui::{agent_text_from_bytes, AgentMenuItem};
 use crate::ui_driver;
 
 /// Overworld step deltas matching `play` / `fullgame_autoplay` key mapping:
@@ -36,15 +37,21 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
         g.viewport.0 + g.partyoffset.0,
         g.viewport.1 + g.partyoffset.1,
     );
-    let in_dialog = engine.ui.in_dialog || engine.ui.current_dialog_line > 0;
+    let in_dialog = engine.ui.in_dialog
+        || engine.ui.current_dialog_line > 0
+        || !engine.ui.agent_dialog_lines.is_empty()
+        || !engine.ui.agent_dialog_speaker.is_empty();
     let in_battle = g.in_battle || engine.battle.is_some();
+    let in_menu = engine.ui.agent_menu.is_some();
 
-    let phase = if !g.in_main_game {
+    let phase = if !g.in_main_game && !in_menu {
         "boot"
     } else if in_battle {
         "battle"
     } else if in_dialog {
         "dialog"
+    } else if in_menu {
+        "menu"
     } else if g.entering_scene {
         "scene_transition"
     } else {
@@ -89,9 +96,19 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
     out.push(',');
     push_bool(&mut out, "in_dialog", in_dialog);
     out.push(',');
+    push_bool(&mut out, "in_menu", in_menu);
+    out.push(',');
     push_i64(&mut out, "dialog_line", engine.ui.current_dialog_line as i64);
     out.push(',');
     push_u64(&mut out, "dialog_position", engine.ui.dialog_position as u64);
+    out.push(',');
+    // Live dialog text (UTF-8).
+    out.push_str("\"dialog\":");
+    append_dialog(&mut out, engine);
+    out.push(',');
+    // Live menu (null when none).
+    out.push_str("\"menu\":");
+    append_menu(&mut out, engine);
     out.push(',');
     push_bool(&mut out, "quit_requested", engine.quit_requested);
     out.push(',');
@@ -168,7 +185,7 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
     // Suggested keys for the current phase (hints only).
     out.push(',');
     out.push_str("\"keys_hint\":");
-    append_keys_hint(&mut out, phase, in_dialog, in_battle);
+    append_keys_hint(&mut out, phase, in_dialog, in_battle, in_menu);
 
     // Compact action vocabulary reminder.
     out.push(',');
@@ -181,6 +198,204 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
     out.push('}');
     out.push('\n');
     out
+}
+
+fn append_dialog(out: &mut String, engine: &Engine) {
+    let speaker = &engine.ui.agent_dialog_speaker;
+    let lines = &engine.ui.agent_dialog_lines;
+    if speaker.is_empty() && lines.is_empty() {
+        out.push_str("null");
+        return;
+    }
+    out.push('{');
+    push_str(out, "speaker", speaker);
+    out.push(',');
+    out.push_str("\"lines\":[");
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_json_string(out, line);
+    }
+    out.push_str("],");
+    // Convenience: speaker + body joined for LLM prompts.
+    let mut full = String::new();
+    if !speaker.is_empty() {
+        full.push_str(speaker);
+        full.push_str("：");
+    }
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            full.push('\n');
+        }
+        full.push_str(line);
+    }
+    push_str(out, "text", &full);
+    out.push('}');
+}
+
+fn append_menu(out: &mut String, engine: &Engine) {
+    // Prefer live agent_menu; fall back to synthesizing battle main/misc menu.
+    if let Some(menu) = engine.ui.agent_menu.as_ref() {
+        write_menu_obj(out, &menu.kind, menu.index, &menu.items);
+        return;
+    }
+    if let Some(battle) = engine.battle.as_ref() {
+        if battle.ui.state == BattleUiState::SelectMove {
+            let (kind, index, items) = battle_menu_snapshot(engine, battle);
+            write_menu_obj(out, kind, index, &items);
+            return;
+        }
+    }
+    out.push_str("null");
+}
+
+fn write_menu_obj(out: &mut String, kind: &str, index: usize, items: &[AgentMenuItem]) {
+    out.push('{');
+    push_str(out, "kind", kind);
+    out.push(',');
+    push_u64(out, "index", index as u64);
+    out.push(',');
+    if let Some(sel) = items.get(index) {
+        push_u64(out, "selected_value", sel.value as u64);
+        out.push(',');
+        push_str(out, "selected_label", &sel.label);
+        out.push(',');
+    }
+    out.push_str("\"items\":[");
+    for (i, it) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('{');
+        push_u64(out, "index", i as u64);
+        out.push(',');
+        push_u64(out, "value", it.value as u64);
+        out.push(',');
+        push_str(out, "label", &it.label);
+        out.push(',');
+        push_bool(out, "enabled", it.enabled);
+        out.push(',');
+        push_bool(out, "selected", i == index);
+        out.push('}');
+    }
+    out.push(']');
+    out.push('}');
+}
+
+/// Classic battle command menu (synthesized; live item/magic lists use agent_menu).
+fn battle_menu_snapshot(
+    engine: &Engine,
+    battle: &crate::battle::Battle,
+) -> (&'static str, usize, Vec<AgentMenuItem>) {
+    // WORD.DAT indices from uibattle.rs (BATTLEUI_LABEL_*).
+    const LABEL_USEITEM: u16 = 23;
+    const LABEL_THROWITEM: u16 = 24;
+    const LABEL_AUTO: u16 = 56;
+    const LABEL_INVENTORY: u16 = 57;
+    const LABEL_DEFEND: u16 = 58;
+    const LABEL_FLEE: u16 = 59;
+    const LABEL_STATUS: u16 = 60;
+    const LABEL_MAGIC: u16 = 14; // common; empty → fallback "法術"
+
+    let word = |id: u16| agent_text_from_bytes(&engine.texts.word(id as usize));
+    let lab = |id: u16, fb: &str| {
+        let s = word(id);
+        if s.is_empty() {
+            fb.to_string()
+        } else {
+            s
+        }
+    };
+
+    match battle.ui.menu_state {
+        BattleMenuState::Main => {
+            let items = vec![
+                AgentMenuItem {
+                    value: 0,
+                    label: "攻擊".into(),
+                    enabled: true,
+                },
+                AgentMenuItem {
+                    value: 1,
+                    label: lab(LABEL_MAGIC, "法術"),
+                    enabled: true,
+                },
+                AgentMenuItem {
+                    value: 2,
+                    label: "協力".into(),
+                    enabled: true,
+                },
+                AgentMenuItem {
+                    value: 3,
+                    label: "其它".into(),
+                    enabled: true,
+                },
+            ];
+            (
+                "battle_main",
+                (battle.ui.selected_action as usize) % 4,
+                items,
+            )
+        }
+        BattleMenuState::Misc => {
+            let items = vec![
+                AgentMenuItem {
+                    value: 0,
+                    label: lab(LABEL_AUTO, "自動"),
+                    enabled: true,
+                },
+                AgentMenuItem {
+                    value: 1,
+                    label: lab(LABEL_INVENTORY, "道具"),
+                    enabled: true,
+                },
+                AgentMenuItem {
+                    value: 2,
+                    label: lab(LABEL_DEFEND, "防禦"),
+                    enabled: true,
+                },
+                AgentMenuItem {
+                    value: 3,
+                    label: lab(LABEL_FLEE, "逃跑"),
+                    enabled: true,
+                },
+                AgentMenuItem {
+                    value: 4,
+                    label: lab(LABEL_STATUS, "狀態"),
+                    enabled: true,
+                },
+            ];
+            (
+                "battle_misc",
+                battle.ui.selected_index.clamp(0, 4) as usize,
+                items,
+            )
+        }
+        BattleMenuState::MiscItemSubMenu => {
+            let items = vec![
+                AgentMenuItem {
+                    value: 0,
+                    label: lab(LABEL_USEITEM, "使用"),
+                    enabled: true,
+                },
+                AgentMenuItem {
+                    value: 1,
+                    label: lab(LABEL_THROWITEM, "投擲"),
+                    enabled: true,
+                },
+            ];
+            (
+                "battle_item_sub",
+                battle.ui.selected_index.clamp(0, 1) as usize,
+                items,
+            )
+        }
+        // Item/magic selection publishes agent_menu from their update loops.
+        BattleMenuState::MagicSelect
+        | BattleMenuState::UseItemSelect
+        | BattleMenuState::ThrowItemSelect => ("battle", 0, Vec::new()),
+    }
 }
 
 fn append_scene_info(out: &mut String, engine: &Engine) {
@@ -551,12 +766,20 @@ fn append_battle(out: &mut String, engine: &Engine, battle: &crate::battle::Batt
     out.push('}');
 }
 
-fn append_keys_hint(out: &mut String, phase: &str, in_dialog: bool, in_battle: bool) {
+fn append_keys_hint(
+    out: &mut String,
+    phase: &str,
+    in_dialog: bool,
+    in_battle: bool,
+    in_menu: bool,
+) {
     out.push('[');
     let hints: &[&str] = if in_dialog || phase == "dialog" {
         &["confirm"]
+    } else if in_menu || phase == "menu" {
+        &["up", "down", "left", "right", "confirm", "menu"]
     } else if in_battle || phase == "battle" {
-        &["force", "auto", "defend", "confirm", "menu"]
+        &["up", "down", "confirm", "menu", "force", "auto", "defend"]
     } else if phase == "boot" {
         &["confirm"]
     } else {
@@ -627,18 +850,11 @@ fn word_utf8(engine: &Engine, n: usize) -> String {
     if n == 0 {
         return String::new();
     }
-    bytes_to_display(&engine.texts.word(n))
+    agent_text_from_bytes(&engine.texts.word(n))
 }
 
 fn bytes_to_display(bytes: &[u8]) -> String {
-    if bytes.is_empty() {
-        return String::new();
-    }
-    // Strip dialog control-ish ASCII for names; keep printable.
-    let (cow, _, _) = encoding_rs::BIG5.decode(bytes);
-    cow.chars()
-        .filter(|c| !c.is_control() || *c == '\n')
-        .collect()
+    agent_text_from_bytes(bytes)
 }
 
 // --- minimal JSON helpers (no serde) ---

@@ -6,9 +6,9 @@
 use crate::game_loop::{Engine, FRAME_TIME};
 use crate::global::{ITEMFLAG_USABLE, MAX_INVENTORY, MAX_PLAYER_EQUIPMENTS};
 use crate::ui::{
-    MenuItemChanged, NumAlign, NumColor, MENUITEM_COLOR, MENUITEM_COLOR_CONFIRMED,
-    MENUITEM_COLOR_EQUIPPEDITEM, MENUITEM_COLOR_INACTIVE, MENUITEM_COLOR_SELECTED_INACTIVE,
-    SPRITENUM_CURSOR, SPRITENUM_ITEMBOX,
+    agent_text_from_bytes, AgentMenuItem, MenuItemChanged, NumAlign, NumColor, MENUITEM_COLOR,
+    MENUITEM_COLOR_CONFIRMED, MENUITEM_COLOR_EQUIPPEDITEM, MENUITEM_COLOR_INACTIVE,
+    MENUITEM_COLOR_SELECTED_INACTIVE, SPRITENUM_CURSOR, SPRITENUM_ITEMBOX,
 };
 
 /// Bytes per WORD.DAT record for the Chinese DOS data (gConfig.dwWordLength).
@@ -93,6 +93,7 @@ impl Engine {
         } else if self.input.pressed(KEY_END) {
             ctx.num_inventory - cur - 1
         } else if self.input.pressed(KEY_MENU) {
+            self.agent_clear_menu();
             return 0;
         } else {
             0
@@ -106,6 +107,33 @@ impl Engine {
             cur + item_delta
         };
         let cur = self.globals.cur_inv_menu_item;
+
+        // AI observe: full inventory list for this filter.
+        {
+            let mut items = Vec::new();
+            for i in 0..ctx.num_inventory as usize {
+                if i >= MAX_INVENTORY {
+                    break;
+                }
+                let inv = self.globals.inventory[i];
+                if inv.item == 0 {
+                    break;
+                }
+                let flags = self.globals.game.objects[inv.item as usize].item_flags();
+                let selectable =
+                    flags & ctx.item_flags != 0 && (inv.amount as i16) > (inv.amount_in_use as i16);
+                items.push(AgentMenuItem {
+                    value: inv.item,
+                    label: format!(
+                        "{} x{}",
+                        agent_text_from_bytes(&self.texts.word(inv.item as usize)),
+                        inv.amount
+                    ),
+                    enabled: selectable,
+                });
+            }
+            self.agent_set_menu("item", cur as usize, items);
+        }
 
         // Redraw the box.
         self.create_box_with_shadow((2, 0), lines_per_page - 1, 17, 1, false, 0);
@@ -220,6 +248,7 @@ impl Engine {
                     );
                     self.draw_ui_sprite(SPRITENUM_CURSOR, cursor_pos.0, cursor_pos.1);
                 }
+                self.agent_clear_menu();
                 return object;
             }
         }

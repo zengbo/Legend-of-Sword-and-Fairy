@@ -102,6 +102,23 @@ struct BoxRecord {
     saved: Vec<u8>,
 }
 
+/// One row of an interactive menu for AI observation (`GET /v1/state`).
+#[derive(Clone, Debug)]
+pub struct AgentMenuItem {
+    pub value: u16,
+    pub label: String,
+    pub enabled: bool,
+}
+
+/// Live menu snapshot for AI observation.
+#[derive(Clone, Debug)]
+pub struct AgentMenu {
+    /// `menu` (read_menu), `item`, `magic`, or `battle`.
+    pub kind: String,
+    pub index: usize,
+    pub items: Vec<AgentMenuItem>,
+}
+
 /// Module-private UI/dialog state (text.c `g_TextLib` and ui.c statics).
 pub struct UiState {
     /// The UI sprite loaded from DATA.MKF #9 (ui.c gpSpriteUI).
@@ -146,6 +163,14 @@ pub struct UiState {
     /// code can be exercised without a window or real input. Set only by
     /// tests; always false in the running game.
     pub auto_confirm: bool,
+
+    // ---- AI observe surface (HTTP /v1/state) ----
+    /// Speaker name line (UTF-8), when the dialog title is a "Name：" line.
+    pub agent_dialog_speaker: String,
+    /// Body lines currently on this dialog page (UTF-8).
+    pub agent_dialog_lines: Vec<String>,
+    /// Active menu, if any (`read_menu` / item / magic selection).
+    pub agent_menu: Option<AgentMenu>,
 }
 
 impl Default for UiState {
@@ -168,7 +193,32 @@ impl Default for UiState {
             updated_in_battle: false,
             in_dialog: false,
             auto_confirm: false,
+            agent_dialog_speaker: String::new(),
+            agent_dialog_lines: Vec::new(),
+            agent_menu: None,
         }
+    }
+}
+
+/// Decode game Big5 (or ASCII) bytes to a display string for AI state.
+pub(crate) fn agent_text_from_bytes(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let (cow, _, _) = encoding_rs::BIG5.decode(bytes);
+        return cow
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n')
+            .collect();
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        String::from_utf8_lossy(bytes)
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n')
+            .collect()
     }
 }
 
@@ -628,6 +678,7 @@ impl Engine {
         } else {
             0
         };
+        self.agent_set_menu_from_items("menu", items, current);
 
         // Draw all menu texts.
         for (i, it) in items.iter().enumerate() {
@@ -659,8 +710,10 @@ impl Engine {
                     false,
                     true,
                 );
+                self.agent_clear_menu();
                 return Some(items[current].value);
             }
+            self.agent_clear_menu();
             return None;
         }
 
@@ -669,6 +722,9 @@ impl Engine {
         let mut deadline = self.ticks();
         loop {
             self.input.clear_key_state();
+            if let Some(menu) = self.ui.agent_menu.as_mut() {
+                menu.index = current;
+            }
 
             // Redraw the selected item shimmering.
             if items[current].enabled {
@@ -681,6 +737,7 @@ impl Engine {
             self.delay_until(deadline);
             deadline = self.ticks() + 50;
             if self.quit_requested {
+                self.agent_clear_menu();
                 return None;
             }
 
@@ -697,6 +754,9 @@ impl Engine {
                 self.draw_text(&word, items[current].pos, color, false, false);
 
                 current = (current + 1) % n;
+                if let Some(menu) = self.ui.agent_menu.as_mut() {
+                    menu.index = current;
+                }
 
                 let color = if items[current].enabled {
                     self.menuitem_color_selected()
@@ -720,6 +780,9 @@ impl Engine {
                 self.draw_text(&word, items[current].pos, color, false, false);
 
                 current = if current > 0 { current - 1 } else { n - 1 };
+                if let Some(menu) = self.ui.agent_menu.as_mut() {
+                    menu.index = current;
+                }
 
                 let color = if items[current].enabled {
                     self.menuitem_color_selected()
@@ -751,10 +814,13 @@ impl Engine {
                     false,
                     false,
                 );
-                return Some(items[current].value);
+                let value = items[current].value;
+                self.agent_clear_menu();
+                return Some(value);
             }
         }
 
+        self.agent_clear_menu();
         None
     }
 
@@ -815,6 +881,9 @@ impl Engine {
         self.ui.current_dialog_line = 0;
         self.ui.pos_dialog_title = (12, 8);
         self.ui.user_skip = false;
+        self.ui.in_dialog = true;
+        self.ui.agent_dialog_speaker.clear();
+        self.ui.agent_dialog_lines.clear();
 
         if font_color != 0 {
             self.ui.current_font_color = font_color;
@@ -1064,6 +1133,7 @@ impl Engine {
     pub fn show_dialog_text(&mut self, text: &[u8]) {
         self.input.clear_key_state();
         self.ui.icon = 0;
+        self.ui.in_dialog = true;
 
         if self.globals.in_battle && !self.ui.updated_in_battle {
             self.video_update();
@@ -1074,12 +1144,14 @@ impl Engine {
             // Rest of the dialog goes on the next page.
             self.dialog_wait_for_key();
             self.ui.current_dialog_line = 0;
+            self.ui.agent_dialog_lines.clear();
             self.restore_screen();
             self.video_update();
         }
 
         let x = self.ui.pos_dialog_text.0;
         let y = self.ui.pos_dialog_text.1 + self.ui.current_dialog_line * 18;
+        let line_utf8 = agent_text_from_bytes(text);
 
         if self.ui.dialog_position == DIALOG_CENTER_WINDOW {
             // Small window at the center of the screen.
@@ -1091,6 +1163,11 @@ impl Engine {
             let shadow = self.ui.dialog_shadow;
             let lp_box = self.create_single_line_box_with_shadow(pos, (len + 1) / 2, false, shadow);
             self.video_update();
+
+            self.ui.agent_dialog_lines.clear();
+            if !line_utf8.is_empty() {
+                self.ui.agent_dialog_lines.push(line_utf8);
+            }
 
             self.display_text(text, pos.0 + 8 + ((len & 1) << 2), pos.1 + 10, true);
             self.video_update();
@@ -1115,10 +1192,20 @@ impl Engine {
                 && ends_with_colon
             {
                 let pos = self.ui.pos_dialog_title;
+                // Strip trailing ： or : for a cleaner speaker field.
+                let mut speaker = line_utf8.clone();
+                if speaker.ends_with('：') || speaker.ends_with(':') {
+                    speaker.pop();
+                }
+                self.ui.agent_dialog_speaker = speaker;
                 self.draw_text(text, pos, FONT_COLOR_CYAN_ALT, true, true);
             } else {
                 if !self.ui.playing_rng && self.ui.current_dialog_line == 0 {
                     self.backup_screen();
+                }
+
+                if !line_utf8.is_empty() {
+                    self.ui.agent_dialog_lines.push(line_utf8);
                 }
 
                 let nx = self.display_text(text, x, y, false);
@@ -1213,6 +1300,9 @@ impl Engine {
         }
 
         self.ui.current_dialog_line = 0;
+        self.ui.agent_dialog_speaker.clear();
+        self.ui.agent_dialog_lines.clear();
+        self.ui.in_dialog = false;
 
         if self.ui.dialog_position == DIALOG_CENTER {
             self.ui.pos_dialog_title = (12, 8);
@@ -1231,6 +1321,53 @@ impl Engine {
         self.ui.dialog_position = DIALOG_UPPER;
         self.ui.user_skip = false;
         self.ui.playing_rng = false;
+        self.ui.in_dialog = false;
+        self.ui.agent_dialog_speaker.clear();
+        self.ui.agent_dialog_lines.clear();
+    }
+
+    /// Publish a word-based menu into `agent_menu` for `/v1/state`.
+    pub(crate) fn agent_set_menu_from_items(
+        &mut self,
+        kind: &str,
+        items: &[MenuItem],
+        index: usize,
+    ) {
+        let items: Vec<AgentMenuItem> = items
+            .iter()
+            .map(|it| AgentMenuItem {
+                value: it.value,
+                label: agent_text_from_bytes(&self.texts.word(it.num_word as usize)),
+                enabled: it.enabled,
+            })
+            .collect();
+        self.ui.agent_menu = Some(AgentMenu {
+            kind: kind.to_string(),
+            index: index.min(items.len().saturating_sub(1)),
+            items,
+        });
+    }
+
+    pub(crate) fn agent_clear_menu(&mut self) {
+        self.ui.agent_menu = None;
+    }
+
+    pub(crate) fn agent_set_menu(
+        &mut self,
+        kind: &str,
+        index: usize,
+        items: Vec<AgentMenuItem>,
+    ) {
+        let index = if items.is_empty() {
+            0
+        } else {
+            index.min(items.len() - 1)
+        };
+        self.ui.agent_menu = Some(AgentMenu {
+            kind: kind.to_string(),
+            index,
+            items,
+        });
     }
 }
 
