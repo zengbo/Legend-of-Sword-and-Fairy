@@ -64,8 +64,10 @@
 | `viewport` | 镜头位置 `[x, y]` |
 | `party_direction` | 朝向 0–3 |
 | `walk` | 四向是否可走一步：`{up,right,down,left}` |
-| `events` | 附近可交互对象列表 |
-| `party` | 队员（姓名、HP/MP、装备、法术等） |
+| `events` | 附近可交互对象列表（含 `role`、`keys`） |
+| `nav` | 推荐导航目标与路径；无目标时为 `null` |
+| `hint` | 一句自然语言提示（优先阅读） |
+| `party` | 队员（姓名、HP/MP、经验、装备、法术等） |
 | `inventory` | 物品栏 |
 | `battle` | 战斗详情；非战斗为 `null` |
 | `keys_hint` | 当前更建议使用的键 |
@@ -114,31 +116,97 @@
 
 只对值为 `true` 的方向移动，避免撞墙。
 
+**注意：键名是等距坐标系**，不是屏幕上下左右：
+
+| 键 | 世界步进 |
+| --- | --- |
+| `up` | `(+16, -8)` |
+| `right` | `(+16, +8)` |
+| `down` | `(-16, +8)` |
+| `left` | `(-16, -8)` |
+
+不要根据 `delta` 的正负直接猜屏幕方向；用下面的 `nav` / `events[].keys` / `hint`。
+
+#### 导航 `nav`（大地图优先看）
+
+```json
+"nav": {
+  "event": 54,
+  "role": "exit",
+  "dist": 256,
+  "can_act": false,
+  "keys": ["up"],
+  "steps": 5,
+  "path": ["up", "up", "right", "up", "right"],
+  "reachable": true,
+  "dest_scene": 5
+}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `event` | 推荐接近/交互的事件 id |
+| `role` | 粗分类：`npc` / `exit` / `search` / `trigger` / `decor` |
+| `can_act` | 已可调查或已在触碰范围 |
+| `keys` | 当前一步应优先按的方向（已过滤不可走） |
+| `path` | 短路径（最多约 16 步）；有则按 `path[0]` 走 |
+| `reachable` | BFS 是否找到路径；`false` 时换目标或绕路 |
+| `dest_scene` | 若脚本会切场景，目标场景号 |
+
+- `can_act == true` → 立刻 `confirm` / `space`  
+- 否则优先 `path[0]`，没有 path 再用 `keys[0]`  
+- 无目标时 `nav` 为 `null`
+
+#### 自然语言 `hint`
+
+每拍一句，例如：
+
+- `"dialog — confirm (李大娘：李逍遙！…)"`
+- `"go to #54 (exit) path=up>up>right… — press up"`
+- `"at event #68 (search) — confirm/space to interact"`
+- `"select enemy target index=1 (蛇妖) — left/right, confirm"`
+
+**可先读 `hint`，再读细节字段。**
+
 #### 事件 `events[]`（找人、出口、调查）
 
 | 字段 | 含义 |
 | --- | --- |
 | `id` | 对象编号 |
-| `kind` | `search`（调查）/ `touch`（靠近触发）/ `scenery` |
-| `pos` | 世界坐标 |
-| `delta` | 相对你的位置 |
-| `dist` | 距离（越小越近） |
+| `kind` | `search` / `touch` / `scenery` |
+| `role` | 粗分类（同上） |
+| `pos` / `delta` / `dist` | 位置与距离 |
 | `can_search_now` | 是否已可调查 |
 | `in_touch_range` | 是否已在触碰范围内 |
+| `keys` | 走近该事件的推荐方向（过滤撞墙） |
+| `dest_scene` | 可选；脚本切场景目标 |
+| `trigger_script` 等 | 脚本/精灵编号（高级） |
 
-靠近目标：朝 `delta` 所指方向、且 `walk` 允许的方向移动。  
-`can_search_now` 为 true 时用 `confirm` 或 `space` 调查。
+`can_search_now` 或 `in_touch_range` 为 true 时用 `confirm` / `space`。
+
+#### 队伍 `party[]`
+
+| 字段 | 含义 |
+| --- | --- |
+| `name` / `level` / `hp` / `max_hp` / `mp` / `max_mp` | 基本属性 |
+| `exp` / `next_exp` | 当前经验 / 升级所需经验 |
+| `equipment[]` | 装备 |
+| `magics[]` | 法术：`id`、`name`、`mp`（消耗）、`tgt`（`enemy`/`ally`）、可选 `all`、`ok:false`（MP 不够）、`battle:false` / `field:false` |
+| `status[]` | 异常：`name` 为 `conf`/`para`/`sleep`/`silence`/`puppet`/`brave`/`prot`/`haste`/`dual`，`t` 为剩余回合 |
+| `screen_pos` | 屏幕坐标（**不是**世界坐标；走路用顶层 `player`） |
 
 #### 战斗 `battle`（非战斗为 `null`）
 
 | 字段 | 含义 |
 | --- | --- |
 | `phase` / `ui_state` / `menu_state` | 战斗流程与菜单阶段 |
-| `enemies[]` | 敌人：`name`、`hp`、`level` 等 |
-| `players[]` | 我方战斗状态 |
+| `target` | 选目标时出现：`{side,index,all}` |
+| `enemies[]` | `name`、`hp`、`max_hp`、`level`、可选 `selected`、`status` |
+| `players[]` | `name`、`hp`/`mp`、`defending`、可选 `selected`/`acting`、`status` |
 | `force` / `flee` / `auto_attack` | 相关标志 |
 
-战斗中也可出现 `menu`（法术、道具列表）。结合 `keys_hint` 与 `actions` 操作。
+选目标：`ui_state` 为 `select_target_enemy*` / `select_target_player*` 时，看 `target` 与 `selected`，用左右切换，`confirm` 确认。  
+战斗中也可出现 `menu`（法术、道具）。结合 `keys_hint` 与 `actions`。
 
 #### 物品 `inventory[]`
 
@@ -212,8 +280,10 @@
 5. **`entering_scene` 或 `phase` 为 `scene_transition`** → 少操作，步进或短暂等待。  
 6. **`phase` 为 `boot` 或 `in_main_game` 为 false** → 多用 `confirm` 过片头/主菜单；步进模式下配合大量 `step`。  
 7. **大地图 `overworld`**  
-   - 需要交互：在 `events` 中选近的目标；`can_search_now` 则 `confirm`/`space`；否则沿 `delta` 在 `walk` 允许方向移动  
-   - 探索：只在 `walk` 为 true 的方向移动  
+   - 先读 `hint` / `nav`  
+   - `nav.can_act` → `confirm`/`space`  
+   - 否则按 `nav.path[0]` 或 `nav.keys[0]` 移动（再 `step`）  
+   - 无 `nav`：只在 `walk` 为 true 的方向探索  
 
 `keys_hint` 可作辅助，**以 `actions` 为合法键范围**。
 
@@ -287,6 +357,7 @@ curl -s -X POST 'http://127.0.0.1:8765/v1/step?frames=1'
 ## 7. 省流量与 token
 
 - **主读 `GET /v1/state`**，不要每拍都拉 PNG。  
+- 先读 `hint` + `phase` + `nav`/`dialog`/`menu`/`battle`，细节字段按需看。  
 - `dialog` 已是完整一句/一段，直接用，不要自行拆字段。  
 - 菜单用 `items[index]`，不要假设额外字段。  
 - 未知字段忽略即可。

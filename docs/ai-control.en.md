@@ -64,8 +64,10 @@ Prefer this every turn. Use the PNG only when the state is not enough.
 | `viewport` | Camera world position `[x, y]` |
 | `party_direction` | Facing 0–3 |
 | `walk` | Can take one step: `{up,right,down,left}` |
-| `events` | Nearby interactive objects |
-| `party` | Party members (names, HP/MP, gear, magic) |
+| `events` | Nearby events (`role`, `keys`, …) |
+| `nav` | Recommended navigation target + path; `null` if none |
+| `hint` | One-line natural-language advice (read first) |
+| `party` | Party (names, HP/MP, exp, gear, magic) |
 | `inventory` | Items |
 | `battle` | Battle details, or `null` |
 | `keys_hint` | Suggested keys for the current phase |
@@ -114,30 +116,96 @@ Prefer this every turn. Use the PNG only when the state is not enough.
 
 Only move in directions that are `true`.
 
+**Keys are isometric**, not screen up/down/left/right:
+
+| key | world step |
+| --- | --- |
+| `up` | `(+16, -8)` |
+| `right` | `(+16, +8)` |
+| `down` | `(-16, +8)` |
+| `left` | `(-16, -8)` |
+
+Do not map `delta` signs to screen arrows. Use `nav` / `events[].keys` / `hint`.
+
+#### Navigation `nav` (prefer this on the overworld)
+
+```json
+"nav": {
+  "event": 54,
+  "role": "exit",
+  "dist": 256,
+  "can_act": false,
+  "keys": ["up"],
+  "steps": 5,
+  "path": ["up", "up", "right", "up", "right"],
+  "reachable": true,
+  "dest_scene": 5
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `event` | Recommended event id |
+| `role` | Coarse class: `npc` / `exit` / `search` / `trigger` / `decor` |
+| `can_act` | Can inspect or already in touch range |
+| `keys` | Preferred one-step keys (walk-filtered) |
+| `path` | Short BFS path (≤ ~16 steps); press `path[0]` |
+| `reachable` | Whether BFS found a path |
+| `dest_scene` | Scene change target if the script teleports |
+
+- `can_act == true` → `confirm` / `space` now  
+- else prefer `path[0]`, else `keys[0]`  
+- no target → `nav` is `null`
+
+#### Natural-language `hint`
+
+One line per turn, e.g.:
+
+- `"dialog — confirm (…)"`
+- `"go to #54 (exit) path=up>up>right… — press up"`
+- `"at event #68 (search) — confirm/space to interact"`
+- `"select enemy target index=1 (…) — left/right, confirm"`
+
+**Read `hint` first, then drill into fields.**
+
 #### Events `events[]` (NPCs, exits, inspectables)
 
 | Field | Meaning |
 | --- | --- |
 | `id` | Object id |
 | `kind` | `search` / `touch` / `scenery` |
-| `pos` | World position |
-| `delta` | Offset from you |
-| `dist` | Distance (smaller = closer) |
+| `role` | Coarse class (same as `nav.role`) |
+| `pos` / `delta` / `dist` | Position and distance |
 | `can_search_now` | Close enough to inspect |
 | `in_touch_range` | Inside touch trigger radius |
+| `keys` | Keys that reduce distance (walk-filtered) |
+| `dest_scene` | Optional scene-change target |
+| `trigger_script` etc. | Advanced script/sprite ids |
 
-Move toward a target using `delta` and allowed `walk` directions.  
-When `can_search_now` is true, press `confirm` or `space`.
+When `can_search_now` or `in_touch_range`, press `confirm` or `space`.
+
+#### Party `party[]`
+
+| Field | Meaning |
+| --- | --- |
+| `name` / `level` / `hp` / `max_hp` / `mp` / `max_mp` | Basics |
+| `exp` / `next_exp` | Current / next-level experience |
+| `equipment[]` | Gear |
+| `magics[]` | `id`, `name`, `mp` cost, `tgt` (`enemy`/`ally`), optional `all`, `ok:false` (can't afford), `battle:false` / `field:false` |
+| `status[]` | `name`: `conf`/`para`/`sleep`/`silence`/`puppet`/`brave`/`prot`/`haste`/`dual`; `t` rounds left |
+| `screen_pos` | Screen coords (**not** world; use top-level `player` for walking) |
 
 #### Battle `battle` (`null` when not fighting)
 
 | Field | Meaning |
 | --- | --- |
 | `phase` / `ui_state` / `menu_state` | Battle flow and UI stage |
-| `enemies[]` | Enemy `name`, `hp`, `level`, … |
-| `players[]` | Party battle state |
+| `target` | While selecting: `{side,index,all}` |
+| `enemies[]` | `name`, `hp`, `max_hp`, `level`, optional `selected`, `status` |
+| `players[]` | `name`, `hp`/`mp`, `defending`, optional `selected`/`acting`, `status` |
 | `force` / `flee` / `auto_attack` | Flags |
 
+On `select_target_enemy*` / `select_target_player*`, use `target` / `selected`, left/right, then `confirm`.  
 A `menu` may also open (magic/items). Use `keys_hint` and `actions`.
 
 #### Inventory `inventory[]`
@@ -212,8 +280,10 @@ Each turn, decide in this priority:
 5. **`entering_scene` or `phase` is `scene_transition`** → few inputs; step or wait briefly.  
 6. **`phase` is `boot` or `in_main_game` is false** → use `confirm` for intro/title; in step mode also advance many steps.  
 7. **Overworld**  
-   - Interact: pick a nearby entry in `events`; if `can_search_now`, `confirm`/`space`; else walk using `delta` and `walk`  
-   - Explore: only move where `walk` is true  
+   - Read `hint` / `nav` first  
+   - `nav.can_act` → `confirm`/`space`  
+   - else press `nav.path[0]` or `nav.keys[0]` (then step)  
+   - no `nav`: explore only where `walk` is true  
 
 Use `keys_hint` as soft guidance; **`actions` is the hard list of legal keys.**
 
@@ -287,6 +357,7 @@ curl -s -X POST 'http://127.0.0.1:8765/v1/step?frames=1'
 ## 7. Saving bandwidth and tokens
 
 - **Prefer `GET /v1/state`**; do not fetch PNG every turn.  
+- Read `hint` + `phase` + `nav`/`dialog`/`menu`/`battle` first; open other fields only as needed.  
 - `dialog` is already one full string — use it as-is.  
 - Menu selection is `items[index]` — no extra label field.  
 - Ignore unknown fields.
