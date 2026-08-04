@@ -71,6 +71,7 @@
 | `keys_hint` | 当前更建议使用的键 |
 | `actions` | **全部合法键名**（按键只能用这里的名字） |
 | `cash` | 金钱 |
+| `playtime_secs` | 本存档累计真实游玩秒数（含当前会话） |
 | `quit_requested` | 为 true 时停止操作 |
 | `frame_id` / `ticks` / `step_mode` | 同 status |
 

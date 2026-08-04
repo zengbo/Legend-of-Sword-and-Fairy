@@ -147,6 +147,19 @@ pub fn store_save(slot: i32, data: &[u8]) {
     let _ = worker_scope().post_message(&msg);
 }
 
+/// Persist cumulative playtime (seconds) for a save slot via the main thread.
+pub fn store_playtime(slot: i32, secs: u64) {
+    let text = format!("{secs}\n");
+    let arr = Uint8Array::from(text.as_bytes());
+    if let Ok(files) = js_sys::Reflect::get(&js_sys::global(), &"PAL_FILES".into()) {
+        let _ = js_sys::Reflect::set(&files, &format!("{slot}.PLAYTIME").into(), &arr);
+    }
+    let msg = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&msg, &"palPlaytime".into(), &JsValue::from(slot));
+    let _ = js_sys::Reflect::set(&msg, &"secs".into(), &JsValue::from(secs as f64));
+    let _ = worker_scope().post_message(&msg);
+}
+
 thread_local! {
     /// Dummy SAB used purely as an `Atomics.wait` sleep timer.
     static SLEEP_CELL: Int32Array = Int32Array::new(&SharedArrayBuffer::new(4));

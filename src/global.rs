@@ -1037,6 +1037,12 @@ pub struct Globals {
     pub inventory: [Inventory; MAX_INVENTORY],
     pub frame_num: u32,
 
+    /// Cumulative real-world play time for this save lineage (seconds),
+    /// excluding the open session segment tracked on `Engine`.
+    /// Persisted next to `{slot}.rpg` as `{slot}.playtime` (native) or
+    /// `localStorage` (web).
+    pub playtime_secs: u64,
+
     /// Load flags for the resource layer (res.c bLoadFlags).
     pub load_flags: u8,
 }
@@ -1099,6 +1105,7 @@ impl Globals {
             poison_status: [[PoisonStatus::default(); MAX_PLAYABLE_PLAYER_ROLES]; MAX_POISONS],
             inventory: [Inventory::default(); MAX_INVENTORY],
             frame_num: 0,
+            playtime_secs: 0,
             load_flags: 0,
         })
     }
@@ -1110,6 +1117,9 @@ impl Globals {
         self.current_save_slot = save_slot as u8;
         if save_slot == 0 || self.load_game(save_slot).is_err() {
             self.load_default_game()?;
+            self.playtime_secs = 0;
+        } else {
+            self.playtime_secs = self.read_playtime_secs(save_slot);
         }
         self.cur_inv_menu_item = 0;
         self.in_battle = false;
@@ -1157,6 +1167,48 @@ impl Globals {
 
     fn save_file_path(&self, slot: i32) -> PathBuf {
         self.save_dir.join(format!("{slot}.rpg"))
+    }
+
+    fn playtime_file_path(&self, slot: i32) -> PathBuf {
+        self.save_dir.join(format!("{slot}.playtime"))
+    }
+
+    /// Read cumulative playtime (seconds) for a save slot. Missing file → 0.
+    pub fn read_playtime_secs(&self, slot: i32) -> u64 {
+        if slot <= 0 {
+            return 0;
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Ok(buf) = self.data_dir.read_file(&format!("{slot}.playtime")) {
+                return parse_playtime_bytes(&buf);
+            }
+            return 0;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            match std::fs::read(self.playtime_file_path(slot)) {
+                Ok(buf) => parse_playtime_bytes(&buf),
+                Err(_) => 0,
+            }
+        }
+    }
+
+    /// Persist cumulative playtime for a save slot.
+    pub fn write_playtime_secs(&self, slot: i32, secs: u64) -> io::Result<()> {
+        if slot <= 0 {
+            return Ok(());
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            crate::web::store_playtime(slot, secs);
+            Ok(())
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let text = format!("{secs}\n");
+            std::fs::write(self.playtime_file_path(slot), text.as_bytes())
+        }
     }
 
     /// PAL_LoadGame (DOS format).
@@ -1267,17 +1319,25 @@ impl Globals {
     }
 
     /// PAL_SaveGame (DOS format).
-    pub fn save_game(&self, slot: i32, saved_times: u16) -> io::Result<()> {
+    ///
+    /// `playtime_secs` is the cumulative wall-clock play time to store for
+    /// this slot (typically `Engine::playtime_secs()` after committing the
+    /// open session).
+    pub fn save_game(&self, slot: i32, saved_times: u16, playtime_secs: u64) -> io::Result<()> {
         let buf = self.save_game_to_bytes(saved_times);
         // On the web: update the in-worker PAL_FILES map (so loads in this
         // session see it) and post it to the main thread for localStorage.
         #[cfg(target_arch = "wasm32")]
         {
             crate::web::store_save(slot, &buf);
+            self.write_playtime_secs(slot, playtime_secs)?;
             Ok(())
         }
         #[cfg(not(target_arch = "wasm32"))]
-        std::fs::write(self.save_file_path(slot), buf)
+        {
+            std::fs::write(self.save_file_path(slot), buf)?;
+            self.write_playtime_secs(slot, playtime_secs)
+        }
     }
 
     pub fn save_game_to_bytes(&self, saved_times: u16) -> Vec<u8> {
@@ -1341,7 +1401,15 @@ impl Globals {
         }
         w.buf
     }
+}
 
+/// Parse `{slot}.playtime` contents: ASCII decimal seconds, optional newline.
+fn parse_playtime_bytes(buf: &[u8]) -> u64 {
+    let s = std::str::from_utf8(buf).unwrap_or("").trim();
+    s.parse::<u64>().unwrap_or(0)
+}
+
+impl Globals {
     // =======================================================================
     // Inventory (global.c).
     // =======================================================================

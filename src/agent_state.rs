@@ -108,6 +108,8 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
     out.push(',');
     push_u64(&mut out, "current_save_slot", g.current_save_slot as u64);
     out.push(',');
+    push_u64(&mut out, "playtime_secs", engine.playtime_secs());
+    out.push(',');
     push_u64(&mut out, "palette", g.num_palette as u64);
     out.push(',');
     push_bool(&mut out, "night_palette", g.night_palette);

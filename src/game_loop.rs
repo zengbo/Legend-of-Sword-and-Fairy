@@ -691,6 +691,10 @@ pub struct Engine {
     /// timestamps for captured frames.
     tick_scale: u64,
 
+    /// Wall-clock mark when `globals.playtime_secs` was last set. Total play
+    /// time = `playtime_secs + session elapsed`.
+    playtime_session_start: Instant,
+
     /// Set when the user asked to quit (window close / Alt+F4).
     pub quit_requested: bool,
 
@@ -828,6 +832,7 @@ impl Engine {
             video,
             start: Instant::now(),
             tick_scale,
+            playtime_session_start: Instant::now(),
             quit_requested: false,
             ending_effect_sprite: 0,
             battle: None,
@@ -887,6 +892,7 @@ impl Engine {
             video,
             start: Instant::now(),
             tick_scale: 1,
+            playtime_session_start: Instant::now(),
             quit_requested: false,
             ending_effect_sprite: 0,
             battle: None,
@@ -905,6 +911,34 @@ impl Engine {
         engine.init_ui()?;
         engine.process_event();
         Ok(engine)
+    }
+
+    /// Cumulative wall-clock play time for the current save lineage (seconds).
+    pub fn playtime_secs(&self) -> u64 {
+        self.globals
+            .playtime_secs
+            .saturating_add(self.playtime_session_start.elapsed().as_secs())
+    }
+
+    /// Fold the open session into `globals.playtime_secs` and restart the
+    /// session mark (e.g. just before writing a save).
+    pub fn playtime_commit_session(&mut self) {
+        self.globals.playtime_secs = self.playtime_secs();
+        self.playtime_session_start = Instant::now();
+    }
+
+    /// After loading a save (or starting a new game), set the base total and
+    /// restart session timing from now.
+    pub fn playtime_begin_session(&mut self, base_secs: u64) {
+        self.globals.playtime_secs = base_secs;
+        self.playtime_session_start = Instant::now();
+    }
+
+    /// Format cumulative play time as `HHH:MM` (hours may exceed 99).
+    pub fn playtime_hhmm(secs: u64) -> (u32, u32) {
+        let hours = (secs / 3600).min(u32::MAX as u64) as u32;
+        let mins = ((secs % 3600) / 60) as u32;
+        (hours, mins)
     }
 
     /// Milliseconds since engine start (SDL_GetTicks equivalent).
@@ -1603,6 +1637,7 @@ impl Engine {
             match self.res.load_resources(&mut self.globals) {
                 Ok(flags) => {
                     if flags.global_data {
+                        self.playtime_begin_session(self.globals.playtime_secs);
                         self.update_equipments();
                         let music = self.globals.num_music as i32;
                         self.play_music(music, true, 1.0);

@@ -158,6 +158,13 @@ async function boot() {
     const u8 = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
     files[`${slot}.RPG`] = u8;
+    // Cumulative play time (seconds) for this slot.
+    const pt = localStorage.getItem(`pal-playtime-${slot}`);
+    if (pt != null && pt !== "") {
+      const text = String(pt).trim() + "\n";
+      const enc = new TextEncoder();
+      files[`${slot}.PLAYTIME`] = enc.encode(text);
+    }
   }
 
   const worker = new Worker("worker.js");
@@ -173,6 +180,8 @@ async function boot() {
         bin += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
       }
       localStorage.setItem(`pal-save-${e.data.palSave}`, btoa(bin));
+    } else if (e.data && e.data.palPlaytime !== undefined) {
+      localStorage.setItem(`pal-playtime-${e.data.palPlaytime}`, String(e.data.secs | 0));
     } else if (typeof e.data === "string") {
       status.textContent = e.data; // worker status/error text
     }

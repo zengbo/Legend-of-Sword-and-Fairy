@@ -52,6 +52,8 @@ impl Resources {
         // Load global data.
         if globals.load_flags & LOAD_GLOBAL_DATA != 0 {
             globals.init_game_data(globals.current_save_slot as i32)?;
+            // playtime_secs loaded/reset here; Engine restarts the open-session
+            // wall clock when it sees global_data (playtime_begin_session).
             done.global_data = true;
             // Caller must: play music gpGlobals->wNumMusic (looping) and run
             // the equipment scripts (PAL_UpdateEquipments).

@@ -71,6 +71,7 @@ Prefer this every turn. Use the PNG only when the state is not enough.
 | `keys_hint` | Suggested keys for the current phase |
 | `actions` | **All legal key names** (only use these) |
 | `cash` | Money |
+| `playtime_secs` | Cumulative real-world play seconds for this save lineage (includes open session) |
 | `quit_requested` | Stop when true |
 | `frame_id` / `ticks` / `step_mode` | Same idea as status |
 

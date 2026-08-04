@@ -424,6 +424,9 @@ impl Engine {
             Err(_) => return,
         };
         if done.global_data {
+            // New game or loaded slot: base playtime already set in
+            // init_game_data; restart the open-session wall clock.
+            self.playtime_begin_session(self.globals.playtime_secs);
             let num_music = self.globals.num_music as i32;
             self.play_music(num_music, true, 0.0);
             self.update_equipments();

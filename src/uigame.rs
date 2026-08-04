@@ -269,6 +269,17 @@ impl Engine {
                 NumColor::Yellow,
                 NumAlign::Right,
             );
+            // Play time HH:MM under the save-count (empty slot shows 000:00).
+            let secs = self.globals.read_playtime_secs(i);
+            let (hh, mm) = crate::game_loop::Engine::playtime_hhmm(secs);
+            let hhmm = hh.saturating_mul(100).saturating_add(mm.min(99));
+            self.draw_number(
+                hhmm,
+                4,
+                (270, 38 * i - 4),
+                NumColor::Blue,
+                NumAlign::Right,
+            );
         }
 
         let selected = self
@@ -463,7 +474,13 @@ impl Engine {
                     for i in 1..=5 {
                         times = times.max(self.get_saved_times(i));
                     }
-                    let _ = self.globals.save_game(slot as i32, times + 1);
+                    // Fold open-session wall time into the cumulative total,
+                    // then write both the DOS .rpg and the sidecar playtime.
+                    self.playtime_commit_session();
+                    let playtime = self.globals.playtime_secs;
+                    let _ = self
+                        .globals
+                        .save_game(slot as i32, times + 1, playtime);
                 }
             }
             2 => {
@@ -473,6 +490,8 @@ impl Engine {
                     self.play_music(0, false, 1.0);
                     self.fade_out(1);
                     self.globals.reload_in_next_tick(slot as i32);
+                    // Session timer restarts when LOAD_GLOBAL_DATA runs
+                    // init_game_data; see Resources::load_resources.
                 }
             }
             3 => {
