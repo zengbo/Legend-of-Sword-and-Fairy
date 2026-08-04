@@ -1,7 +1,11 @@
 # 仙剑 · AI 操作手册
 
-你是**玩家客户端**。通过本机 HTTP 观察状态并发送按键，像真人一样推进游戏。  
+你是**玩家客户端**。通过本机 HTTP **观察**状态并发送按键，像真人一样推进游戏。  
 默认地址：`http://127.0.0.1:8765`（仅本机）。
+
+**原则：`/v1/state` 只提供信息，不提供策略。**  
+引擎告诉你「在哪、附近有什么、对话写了什么、这一步能不能调查」；**去哪、先聊谁、怎么绕路，由你自己决定。**  
+不要期望字段里有「推荐路径 / 请按 up」之类的指令。
 
 ---
 
@@ -64,14 +68,11 @@
 | `viewport` | 镜头位置 `[x, y]` |
 | `party_direction` | 朝向 0–3 |
 | `walk` | 四向是否可走一步：`{up,right,down,left}` |
-| `events` | 附近可交互对象列表（含 `role`、`keys`） |
-| `nav` | 推荐导航目标与路径；无目标时为 `null` |
-| `hint` | 一句自然语言提示（优先阅读） |
+| `events` | 附近对象事实（位置、调查、脚本性质；**不是**推荐目标列表） |
 | `party` | 队员（姓名、HP/MP、经验、装备、法术等） |
 | `inventory` | 物品栏 |
 | `battle` | 战斗详情；非战斗为 `null` |
-| `keys_hint` | 当前更建议使用的键 |
-| `actions` | **全部合法键名**（按键只能用这里的名字） |
+| `actions` | **合法键名词汇表**（不是「建议按哪个」） |
 | `cash` | 金钱 |
 | `playtime_secs` | 本存档累计真实游玩秒数（含当前会话） |
 | `quit_requested` | 为 true 时停止操作 |
@@ -125,85 +126,32 @@
 | `down` | `(-16, +8)` |
 | `left` | `(-16, -8)` |
 
-不要根据 `delta` 的正负直接猜屏幕方向；用下面的 `nav` / `events[].keys` / `hint`。
+键名是**等距世界步进**，不是屏幕像素方向。结合 `player`、`events[].pos` / `delta`、`walk` 自己规划路线。
 
-#### 导航 `nav`（大地图优先看）
+顶层 `facing`：当前朝向键名（`down`/`left`/`up`/`right`）。
 
-```json
-"nav": {
-  "event": 16,
-  "role": "exit",
-  "dist": 960,
-  "can_act": false,
-  "progress": "item",
-  "keys": ["up"],
-  "steps": 12,
-  "path": ["up", "right", "up"],
-  "reachable": true
-}
-```
+#### 事件 `events[]`（附近对象 — 事实，不是推荐列表）
 
-| 字段 | 含义 |
-| --- | --- |
-| `event` | 推荐接近/交互的事件 id |
-| `role` | 粗分类：`npc` / `exit` / `search` / `trigger` / `decor` |
-| `progress` | 脚本进度等级：`item` / `quest` / `scene` / `dialog` / `battle` / `cash` / `mild` / `none` |
-| `item_use` | 可选；背包中可对该事件「使用」的物品 id（需菜单→物品→使用） |
-| `can_act` | 当前朝向已可调查，或已在触碰范围 |
-| `in_search_range` | 已进入调查格（可能还要转身） |
-| `face` | 需要面向的方向键；先 tap 该键再 `confirm` |
-| `key` | **唯一**推荐下一步方向（稳定，避免左右抖） |
-| `keys` | 与 `key` 相同的单元素数组（兼容旧客户端） |
-| `path` | 短路径；有则按 `path[0]`（= `key`）走 |
-| `reachable` | BFS 是否找到路径 |
-| `dest_scene` | 若脚本会切场景，目标场景号 |
-
-顶层还有 `facing`：当前朝向对应的键名（`down`/`left`/`up`/`right`）。
-
-**选目标规则（引擎已按此排序 `nav`）：**  
-优先 `item_use` / 会给物品·改状态的 `quest`·`item` 脚本 → 切场景 `scene` → 其它；**纯对话循环 `dialog`（`events[].loop=true`）会被降权**；**走不过去的目标会被跳过**（例如厨房到楼上送菜点中间有墙，会先指向可达的门 `progress=scene`/`bridge`，而不是对着 `reachable:false` 空转）。
-
-- `nav.item_use` 有值 → **菜单使用该物品**对准目标（不要只 confirm 对话）  
-- `can_act` → 立刻 `confirm` / `space`  
-- `in_search_range` 且有 `face` → 先 tap `face` 转身，再 `confirm`  
-- 否则 **只按 `key`（或 `path[0]`）一个方向**，不要在多个方向间切换  
-- 无目标时 `nav` 为 `null`  
-- 若仍空转：可读 `events[]` 里 `progress!=dialog` 且无 `loop` 的目标，用其 `key` 走（一般不必，`nav` 已避开循环）
-
-#### 自然语言 `hint`
-
-每拍一句，例如：
-
-- `"dialog — confirm (李大娘：李逍遙！…)"`
-- `"go to #16 (exit/item) path=up>right… — press up"`
-- `"use item 272(桂花酒) on #63 (npc/item) — menu→item→use, face target"`
-- `"at event #68 (search/quest) — confirm/space to interact"`
-- `"select enemy target index=1 (蛇妖) — left/right, confirm"`
-
-**可先读 `hint`，再读细节字段。**
-
-#### 事件 `events[]`（找人、出口、调查）
+按距离排序，最多约 48 个。**没有**「该去哪个」的排序策略；你自己根据剧情、`progress`、`dest_scene` 等选择。
 
 | 字段 | 含义 |
 | --- | --- |
 | `id` | 对象编号 |
 | `kind` | `search` / `touch` / `scenery` |
-| `role` | 粗分类（同上） |
-| `progress` | 脚本进度：`item`/`quest`/`scene`/`dialog`/…（同 `nav`） |
-| `loop` | 可选；`true` 表示当前脚本是纯对话循环，可跳过 |
-| `item_use` | 可选；可用物品 id |
-| `pos` / `delta` / `dist` | 位置与距离 |
-| `can_search_now` | **当前朝向**下按 confirm 能否命中（引擎格匹配） |
+| `role` | 粗分类：`npc` / `exit` / `search` / `trigger` / `decor` |
+| `progress` | 脚本**性质**扫描（非优先级）：`item`/`quest`/`scene`/`dialog`/`battle`/`cash`/`mild`/`none` |
+| `loop` | 可选；`true` = 当前入口像是纯对话循环（事实标注） |
+| `item_use` | 可选；背包里 use 脚本会检查该事件的物品 id（可用道具的事实） |
+| `pos` / `delta` / `dist` | 世界坐标、相对位移、距离度量 |
+| `can_search_now` | **当前朝向**下 confirm 是否命中（引擎格匹配） |
 | `in_search_range` | 任一方位下可调查 |
-| `face` | 需要面向的方向 |
-| `in_touch_range` | 是否已在触碰范围内 |
-| `key` | 走近该事件的**单一**推荐方向 |
-| `dest_scene` | 可选；脚本切场景目标 |
+| `face` | 若要调查，需要面向的方向（几何事实，不是「请按」） |
+| `in_touch_range` | 是否已在触碰半径内 |
+| `dest_scene` | 可选；脚本会切到的场景号 |
 | `trigger_script` 等 | 脚本/精灵编号（高级） |
 
-调查判定与引擎一致：朝向锥 + 地图格子。mode=1 时几乎要站在目标格旁。  
-`can_search_now` / `in_touch_range` → `confirm`/`space`；仅有 `face` → 先转身再确认。  
-**桌上酒菜 / 楼梯送菜** 等可能是 `search` 或无精灵的 `exit`/`touch`，不一定叫「桌子」；看 `progress=item|quest` 与 `nav` 即可。
+调查与引擎一致：朝向锥 + 地图格子。mode=1 时几乎要贴格。  
+如何接近、是否交互、是否用道具：**由你决定**。
 
 #### 队伍 `party[]`
 
@@ -227,7 +175,7 @@
 | `force` / `flee` / `auto_attack` | 相关标志 |
 
 选目标：`ui_state` 为 `select_target_enemy*` / `select_target_player*` 时，看 `target` 与 `selected`，用左右切换，`confirm` 确认。  
-战斗中也可出现 `menu`（法术、道具）。结合 `keys_hint` 与 `actions`。
+战斗中也可出现 `menu`（法术、道具）。合法键见 `actions`。
 
 #### 物品 `inventory[]`
 
@@ -290,26 +238,18 @@
 
 ---
 
-## 3. 怎么玩（决策顺序）
+## 3. 怎么玩（你自己决策）
 
-每一拍按下面优先级判断：
+引擎**不**给出「下一步按哪个键」。下面只是 UI 层常见情况说明，不是强制策略树：
 
 1. **`quit_requested`** → 停止。  
-2. **`dialog` 不是 null** → 阅读内容，`confirm`。  
-3. **`menu` 不是 null** → 根据 `items` 与目标选择；方向移动光标，`confirm` 确认，`menu` 取消。  
-4. **`in_battle` 或 `phase` 为 `battle`** → 看 `battle` 与可能的 `menu`；常用 `force` / `auto` / `confirm` / `defend`。  
-5. **`entering_scene` 或 `phase` 为 `scene_transition`** → 少操作，步进或短暂等待。  
-6. **`phase` 为 `boot` 或 `in_main_game` 为 false** → 多用 `confirm` 过片头/主菜单；步进模式下配合大量 `step`。  
-7. **大地图 `overworld`**  
-   - 先读 `hint` / `nav`（`nav` 已优先 `item`/`quest`，并避开 `dialog` 循环 NPC）  
-   - `nav.item_use` 有值 → **菜单使用该物品**对准 `nav.event`（如桂花酒对醉道士）  
-   - `nav.can_act` → `confirm`/`space`  
-   - `nav.in_search_range` + `face` → tap `face` 转身 → `confirm`  
-   - 否则 **只** 按 `nav.key`（= `path[0]`）一个方向；长按该方向直到 `can_act` 或 `hint` 变化  
-   - 无 `nav`：只在 `walk` 为 true 的方向探索  
-   - 仍空转时：在 `events[]` 选 `progress` 为 `item`/`quest`/`scene` 且无 `loop` 的目标  
+2. **`dialog` 不是 null** → 对话进行中；通常用 `confirm` 翻页（你决定何时确认）。  
+3. **`menu` 不是 null** → 根据 `items`/`index` 选目标；方向移动，`confirm`/`menu`。  
+4. **`phase` 为 `battle`** → 看 `battle` 与菜单；按键见 `actions`。  
+5. **`scene_transition` / boot** → 少操作或过片头。  
+6. **`overworld`** → 用 `player`、`walk`、`events[]`、`inventory`、对话记忆自己规划：去哪、跟谁说、是否调查、是否用道具。  
 
-`keys_hint` 可作辅助，**以 `actions` 为合法键范围**。
+合法键名见 `actions`。等距移动键含义见上文 `walk` 表。
 
 ---
 
@@ -381,7 +321,7 @@ curl -s -X POST 'http://127.0.0.1:8765/v1/step?frames=1'
 ## 7. 省流量与 token
 
 - **主读 `GET /v1/state`**，不要每拍都拉 PNG。  
-- 先读 `hint` + `phase` + `nav`/`dialog`/`menu`/`battle`，细节字段按需看。  
+- 先读 `phase` + `dialog`/`menu`/`battle`/`player`/`events`，细节按需看；**不要**指望推荐路径字段。  
 - `dialog` 已是完整一句/一段，直接用，不要自行拆字段。  
 - 菜单用 `items[index]`，不要假设额外字段。  
 - 未知字段忽略即可。

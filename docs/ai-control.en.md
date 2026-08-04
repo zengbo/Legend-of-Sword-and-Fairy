@@ -3,6 +3,10 @@
 You are a **player client**. Observe the game and send key presses over local HTTP, the same way a human would play.  
 Default base URL: `http://127.0.0.1:8765` (loopback only).
 
+**Principle: `/v1/state` is information, not strategy.**  
+The engine reports where you are, nearby objects, dialogue text, and whether search would hit — **where to go and what to do is your decision.**  
+Do not expect fields that say “press up” or ship a full recommended path.
+
 ---
 
 ## 1. What you can do
@@ -64,14 +68,11 @@ Prefer this every turn. Use the PNG only when the state is not enough.
 | `viewport` | Camera world position `[x, y]` |
 | `party_direction` | Facing 0–3 |
 | `walk` | Can take one step: `{up,right,down,left}` |
-| `events` | Nearby events (`role`, `keys`, …) |
-| `nav` | Recommended navigation target + path; `null` if none |
-| `hint` | One-line natural-language advice (read first) |
+| `events` | Nearby objects (facts: pos, search, scripts — not ranked goals) |
 | `party` | Party (names, HP/MP, exp, gear, magic) |
 | `inventory` | Items |
 | `battle` | Battle details, or `null` |
-| `keys_hint` | Suggested keys for the current phase |
-| `actions` | **All legal key names** (only use these) |
+| `actions` | **All legal key names** (input vocabulary, not suggestions) |
 | `cash` | Money |
 | `playtime_secs` | Cumulative real-world play seconds for this save lineage (includes open session) |
 | `quit_requested` | Stop when true |
@@ -125,85 +126,31 @@ Only move in directions that are `true`.
 | `down` | `(-16, +8)` |
 | `left` | `(-16, -8)` |
 
-Do not map `delta` signs to screen arrows. Use `nav` / `events[].keys` / `hint`.
+Keys are **isometric world steps**, not screen pixels. Plan routes from `player`, `events[].pos` / `delta`, and `walk`.
 
-#### Navigation `nav` (prefer this on the overworld)
+Top-level `facing` is the current facing key name (`down`/`left`/`up`/`right`).
 
-```json
-"nav": {
-  "event": 16,
-  "role": "exit",
-  "dist": 960,
-  "can_act": false,
-  "progress": "item",
-  "keys": ["up"],
-  "steps": 12,
-  "path": ["up", "right", "up"],
-  "reachable": true
-}
-```
+#### Events `events[]` (nearby objects — facts, not a ranked to-do list)
 
-| Field | Meaning |
-| --- | --- |
-| `event` | Recommended event id |
-| `role` | Coarse class: `npc` / `exit` / `search` / `trigger` / `decor` |
-| `progress` | Script rank: `item` / `quest` / `scene` / `dialog` / `battle` / `cash` / `mild` / `none` |
-| `item_use` | Optional inventory item id to **use** on this event (menu → item → use) |
-| `can_act` | Confirm works **with current facing**, or in touch range |
-| `in_search_range` | Inside search tiles (may need to turn) |
-| `face` | Face this key, then `confirm` |
-| `key` | **Single** next walk key (stable; avoids left/right flip) |
-| `keys` | One-element array = `[key]` (compat) |
-| `path` | Short BFS path; press `path[0]` (= `key`) |
-| `reachable` | Whether BFS found a path |
-| `dest_scene` | Scene change target if the script teleports |
-
-Top-level `facing` is the key name for current facing (`down`/`left`/`up`/`right`).
-
-**Target selection (engine already ranks `nav` this way):**  
-Prefer `item_use` / scripts that grant items or mutate quest state → scene exits → other; **pure dialog loops** are deprioritized; **walk-unreachable targets are skipped** (e.g. kitchen cannot path to upstairs delivery — nav points at a reachable door with `progress=scene`/`bridge` instead of spinning on `reachable:false`).
-
-- `nav.item_use` set → **use that item from the menu** on the target (do not only confirm dialog)  
-- `can_act` → `confirm` / `space` now  
-- `in_search_range` + `face` → tap `face`, then `confirm`  
-- else press **only** `key` / `path[0]` — do not alternate directions  
-- no target → `nav` is `null`  
-- if still stuck: pick `events[]` with `progress` in `item`/`quest`/`scene` and no `loop`
-
-#### Natural-language `hint`
-
-One line per turn, e.g.:
-
-- `"dialog — confirm (…)"`
-- `"go to #16 (exit/item) path=up>right… — press up"`
-- `"use item 272(…) on #63 (npc/item) — menu→item→use, face target"`
-- `"at event #68 (search/quest) — confirm/space to interact"`
-- `"select enemy target index=1 (…) — left/right, confirm"`
-
-**Read `hint` first, then drill into fields.**
-
-#### Events `events[]` (NPCs, exits, inspectables)
+Sorted by distance (cap ~48). There is **no** engine-chosen “you should go here”.
 
 | Field | Meaning |
 | --- | --- |
 | `id` | Object id |
 | `kind` | `search` / `touch` / `scenery` |
-| `role` | Coarse class (same as `nav.role`) |
-| `progress` | Script rank (same labels as `nav.progress`) |
-| `loop` | Optional; `true` = pure dialog loop (safe to skip) |
-| `item_use` | Optional usable item id for this event |
-| `pos` / `delta` / `dist` | Position and distance |
-| `can_search_now` | Confirm hits with **current facing** (engine tile match) |
+| `role` | Coarse class: `npc` / `exit` / `search` / `trigger` / `decor` |
+| `progress` | Script **character** scan (not priority): `item`/`quest`/`scene`/`dialog`/… |
+| `loop` | Optional; `true` if the entry looks like pure dialog |
+| `item_use` | Optional inventory item whose use-script checks this event |
+| `pos` / `delta` / `dist` | World position, offset, distance metric |
+| `can_search_now` | Confirm hits with **current facing** |
 | `in_search_range` | Search works for some facing |
-| `face` | Required facing key |
-| `in_touch_range` | Inside touch trigger radius |
-| `key` | Single preferred walk key toward this event |
+| `face` | Facing needed for search (geometry fact, not a “press this” order) |
+| `in_touch_range` | Inside touch radius |
 | `dest_scene` | Optional scene-change target |
-| `trigger_script` etc. | Advanced script/sprite ids |
+| `trigger_script` etc. | Advanced ids |
 
-Search uses the engine’s facing cone + map tiles. mode=1 needs you almost on the same tile.  
-`can_search_now` / `in_touch_range` → `confirm`/`space`; only `face` → turn first, then confirm.  
-Table dishes / delivery stairs may be `search` or sprite-less `exit`/`touch` — follow `progress` and `nav`, not a “table” label.
+Search matches the engine (facing cone + tiles). How to approach and when to act is **your** call.
 
 #### Party `party[]`
 
@@ -227,7 +174,7 @@ Table dishes / delivery stairs may be `search` or sprite-less `exit`/`touch` —
 | `force` / `flee` / `auto_attack` | Flags |
 
 On `select_target_enemy*` / `select_target_player*`, use `target` / `selected`, left/right, then `confirm`.  
-A `menu` may also open (magic/items). Use `keys_hint` and `actions`.
+A `menu` may also open (magic/items). Use `actions` for legal key names.
 
 #### Inventory `inventory[]`
 
@@ -290,27 +237,18 @@ Response field `gating: true` means the game waits for your steps.
 
 ---
 
-## 3. How to play (decision order)
+## 3. How to play (you decide)
 
-Each turn, decide in this priority:
+The engine does **not** publish “press this next”. UI facts only:
 
 1. **`quit_requested`** → stop.  
-2. **`dialog` is not null** → read it, press `confirm`.  
-3. **`menu` is not null** → choose from `items`; arrows to move, `confirm` to accept, `menu` to cancel.  
-4. **`in_battle` or `phase` is `battle`** → use `battle` and any open `menu`; often `force` / `auto` / `confirm` / `defend`.  
-5. **`entering_scene` or `phase` is `scene_transition`** → few inputs; step or wait briefly.  
-6. **`phase` is `boot` or `in_main_game` is false** → use `confirm` for intro/title; in step mode also advance many steps.  
-7. **Overworld**  
-   - Read `hint` / `nav` first  
-   - Read `hint` / `nav` first (`nav` prefers `item`/`quest` and deprioritizes dialog loops)  
-   - `nav.item_use` set → **menu-use that item** on `nav.event`  
-   - `nav.can_act` → `confirm`/`space`  
-   - `nav.in_search_range` + `face` → tap `face`, then `confirm`  
-   - else press **only** `nav.key` (= `path[0]`); hold that one direction until `can_act` / `hint` changes  
-   - no `nav`: explore only where `walk` is true  
-   - if still spinning: pick `events[]` with `progress` in `item`/`quest`/`scene` and no `loop`
+2. **`dialog` is not null** → dialogue is open; you usually `confirm` to advance.  
+3. **`menu` is not null** → use `items`/`index`; arrows, `confirm`, `menu`.  
+4. **`phase` is `battle`** → use `battle` + menus; keys in `actions`.  
+5. **`scene_transition` / boot** → few inputs or skip intros.  
+6. **`overworld`** → plan from `player`, `walk`, `events[]`, `inventory`, and your own story goals.
 
-Use `keys_hint` as soft guidance; **`actions` is the hard list of legal keys.**
+Legal key names: `actions`. Isometric move keys: see `walk` table above.
 
 ---
 
@@ -382,7 +320,7 @@ curl -s -X POST 'http://127.0.0.1:8765/v1/step?frames=1'
 ## 7. Saving bandwidth and tokens
 
 - **Prefer `GET /v1/state`**; do not fetch PNG every turn.  
-- Read `hint` + `phase` + `nav`/`dialog`/`menu`/`battle` first; open other fields only as needed.  
+- Read `phase` + `dialog`/`menu`/`battle`/`player`/`events` first; there is no recommended-path field.  
 - `dialog` is already one full string — use it as-is.  
 - Menu selection is `items[index]` — no extra label field.  
 - Ignore unknown fields.

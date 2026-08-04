@@ -1,9 +1,11 @@
-//! Rich JSON snapshot for `GET /v1/state` (AI / HTTP driver).
+//! Observation JSON for `GET /v1/state` (AI / HTTP driver).
+//!
+//! **Facts only** — position, nearby events, dialogue, inventory, battle.
+//! No recommended path, ranked target, or "press this" strategy fields.
+//! Strategy is the AI client's job.
 //!
 //! Kept out of `game_loop.rs` so the observe surface can grow without
 //! cluttering the engine core.
-
-use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::battle::{BattleMenuState, BattlePhase, BattleUiState, FighterState};
 use crate::game_loop::Engine;
@@ -33,14 +35,6 @@ const DIR_KEYS: [&str; 4] = ["down", "left", "up", "right"];
 const MAX_EVENTS: usize = 48;
 /// Max inventory rows listed.
 const MAX_INV_LIST: usize = 64;
-/// BFS node budget for short path hints (per state build).
-/// Inn maps need ~15k+ nodes to cross a floor; keep headroom.
-const PATH_BFS_LIMIT: usize = 40_000;
-/// Max path steps published in `nav.path`.
-const PATH_MAX_STEPS: usize = 32;
-/// Max interactable candidates to path-check when picking nav (cheap skip of
-/// unreachable high-progress targets behind walls / other floors).
-const NAV_PATH_CANDIDATES: usize = 16;
 /// Status short names (STATUS_* index).
 const STATUS_NAMES: [&str; STATUS_ALL] = [
     "conf", "para", "sleep", "silence", "puppet", "brave", "prot", "haste", "dual",
@@ -185,15 +179,10 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
     out.push_str("\"inventory\":");
     append_inventory(&mut out, engine);
 
-    // Nearby / active event objects + nav + path for best target.
-    let (events_json, nav, path_keys) = build_events_and_nav(engine, player, &walk);
+    // Nearby event objects — facts only (pos/search/scripts). No recommended path.
     out.push(',');
     out.push_str("\"events\":");
-    out.push_str(&events_json);
-
-    out.push(',');
-    out.push_str("\"nav\":");
-    append_nav(&mut out, &nav, &path_keys);
+    out.push_str(&build_events_json(engine, player));
 
     // Battle block (null when not in battle).
     out.push(',');
@@ -204,18 +193,7 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
         out.push_str("null");
     }
 
-    // Natural-language one-liner for agents.
-    out.push(',');
-    out.push_str("\"hint\":");
-    push_json_string(
-        &mut out,
-        &build_hint(engine, phase, in_dialog, in_battle, in_menu, &nav, &path_keys, &walk),
-    );
-
-    // Context-sensitive key suggestions + full legal key vocabulary.
-    out.push(',');
-    out.push_str("\"keys_hint\":");
-    append_keys_hint(&mut out, phase, in_dialog, in_battle, in_menu, &nav, &path_keys);
+    // Legal input vocabulary (not a suggestion of what to press).
     out.push(',');
     out.push_str(
         "\"actions\":[\"up\",\"down\",\"left\",\"right\",\"confirm\",\"space\",\"menu\",\
@@ -677,31 +655,11 @@ fn append_inventory(out: &mut String, engine: &Engine) {
 }
 
 // ---------------------------------------------------------------------------
-// Events + navigation
+// Events (observation only — no recommended path / target)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Default)]
-struct NavInfo {
-    event_id: u16,
-    role: &'static str,
-    /// Single preferred step key (stable).
-    key: Option<&'static str>,
-    /// Face key needed for search (when in range but wrong facing).
-    face: Option<&'static str>,
-    can_act: bool,
-    /// In search range for some facing (may still need to turn).
-    in_search_range: bool,
-    dist: i32,
-    dest_scene: Option<u16>,
-    /// Script progress class for hints: item/quest/scene/dialog/…
-    progress: &'static str,
-    /// Inventory item that can be used on this event (field item-use).
-    item_use: Option<u16>,
-}
-
-/// How promising a trigger script looks for story progress (lower = better).
-/// 0 item-use target · 1 grants item/cash/battle · 2 mutates world · 3 scene
-/// change · 4 mild · 5 pure dialog loop · 6 empty.
+/// How a trigger script looks when scanned (label for AI; not a goal ranking).
+/// Labels: item / quest / scene / dialog / battle / cash / mild / none.
 #[derive(Clone, Copy)]
 struct ScriptRank {
     rank: u8,
@@ -719,15 +677,12 @@ fn compute_walk(engine: &Engine, player: (i32, i32)) -> [bool; 4] {
     walk
 }
 
-fn build_events_and_nav(
-    engine: &Engine,
-    player: (i32, i32),
-    walk: &[bool; 4],
-) -> (String, NavInfo, Vec<&'static str>) {
+/// Nearby event objects as pure observation for the agent.
+fn build_events_json(engine: &Engine, player: (i32, i32)) -> String {
     let g = &engine.globals;
     let scene_i = g.num_scene as usize;
     if scene_i == 0 || scene_i > g.game.scenes.len() {
-        return ("[]".into(), NavInfo::default(), Vec::new());
+        return "[]".into();
     }
     let start = g.game.scenes[scene_i - 1].event_object_index as usize;
     let end = g
@@ -737,7 +692,6 @@ fn build_events_and_nav(
         .map(|s| s.event_object_index as usize)
         .unwrap_or(g.game.event_objects.len());
     let party_dir = g.party_direction;
-    let prefer_key = dir_to_key(party_dir);
 
     struct Row {
         dist: i32,
@@ -745,22 +699,12 @@ fn build_events_and_nav(
         index: usize,
         role: &'static str,
         kind: &'static str,
-        /// confirm would hit with **current** facing.
         search_ok: bool,
-        /// confirm would hit if facing `face` (any dir).
         face: Option<&'static str>,
         in_touch: bool,
         dest_scene: Option<u16>,
-        /// Single best walk key toward this event.
-        key: Option<&'static str>,
-        interactable: bool,
-        has_sprite: bool,
-        /// Lower = better story progress (see ScriptRank).
-        progress_rank: u8,
         progress: &'static str,
-        /// Field-usable inventory item targeting this event (0x0081).
         item_use: Option<u16>,
-        /// Pure dialog with no world side-effects (safe to skip when stuck).
         dialog_loop: bool,
     }
 
@@ -796,9 +740,6 @@ fn build_events_and_nav(
             0
         };
         let in_touch = touch_radius > 0 && dist < touch_radius;
-        let interactable =
-            ev.trigger_script != 0 && (ev.trigger_mode > 0 || dest_scene.is_some());
-        let key = best_key_toward(player, pos, walk, prefer_key);
         let item_use = story_item_for_event(engine, event_id);
         let mut rank = analyze_script_progress(engine, ev.trigger_script);
         if item_use.is_some() {
@@ -808,7 +749,6 @@ fn build_events_and_nav(
                 grants_item: item_use,
             };
         } else if dest_scene.is_some() && rank.rank > 3 {
-            // Scene-change exits that our short scan missed still beat dialog loops.
             rank = ScriptRank {
                 rank: 3,
                 label: "scene",
@@ -825,134 +765,14 @@ fn build_events_and_nav(
             face,
             in_touch,
             dest_scene,
-            key,
-            interactable,
-            has_sprite: ev.sprite_num != 0,
-            progress_rank: rank.rank,
             progress: rank.label,
             item_use,
             dialog_loop: rank.rank >= 5,
         });
     }
-    // Near first for the published list; nav re-orders by progress + walk path.
     rows.sort_by_key(|r| (r.dist, r.event_id));
     rows.truncate(MAX_EVENTS);
 
-    // Prefer story progress, but skip targets with **no walk path**. Delivery
-    // stairs #16 are behind a wall from the kitchen — must leave via door
-    // #13/#19 → scene 3 → re-enter hall. Greedy "press up" alone spins forever.
-    let mut nav = NavInfo::default();
-    let mut path_keys: Vec<&'static str> = Vec::new();
-    {
-        let mut ordered: Vec<&Row> = rows.iter().filter(|r| r.interactable).collect();
-        ordered.sort_by_key(|r| {
-            let act_pen = if r.search_ok || r.in_touch {
-                0u8
-            } else if r.face.is_some() {
-                1
-            } else {
-                2
-            };
-            let role_pen = match r.role {
-                "npc" | "search" => 0u8,
-                "exit" => 1,
-                "trigger" => 2,
-                _ => 4,
-            };
-            let sprite_pen = if r.has_sprite { 0u8 } else { 1 };
-            (r.progress_rank, act_pen, role_pen, sprite_pen, r.dist, r.event_id)
-        });
-
-        let mut fallback: Option<&Row> = None;
-        for (i, best) in ordered.into_iter().enumerate() {
-            if i >= NAV_PATH_CANDIDATES {
-                break;
-            }
-            let can_act = best.search_ok || best.in_touch;
-            let in_search_range = best.search_ok || best.face.is_some();
-            if can_act || in_search_range {
-                nav = NavInfo {
-                    event_id: best.event_id,
-                    role: best.role,
-                    key: if can_act {
-                        None
-                    } else {
-                        best.face.or(best.key)
-                    },
-                    face: best.face,
-                    can_act,
-                    in_search_range,
-                    dist: best.dist,
-                    dest_scene: best.dest_scene,
-                    progress: best.progress,
-                    item_use: best.item_use,
-                };
-                path_keys.clear();
-                break;
-            }
-            if let Some(ev) = g.game.event_objects.get(best.index).copied() {
-                let path = path_to_event(
-                    engine,
-                    player,
-                    ev,
-                    party_dir,
-                    PATH_BFS_LIMIT,
-                    PATH_MAX_STEPS,
-                );
-                if !path.is_empty() {
-                    nav = NavInfo {
-                        event_id: best.event_id,
-                        role: best.role,
-                        key: path.first().copied().or(best.key),
-                        face: best.face,
-                        can_act: false,
-                        in_search_range: false,
-                        dist: best.dist,
-                        dest_scene: best.dest_scene,
-                        progress: best.progress,
-                        item_use: best.item_use,
-                    };
-                    path_keys = path;
-                    break;
-                }
-            }
-            if fallback.is_none() {
-                fallback = Some(best);
-            }
-        }
-
-        if nav.event_id == 0 {
-            if let Some(target) = fallback {
-                let target_pos = g
-                    .game
-                    .event_objects
-                    .get(target.index)
-                    .map(|e| (e.x as i32, e.y as i32))
-                    .unwrap_or(player);
-                if let Some((bridge_nav, bridge_path)) =
-                    find_bridge_exit(engine, player, party_dir, target.event_id, target_pos)
-                {
-                    nav = bridge_nav;
-                    path_keys = bridge_path;
-                } else {
-                    nav = NavInfo {
-                        event_id: target.event_id,
-                        role: target.role,
-                        key: target.key,
-                        face: target.face,
-                        can_act: target.search_ok || target.in_touch,
-                        in_search_range: target.search_ok || target.face.is_some(),
-                        dist: target.dist,
-                        dest_scene: target.dest_scene,
-                        progress: target.progress,
-                        item_use: target.item_use,
-                    };
-                }
-            }
-        }
-    }
-
-    // Serialize events.
     let mut events = String::from("[");
     for (i, row) in rows.iter().enumerate() {
         if i > 0 {
@@ -1001,7 +821,6 @@ fn build_events_and_nav(
         if let Some(f) = row.face {
             events.push(',');
             push_str(&mut events, "face", f);
-            // True when any facing works (including current).
             events.push(',');
             push_bool(&mut events, "in_search_range", true);
         }
@@ -1009,15 +828,10 @@ fn build_events_and_nav(
             events.push(',');
             push_u64(&mut events, "dest_scene", ds as u64);
         }
-        // Single stable key (not a multi-key array — avoids left/right flip).
-        if let Some(k) = row.key {
-            events.push(',');
-            push_str(&mut events, "key", k);
-        }
         events.push('}');
     }
     events.push(']');
-    (events, nav, path_keys)
+    events
 }
 
 fn classify_event_role(
@@ -1033,7 +847,6 @@ fn classify_event_role(
         return "exit";
     }
     if trigger_mode >= 4 {
-        // Invisible touch zones are usually doors/transitions.
         if sprite_num == 0 {
             "exit"
         } else {
@@ -1044,109 +857,12 @@ fn classify_event_role(
     } else if sprite_num == 0 {
         "trigger"
     } else {
-        // Visible inspectable — NPC / object / floor character.
         "npc"
     }
 }
 
 fn dir_to_key(dir: u16) -> &'static str {
     DIR_KEYS[(dir as usize) % 4]
-}
-
-fn key_to_walk_index(key: &str) -> Option<usize> {
-    WALK_DELTA.iter().position(|(_, n)| *n == key)
-}
-
-/// Single best walkable key that reduces isometric distance.
-/// Prefer continuing current facing when tied (reduces left/right shake).
-fn best_key_toward(
-    player: (i32, i32),
-    target: (i32, i32),
-    walk: &[bool; 4],
-    prefer_key: &str,
-) -> Option<&'static str> {
-    let cur = metric(player, target);
-    let mut best: Option<(i32, u8, usize, &'static str)> = None;
-    for (i, &((dx, dy), name)) in WALK_DELTA.iter().enumerate() {
-        if !walk[i] {
-            continue;
-        }
-        let next = (player.0 + dx, player.1 + dy);
-        let d = metric(next, target);
-        if d >= cur {
-            continue;
-        }
-        let prefer = if name == prefer_key { 0u8 } else { 1u8 };
-        let score = (d, prefer, i, name);
-        if best.map(|b| (score.0, score.1, score.2) < (b.0, b.1, b.2)).unwrap_or(true) {
-            best = Some(score);
-        }
-    }
-    best.map(|s| s.3)
-}
-
-fn append_nav(out: &mut String, nav: &NavInfo, path: &[&'static str]) {
-    if nav.event_id == 0 {
-        out.push_str("null");
-        return;
-    }
-    out.push('{');
-    push_u64(out, "event", nav.event_id as u64);
-    out.push(',');
-    push_str(out, "role", nav.role);
-    out.push(',');
-    push_i64(out, "dist", nav.dist as i64);
-    out.push(',');
-    push_bool(out, "can_act", nav.can_act);
-    if !nav.progress.is_empty() {
-        out.push(',');
-        push_str(out, "progress", nav.progress);
-    }
-    if let Some(item) = nav.item_use {
-        out.push(',');
-        push_u64(out, "item_use", item as u64);
-    }
-    if nav.in_search_range {
-        out.push(',');
-        push_bool(out, "in_search_range", true);
-    }
-    if let Some(f) = nav.face {
-        out.push(',');
-        push_str(out, "face", f);
-    }
-    if let Some(ds) = nav.dest_scene {
-        out.push(',');
-        push_u64(out, "dest_scene", ds as u64);
-    }
-    // Single key (stable). Prefer path[0] already folded into nav.key.
-    if let Some(k) = nav.key {
-        out.push(',');
-        push_str(out, "key", k);
-        // Keep keys:[] as one-element for older agents.
-        out.push(',');
-        out.push_str("\"keys\":[");
-        push_json_string(out, k);
-        out.push(']');
-    }
-    if !path.is_empty() {
-        out.push(',');
-        push_u64(out, "steps", path.len() as u64);
-        out.push(',');
-        out.push_str("\"path\":[");
-        for (i, k) in path.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
-            }
-            push_json_string(out, k);
-        }
-        out.push(']');
-        out.push(',');
-        push_bool(out, "reachable", true);
-    } else if !nav.can_act && !nav.in_search_range {
-        out.push(',');
-        push_bool(out, "reachable", false);
-    }
-    out.push('}');
 }
 
 fn metric(a: (i32, i32), b: (i32, i32)) -> i32 {
@@ -1238,33 +954,16 @@ fn search_status(
     (now, face)
 }
 
-/// Any-facing search range (path goal).
-fn can_search_from(position: (i32, i32), event: (i32, i32), mode: u16) -> bool {
-    search_status(position, event, mode, 0).1.is_some()
-}
-
 fn script_destination_scene(engine: &Engine, script: u16) -> Option<u16> {
-    script_exit_info(engine, script).map(|(scene, _)| scene)
-}
-
-/// First scene-change in a trigger script, with optional spawn world position
-/// from a preceding 0x0046 (set party position) opcode.
-fn script_exit_info(engine: &Engine, script: u16) -> Option<(u16, Option<(i32, i32)>)> {
     if script == 0 {
         return None;
     }
     let start = script as usize;
-    let mut spawn: Option<(i32, i32)> = None;
     for index in start..start.saturating_add(24) {
         let entry = engine.globals.game.script_entries.get(index)?;
-        if entry.operation == 0x0046 {
-            // Tile (op0, op1) + half (op2) → world coords (same as script 0x0046).
-            let x = entry.operand[0] as i32 * 32 + entry.operand[2] as i32 * 16;
-            let y = entry.operand[1] as i32 * 16 + entry.operand[2] as i32 * 8;
-            spawn = Some((x, y));
-        }
+        // 0x0059 = teleport / change scene.
         if entry.operation == 0x0059 && entry.operand[0] != 0 {
-            return Some((entry.operand[0], spawn));
+            return Some(entry.operand[0]);
         }
         if entry.operation == 0x0000 {
             break;
@@ -1276,129 +975,7 @@ fn script_exit_info(engine: &Engine, script: u16) -> Option<(u16, Option<(i32, i
 /// When the best progress target is walk-unreachable, pick a **reachable door**
 /// that leads to a scene which has a portal landing near that target (one hop
 /// out and back). Example: kitchen → door #13 → scene 3 → door #52 → hall #16.
-fn find_bridge_exit(
-    engine: &Engine,
-    player: (i32, i32),
-    party_dir: u16,
-    target_event: u16,
-    target_pos: (i32, i32),
-) -> Option<(NavInfo, Vec<&'static str>)> {
-    let cur_scene = engine.globals.num_scene;
-    if cur_scene == 0 {
-        return None;
-    }
 
-    // Mid scenes that can drop us near the unreachable target in `cur_scene`.
-    let mut useful_mid: HashSet<u16> = HashSet::new();
-    let n_scenes = engine.globals.game.scenes.len();
-    for scene in 1..n_scenes {
-        let scene_u = scene as u16;
-        if scene_u == cur_scene {
-            continue;
-        }
-        let start = engine.globals.game.scenes[scene - 1].event_object_index as usize;
-        let end = engine.globals.game.scenes[scene].event_object_index as usize;
-        for index in start..end.min(engine.globals.game.event_objects.len()) {
-            let ev = engine.globals.game.event_objects[index];
-            if ev.state <= 0 || ev.trigger_script == 0 {
-                continue;
-            }
-            if let Some((dest, spawn)) = script_exit_info(engine, ev.trigger_script) {
-                if dest == cur_scene {
-                    if let Some(sp) = spawn {
-                        if metric(sp, target_pos) < 320 {
-                            useful_mid.insert(scene_u);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if useful_mid.is_empty() {
-        return None;
-    }
-
-    // Reachable exit in the *current* scene that goes to a useful mid scene.
-    let start = engine.globals.game.scenes[cur_scene as usize - 1].event_object_index as usize;
-    let end = engine.globals.game.scenes[cur_scene as usize].event_object_index as usize;
-    let mut best: Option<(i32, u16, usize, Vec<&'static str>, Option<u16>)> = None;
-    for index in start..end.min(engine.globals.game.event_objects.len()) {
-        let ev = engine.globals.game.event_objects[index];
-        if ev.state <= 0 || ev.trigger_script == 0 {
-            continue;
-        }
-        let event_id = (index + 1) as u16;
-        if event_id == target_event {
-            continue;
-        }
-        let Some((dest, _)) = script_exit_info(engine, ev.trigger_script) else {
-            continue;
-        };
-        if !useful_mid.contains(&dest) {
-            continue;
-        }
-        let pos = (ev.x as i32, ev.y as i32);
-        let dist = metric(player, pos);
-        let path = path_to_event(
-            engine,
-            player,
-            ev,
-            party_dir,
-            PATH_BFS_LIMIT,
-            PATH_MAX_STEPS,
-        );
-        let touch_r = if ev.trigger_mode >= 4 {
-            ((ev.trigger_mode - 4) as i32 * 32 + 16).max(16)
-        } else {
-            0
-        };
-        let in_range = touch_r > 0 && dist < touch_r;
-        if path.is_empty() && !in_range {
-            continue;
-        }
-        let better = best
-            .as_ref()
-            .map(|(d, id, ..)| (dist, event_id) < (*d, *id))
-            .unwrap_or(true);
-        if better {
-            best = Some((dist, event_id, index, path, Some(dest)));
-        }
-    }
-    let (dist, event_id, _index, path, dest_scene) = best?;
-    let bridge_pos = engine
-        .globals
-        .game
-        .event_objects
-        .get(event_id as usize - 1)
-        .map(|e| (e.x as i32, e.y as i32))
-        .unwrap_or(target_pos);
-    let key = path.first().copied().or_else(|| {
-        best_key_toward(
-            player,
-            bridge_pos,
-            &compute_walk(engine, player),
-            dir_to_key(party_dir),
-        )
-    });
-    Some((
-        NavInfo {
-            event_id,
-            role: "exit",
-            key,
-            face: None,
-            can_act: false,
-            in_search_range: false,
-            dist,
-            dest_scene,
-            progress: "bridge",
-            item_use: None,
-        },
-        path,
-    ))
-}
-
-/// Scan a trigger script (until first hard stop) for story-progress signals.
-/// Used so nav skips pure dialog loops and prefers item/quest scripts.
 fn analyze_script_progress(engine: &Engine, script: u16) -> ScriptRank {
     analyze_script_progress_depth(engine, script, 0)
 }
@@ -1564,114 +1141,7 @@ fn story_item_for_event(engine: &Engine, event_id: u16) -> Option<u16> {
 
 /// BFS short path; returns key names (up/right/down/left), truncated.
 /// Prefer expanding current facing first to reduce path flip-flop.
-fn path_to_event(
-    engine: &Engine,
-    start: (i32, i32),
-    event: crate::global::EventObject,
-    party_dir: u16,
-    bfs_limit: usize,
-    max_steps: usize,
-) -> Vec<&'static str> {
-    path_to_event_with(
-        engine,
-        start,
-        event,
-        party_dir,
-        bfs_limit,
-        max_steps,
-        true,
-    )
-    .or_else(|| {
-        path_to_event_with(
-            engine,
-            start,
-            event,
-            party_dir,
-            bfs_limit / 2,
-            max_steps,
-            false,
-        )
-    })
-    .unwrap_or_default()
-}
 
-fn path_to_event_with(
-    engine: &Engine,
-    start: (i32, i32),
-    event: crate::global::EventObject,
-    party_dir: u16,
-    bfs_limit: usize,
-    max_steps: usize,
-    check_event_objects: bool,
-) -> Option<Vec<&'static str>> {
-    let goal = (event.x as i32, event.y as i32);
-    let trigger_distance = if event.trigger_mode >= 4 {
-        ((event.trigger_mode - 4) as i32 * 32 + 16).max(16)
-    } else {
-        0
-    };
-    let reached = |position: (i32, i32)| {
-        if event.trigger_mode > 0 && event.trigger_mode < 4 {
-            can_search_from(position, goal, event.trigger_mode)
-        } else if event.trigger_mode >= 4 {
-            metric(position, goal) < trigger_distance
-        } else {
-            metric(position, goal) < 24
-        }
-    };
-    if reached(start) {
-        return Some(Vec::new());
-    }
-
-    // Expand preferred facing first for stable paths.
-    let prefer = dir_to_key(party_dir);
-    let mut dir_order: [usize; 4] = [0, 1, 2, 3];
-    if let Some(pi) = key_to_walk_index(prefer) {
-        dir_order.swap(0, pi);
-    }
-
-    let mut queue = VecDeque::from([start]);
-    let mut previous: HashMap<(i32, i32), ((i32, i32), usize)> = HashMap::new();
-    let mut seen = HashSet::from([start]);
-    let mut found = None;
-
-    while let Some(position) = queue.pop_front() {
-        if reached(position) {
-            found = Some(position);
-            break;
-        }
-        if seen.len() > bfs_limit {
-            break;
-        }
-        for &di in &dir_order {
-            let ((dx, dy), _) = WALK_DELTA[di];
-            let next = (position.0 + dx, position.1 + dy);
-            if !(0..8192).contains(&next.0) || !(0..4096).contains(&next.1) {
-                continue;
-            }
-            if seen.contains(&next) {
-                continue;
-            }
-            if engine.check_obstacle_with_range(next, check_event_objects, 0, true) {
-                continue;
-            }
-            seen.insert(next);
-            previous.insert(next, (position, di));
-            queue.push_back(next);
-        }
-    }
-
-    let mut at = found?;
-    let mut rev: Vec<usize> = Vec::new();
-    while at != start {
-        let &(before, di) = previous.get(&at)?;
-        rev.push(di);
-        at = before;
-    }
-    rev.reverse();
-    rev.truncate(max_steps);
-    Some(rev.into_iter().map(|di| WALK_DELTA[di].1).collect())
-}
 
 // ---------------------------------------------------------------------------
 // Battle
@@ -1904,227 +1374,7 @@ fn append_battle(out: &mut String, engine: &Engine, battle: &crate::battle::Batt
 // Hints
 // ---------------------------------------------------------------------------
 
-fn build_hint(
-    engine: &Engine,
-    phase: &str,
-    in_dialog: bool,
-    in_battle: bool,
-    in_menu: bool,
-    nav: &NavInfo,
-    path: &[&'static str],
-    walk: &[bool; 4],
-) -> String {
-    if engine.quit_requested {
-        return "quit requested — stop".into();
-    }
-    if in_dialog || phase == "dialog" {
-        let preview = {
-            let s = &engine.ui.agent_dialog_speaker;
-            let lines = &engine.ui.agent_dialog_lines;
-            if !lines.is_empty() {
-                let body = lines.join(" ");
-                let short: String = body.chars().take(24).collect();
-                if s.is_empty() {
-                    short
-                } else {
-                    format!("{s}：{short}")
-                }
-            } else {
-                String::new()
-            }
-        };
-        if preview.is_empty() {
-            return "dialog — press confirm".into();
-        }
-        return format!("dialog — confirm ({preview})");
-    }
-    if in_menu || phase == "menu" {
-        if let Some(menu) = engine.ui.agent_menu.as_ref() {
-            let cur = menu
-                .items
-                .get(menu.index)
-                .map(|it| it.label.as_str())
-                .unwrap_or("?");
-            return format!(
-                "menu[{}] index={} 「{}」 — arrows+confirm, menu=cancel",
-                menu.kind, menu.index, cur
-            );
-        }
-        if let Some(battle) = engine.battle.as_ref() {
-            if battle.ui.state == BattleUiState::SelectMove {
-                return format!(
-                    "battle menu {} — arrows+confirm",
-                    battle_menu_state_name(battle.ui.menu_state)
-                );
-            }
-        }
-        return "menu — arrows+confirm, menu=cancel".into();
-    }
-    if in_battle || phase == "battle" {
-        if let Some(battle) = engine.battle.as_ref() {
-            match battle.ui.state {
-                BattleUiState::SelectTargetEnemy | BattleUiState::SelectTargetEnemyAll => {
-                    let idx = battle.ui.selected_index;
-                    let name = battle
-                        .enemy
-                        .get(idx as usize)
-                        .filter(|e| e.object_id != 0)
-                        .map(|e| word_utf8(engine, e.object_id as usize))
-                        .unwrap_or_else(|| "?".into());
-                    return format!(
-                        "select enemy target index={idx} ({name}) — left/right, confirm"
-                    );
-                }
-                BattleUiState::SelectTargetPlayer | BattleUiState::SelectTargetPlayerAll => {
-                    return format!(
-                        "select ally target index={} — left/right, confirm",
-                        battle.ui.selected_index
-                    );
-                }
-                BattleUiState::SelectMove => {
-                    return format!(
-                        "battle turn player={} menu={} — confirm/force/auto/defend",
-                        battle.ui.cur_player_index,
-                        battle_menu_state_name(battle.ui.menu_state)
-                    );
-                }
-                BattleUiState::Wait => {
-                    return "battle wait — hold or step".into();
-                }
-            }
-        }
-        return "battle — confirm/force/auto".into();
-    }
-    if phase == "scene_transition" || engine.globals.entering_scene {
-        return "scene transition — wait/step".into();
-    }
-    if phase == "boot" || !engine.globals.in_main_game {
-        return "boot/title — confirm; if step_mode, step frames".into();
-    }
-    // Overworld.
-    if nav.event_id != 0 {
-        let prog = if nav.progress.is_empty() {
-            String::new()
-        } else {
-            format!("/{}", nav.progress)
-        };
-        if let Some(item) = nav.item_use {
-            let name = word_utf8(engine, item as usize);
-            return format!(
-                "use item {item}({name}) on #{} ({}{prog}) — menu→item→use, face target",
-                nav.event_id, nav.role
-            );
-        }
-        if nav.can_act {
-            return format!(
-                "at event #{} ({}{prog}) — confirm/space to interact",
-                nav.event_id, nav.role
-            );
-        }
-        if nav.in_search_range {
-            if let Some(f) = nav.face {
-                return format!(
-                    "in range of #{} ({}{prog}) — face {} then confirm",
-                    nav.event_id, nav.role, f
-                );
-            }
-            return format!(
-                "in range of #{} ({}{prog}) — confirm/space",
-                nav.event_id, nav.role
-            );
-        }
-        if !path.is_empty() {
-            let preview: Vec<&str> = path.iter().copied().take(6).collect();
-            return format!(
-                "go to #{} ({}{prog}) path={}… — press {}",
-                nav.event_id,
-                nav.role,
-                preview.join(">"),
-                path[0]
-            );
-        }
-        if let Some(k) = nav.key {
-            return format!(
-                "approach #{} ({}{prog}) — press {}",
-                nav.event_id, nav.role, k
-            );
-        }
-        // Walkable dirs as fallback.
-        let open: Vec<&str> = WALK_DELTA
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| walk[*i])
-            .map(|(_, n)| n.1)
-            .collect();
-        if open.is_empty() {
-            return format!(
-                "blocked near #{} ({}{prog}) — try menu or other event",
-                nav.event_id, nav.role
-            );
-        }
-        return format!(
-            "approach #{} ({}{prog}) — try {}",
-            nav.event_id,
-            nav.role,
-            open.join("/")
-        );
-    }
-    let open: Vec<&str> = WALK_DELTA
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| walk[*i])
-        .map(|(_, n)| n.1)
-        .collect();
-    if open.is_empty() {
-        "overworld stuck — confirm nearby or menu".into()
-    } else {
-        format!("explore — walk {}", open.join("/"))
-    }
-}
 
-fn append_keys_hint(
-    out: &mut String,
-    phase: &str,
-    in_dialog: bool,
-    in_battle: bool,
-    in_menu: bool,
-    nav: &NavInfo,
-    path: &[&'static str],
-) {
-    out.push('[');
-    let mut hints: Vec<&str> = Vec::new();
-    if in_dialog || phase == "dialog" {
-        hints.push("confirm");
-    } else if in_menu || phase == "menu" {
-        hints.extend_from_slice(&["up", "down", "left", "right", "confirm", "menu"]);
-    } else if in_battle || phase == "battle" {
-        hints.extend_from_slice(&["up", "down", "left", "right", "confirm", "menu", "force", "auto", "defend"]);
-    } else if phase == "boot" {
-        hints.push("confirm");
-    } else if nav.can_act {
-        hints.extend_from_slice(&["confirm", "space"]);
-    } else if nav.in_search_range {
-        if let Some(f) = nav.face {
-            hints.push(f);
-        }
-        hints.extend_from_slice(&["confirm", "space"]);
-    } else if let Some(&k) = path.first() {
-        hints.push(k);
-    } else if let Some(k) = nav.key {
-        hints.push(k);
-    } else {
-        hints.extend_from_slice(&["up", "down", "left", "right", "confirm", "space", "menu"]);
-    }
-    for (i, h) in hints.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        out.push('"');
-        out.push_str(h);
-        out.push('"');
-    }
-    out.push(']');
-}
 
 // ---------------------------------------------------------------------------
 // Name helpers
@@ -2273,66 +1523,33 @@ mod tests {
     #[test]
     fn script_rank_dialog_loop_vs_item_delivery() {
         let e = engine();
-        // Aunt "别愣在这里" pure dialog.
         let aunt = analyze_script_progress(&e, 4981);
         assert_eq!(aunt.label, "dialog");
-        assert!(aunt.rank >= 5, "aunt loop rank {}", aunt.rank);
-
-        // Stairs delivery grants 桂花酒 (item 272).
         let stairs = analyze_script_progress(&e, 4885);
         assert_eq!(stairs.label, "item");
-        assert!(stairs.rank <= 1, "stairs rank {}", stairs.rank);
         assert_eq!(stairs.grants_item, Some(272));
-
-        // Nav must prefer item script over nearer dialog loop.
-        assert!(stairs.rank < aunt.rank);
     }
 
     #[test]
-    fn inn_delivery_nav_prefers_stairs_over_aunt() {
+    fn state_is_observation_not_strategy() {
         let mut e = engine();
-        // Reproduce live kitchen progress: aunt loop, dishes taken, stairs open,
-        // nearby free-loot chests already cleared (state 0).
         e.globals.num_scene = 1;
         e.globals.in_main_game = true;
         e.globals.load_flags |= crate::global::LOAD_SCENE | crate::global::LOAD_PLAYER_SPRITE;
         e.load_resources();
-        e.globals.game.event_objects[19].state = 2; // #20 aunt
-        e.globals.game.event_objects[19].trigger_script = 4981;
-        e.globals.game.event_objects[20].state = 0; // #21 table gone
-        e.globals.game.event_objects[15].state = 1; // #16 stairs
-        e.globals.game.event_objects[15].trigger_script = 4885;
-        for id in [22u16, 23, 24] {
-            e.globals.game.event_objects[id as usize - 1].state = 0;
-        }
-
-        // Kitchen-side position (walk-disconnected from #16 stairs).
         e.globals.viewport = (608, 1024);
-        e.globals.partyoffset = (160, 112); // player ≈ (768, 1136)
+        e.globals.partyoffset = (160, 112);
         let json = build_state_json(&e);
-        let nav_snip = json
-            .find("\"nav\"")
-            .map(|i| &json[i.. (i + 280).min(json.len())])
-            .unwrap_or(&json);
-        // #16 is walk-unreachable from the kitchen; nav must pick a door
-        // (#13/#19) instead of spinning on greedy "up" toward the stairs.
-        assert!(
-            !nav_snip.contains("\"event\":16") || nav_snip.contains("\"reachable\":true"),
-            "must not lock onto unreachable #16: {nav_snip}"
-        );
-        assert!(
-            nav_snip.contains("\"event\":19")
-                || nav_snip.contains("\"event\":13")
-                || nav_snip.contains("\"progress\":\"bridge\"")
-                || nav_snip.contains("\"progress\":\"scene\""),
-            "nav should route via a hall door, got: {nav_snip}"
-        );
-        assert!(
-            nav_snip.contains("\"reachable\":true") || nav_snip.contains("\"path\":"),
-            "door route should publish a path: {nav_snip}"
-        );
-        // Aunt remains listed as a dialog loop for clients that scan events[].
-        assert!(json.contains("\"loop\":true") || json.contains("\"progress\":\"dialog\""));
+        // No recommended path / nav / press-hints for the agent to follow blindly.
+        assert!(!json.contains("\"nav\""), "nav must not be published");
+        assert!(!json.contains("\"path\":"), "path must not be published");
+        assert!(!json.contains("\"keys_hint\""), "keys_hint must not be published");
+        assert!(!json.contains("\"hint\""), "hint must not be published");
+        // Still expose facts.
+        assert!(json.contains("\"events\":"));
+        assert!(json.contains("\"player\":"));
+        assert!(json.contains("\"walk\":"));
+        assert!(json.contains("\"actions\":"));
     }
 
     #[test]
