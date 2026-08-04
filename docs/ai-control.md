@@ -89,10 +89,15 @@ RUSTPAL_UI_STEP_STRICT=1 ./target/release/rustpal --console --ui-driver --ui-ste
 | `in_battle` | 战斗中；见 `battle` |
 | `player` / `viewport` / `walk` | 坐标与四向可走 |
 | `events` / `inventory` / `party` / `battle` | 世界与战斗信息 |
-| `keys_hint` | 短建议键列表（动作表见本文档，**不在 state 里重复**） |
+| `keys_hint` | 当前阶段建议键（短） |
+| `actions` | **合法键名全集**（每帧带上，避免 Agent 必须查文档） |
 | `quit_requested` | 结束 |
 
-**Token 原则：** 有信息量、不重复。布尔 `in_dialog`/`in_menu` 已去掉——用 `dialog`/`menu` 是否为 null 即可。
+**Token 原则：** 有信息量、少重复。  
+- `dialog` 只保留一个字符串；`menu` 不重复 selected 标签。  
+- **保留 `actions[]`**：模型每轮只看 state 就能知道能按什么键。  
+- **不带 `party_offset`**：脚底世界坐标是 `player`；需要时  
+  `party_offset ≈ player - viewport`（屏幕上人物相对视口的偏移，一般 AI 不用）。
 
 #### `dialog`（对话正文，单字段）
 
@@ -296,7 +301,7 @@ loop:
 4. **overworld** → `walk` + `events`  
 5. 尽量只依赖 state；PNG 仅在看不懂时取  
 
-键名表见本文档，**不要**指望 state 每帧带完整 actions 列表。
+合法键名见每帧 state 的 `actions[]`；当前建议键见 `keys_hint`。
 
 ---
 

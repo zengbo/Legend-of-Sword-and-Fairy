@@ -172,10 +172,17 @@ pub(crate) fn build_state_json(engine: &Engine) -> String {
         out.push_str("null");
     }
 
-    // Short key hints only (static action vocab lives in docs/ai-control.md).
+    // Context-sensitive suggestions + full legal key vocabulary (so agents need
+    // not re-read docs every turn).
     out.push(',');
     out.push_str("\"keys_hint\":");
     append_keys_hint(&mut out, phase, in_dialog, in_battle, in_menu);
+    out.push(',');
+    out.push_str(
+        "\"actions\":[\"up\",\"down\",\"left\",\"right\",\"confirm\",\"space\",\"menu\",\
+         \"force\",\"auto\",\"defend\",\"use_item\",\"throw_item\",\"flee\",\"status\",\
+         \"repeat\",\"page_up\",\"page_down\",\"home\",\"end\"]",
+    );
 
     out.push('}');
     out.push('\n');
