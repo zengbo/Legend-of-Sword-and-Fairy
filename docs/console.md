@@ -42,7 +42,10 @@ Needs the `pal/` data directory (same as GUI).
 
 **Kitty:** always sends **320×200** pixels; the terminal stretches them with the
 graphics-protocol `c=` (column) placement — large and fast (no multi‑MB
-upscaled bitmaps that froze the loop).
+upscaled bitmaps that froze the loop). Default width fills the terminal but is
+also capped so the image fits the **available rows** (no bottom clip). Help text
+is printed on the primary screen before enter alt buffer — the game uses the
+full alt screen unless `RUSTPAL_CONSOLE_FPS=1` reserves the top row.
 
 **ANSI:** small integer upscale (1–3×) + half-block cells.
 

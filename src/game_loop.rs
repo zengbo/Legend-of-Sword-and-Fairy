@@ -846,11 +846,13 @@ impl Engine {
             scene: Default::default(),
             play: Default::default(),
         };
+        // PAL_InitUI: load DATA.MKF UI sprites (digit frames, boxes, cursors,
+        // item portrait frame, dialog icons). Without this, Chinese font text
+        // still draws but every blit_ui_frame no-ops — shop prices, cash
+        // amounts, menu boxes, and cursors all disappear.
+        engine.init_ui()?;
         // Headless engines (tests, tools) must never block on input.
         engine.ui.auto_confirm = headless;
-        // PAL_InitUI: load gpSpriteUI / dialog icons. Without this, menu boxes,
-        // numbers, the item picture frame, and dialog wait icons never blit.
-        engine.init_ui()?;
         // Create the window/terminal right away so the first present works.
         engine.process_event();
         Ok(engine)
@@ -906,8 +908,7 @@ impl Engine {
             scene: Default::default(),
             play: Default::default(),
         };
-        // PAL_InitUI: load gpSpriteUI / dialog icons. Without this, menu boxes,
-        // numbers, the item picture frame, and dialog wait icons never blit.
+        // Same as native build: load UI sprites (digits, boxes, cursors, …).
         engine.init_ui()?;
         engine.process_event();
         Ok(engine)

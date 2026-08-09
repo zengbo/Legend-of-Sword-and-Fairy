@@ -70,6 +70,9 @@ pub struct ConsoleVideo {
     place_cols: u32,
     /// ANSI only: integer nearest-neighbor scale (1–3).
     ansi_scale: u32,
+    /// 1-based terminal row where the game image starts. Row 1 is full-bleed;
+    /// row 2 leaves the top line free for the optional FPS banner.
+    image_row: u32,
     rgba: Vec<u8>,
     scaled: Vec<u8>,
     prev_rgba: Vec<u8>,
@@ -233,10 +236,15 @@ impl ConsoleVideo {
             ConsoleMode::Ansi => false,
             ConsoleMode::Auto => detect_kitty(),
         };
-        let (place_cols, ansi_scale) = resolve_display_size(use_kitty);
         let over_ssh = is_over_ssh();
         let show_fps = env_flag_enabled("RUSTPAL_CONSOLE_FPS")
             || env_flag_enabled("RUSTPAL_SHOW_FPS");
+        // Keep the top terminal row free only when the FPS banner is on.
+        // Otherwise place the game full-bleed from row 1 so a default-wide
+        // Kitty image is not clipped at the bottom by a one-line help bar.
+        let image_row = if show_fps { 2 } else { 1 };
+        let reserve_top = u32::from(show_fps);
+        let (place_cols, ansi_scale) = resolve_display_size(use_kitty, reserve_top);
 
         #[cfg(unix)]
         let (key_rx, tty_guard) = spawn_tty_reader()?;
@@ -261,8 +269,13 @@ impl ConsoleVideo {
         };
         let ssh_note = if over_ssh { " · SSH" } else { "" };
         let fps_note = if show_fps { " · FPS on" } else { "" };
+        // Help/controls live on the primary screen only — printing them inside
+        // the alt buffer permanently steals a row and clips a full-height frame.
         eprintln!(
             "rustpal: console backend ready ({label}, place_cols={place_cols}, ansi_scale={ansi_scale}, ssh={over_ssh}, fps={show_fps})"
+        );
+        eprintln!(
+            "rustpal console ({label} · {size_note}{ssh_note}{fps_note}) — arrows/hjkl · Enter · Esc · Ctrl-C restores terminal & quits"
         );
         if !env_flag_enabled("RUSTPAL_CONSOLE_VERBOSE") {
             match std::env::var("RUSTPAL_CONSOLE_LOG") {
@@ -278,12 +291,8 @@ impl ConsoleVideo {
         }
 
         let mut out = io::stdout();
-        // Alternate screen once.
+        // Alternate screen once — no status line on row 1 unless FPS is enabled.
         write!(out, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
-        writeln!(
-            out,
-            "\x1b[36mrustpal console ({label} · {size_note}{ssh_note}{fps_note}) — arrows/hjkl · Enter · Esc · Ctrl-C restores terminal & quits\x1b[0m"
-        )?;
         out.flush()?;
 
         #[cfg(unix)]
@@ -305,6 +314,7 @@ impl ConsoleVideo {
             over_ssh,
             place_cols,
             ansi_scale,
+            image_row,
             rgba: vec![0; SCREEN_W * SCREEN_H * 4],
             scaled: vec![0; scaled_len],
             prev_rgba: Vec::new(),
@@ -428,7 +438,7 @@ impl ConsoleVideo {
             // Always a=T with the same image id + placement. (a=t-only updates
             // did not repaint on several Kitty versions → black screen.)
             if first {
-                let _ = write!(out, "\x1b[2;1H");
+                let _ = write!(out, "\x1b[{};1H", self.image_row);
             }
             if let Err(e) = write_kitty_frame(
                 &mut out,
@@ -453,12 +463,12 @@ impl ConsoleVideo {
                     self.scaled.as_slice(),
                 )
             };
-            let _ = write_ansi_halfblock(&mut out, fw, fh, frame);
+            let _ = write_ansi_halfblock(&mut out, fw, fh, frame, self.image_row);
         }
 
         if self.show_fps {
             self.note_displayed_frame(now);
-            // Status line (row 1): keep help text short, append FPS on the right.
+            // Status line on the reserved top row (image starts at row 2).
             let _ = write!(
                 out,
                 "\x1b[1;1H\x1b[36mrustpal\x1b[0m  \x1b[33m{:>5.1} FPS\x1b[0m\x1b[K",
@@ -720,30 +730,37 @@ fn detect_kitty() -> bool {
 }
 
 /// Returns (kitty place_cols, ansi_scale).
-fn resolve_display_size(use_kitty: bool) -> (u32, u32) {
-    let (cols, rows) = terminal_size().unwrap_or((100, 30));
+///
+/// `reserve_top` is the number of terminal rows kept free above the game
+/// image (0 = full-bleed, 1 = FPS banner).
+fn resolve_display_size(use_kitty: bool, reserve_top: u32) -> (u32, u32) {
+    let (cols, rows, cell) = terminal_geometry().unwrap_or((100, 30, None));
     let manual = std::env::var("RUSTPAL_CONSOLE_SCALE")
         .ok()
         .and_then(|s| s.parse::<u32>().ok());
+    let avail_rows = rows.saturating_sub(reserve_top).max(1);
 
     if use_kitty {
         // `c=` columns: fill most of the terminal width. Manual scale N means
         // roughly N*40 cells (so 4 ≈ 160 cols, 6 ≈ 240).
-        let place = if let Some(n) = manual {
+        let want = if let Some(n) = manual {
             (n.clamp(1, 16) * 40).min(cols.saturating_sub(2).max(20))
         } else {
             cols.saturating_sub(2).clamp(40, 240)
         };
-        // Also leave room vertically: 320:200 → cells tall ≈ place * 200/320
-        // with ~half-width cells; Kitty preserves image aspect when only c= set.
-        let _ = rows;
+        // Kitty preserves aspect when only `c=` is set, so a full-width frame
+        // can be taller than the terminal (bottom clipped). Cap by available
+        // rows using cell pixel size when known.
+        let max_by_rows = max_kitty_cols_for_rows(avail_rows, cell);
+        let place = want.min(max_by_rows).clamp(20, 240);
         (place, 1)
     } else {
         let scale = if let Some(n) = manual {
             n.clamp(1, 3)
         } else {
             let max_cols = cols.saturating_sub(2).max(1);
-            let max_rows = rows.saturating_sub(3).max(1);
+            // Half-block cells: one terminal row ≈ 2 source pixels.
+            let max_rows = avail_rows.saturating_sub(1).max(1);
             let sx = max_cols / SCREEN_W as u32;
             let sy = max_rows / ((SCREEN_H as u32) / 2);
             sx.min(sy).clamp(1, 3)
@@ -752,7 +769,24 @@ fn resolve_display_size(use_kitty: bool) -> (u32, u32) {
     }
 }
 
-fn terminal_size() -> Option<(u32, u32)> {
+/// Largest Kitty `c=` that still fits in `avail_rows` at 320×200 aspect.
+///
+/// With only `c=` set, display height in cells is:
+/// `rows ≈ c * (cell_w / cell_h) * (200 / 320)`.
+fn max_kitty_cols_for_rows(avail_rows: u32, cell: Option<(u32, u32)>) -> u32 {
+    let (cw, ch) = cell.unwrap_or((1, 2)); // typical monospace ~1:2
+    if avail_rows == 0 || cw == 0 || ch == 0 {
+        return 240;
+    }
+    // place * cw / ch * SCREEN_H / SCREEN_W <= avail_rows
+    // place <= avail_rows * ch * SCREEN_W / (cw * SCREEN_H)
+    let num = avail_rows as u64 * ch as u64 * SCREEN_W as u64;
+    let den = cw as u64 * SCREEN_H as u64;
+    (num / den.max(1)).max(20) as u32
+}
+
+/// `(cols, rows, optional (cell_w_px, cell_h_px))`.
+fn terminal_geometry() -> Option<(u32, u32, Option<(u32, u32)>)> {
     #[cfg(unix)]
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
@@ -760,7 +794,16 @@ fn terminal_size() -> Option<(u32, u32)> {
             && ws.ws_col > 0
             && ws.ws_row > 0
         {
-            return Some((ws.ws_col as u32, ws.ws_row as u32));
+            let cols = ws.ws_col as u32;
+            let rows = ws.ws_row as u32;
+            let cell = if ws.ws_xpixel > 0 && ws.ws_ypixel > 0 {
+                let cw = (ws.ws_xpixel as u32 / cols).max(1);
+                let ch = (ws.ws_ypixel as u32 / rows).max(1);
+                Some((cw, ch))
+            } else {
+                None
+            };
+            return Some((cols, rows, cell));
         }
     }
     let cols = std::env::var("COLUMNS")
@@ -770,7 +813,7 @@ fn terminal_size() -> Option<(u32, u32)> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(24);
-    Some((cols, rows))
+    Some((cols, rows, None))
 }
 
 fn nearest_upscale(src: &[u8], sw: usize, sh: usize, scale: u32, dst: &mut [u8]) {
@@ -872,12 +915,14 @@ fn write_ansi_halfblock(
     width: usize,
     height: usize,
     rgba: &[u8],
+    image_row: u32,
 ) -> io::Result<()> {
     let rows = height / 2;
+    let origin = image_row.max(1);
     for cy in 0..rows {
         let y0 = cy * 2;
         let y1 = y0 + 1;
-        write!(out, "\x1b[{};1H", cy + 2)?;
+        write!(out, "\x1b[{};1H", origin + cy as u32)?;
         for x in 0..width {
             let t = pixel(rgba, width, x, y0);
             let b = pixel(rgba, width, x, y1);
@@ -910,6 +955,16 @@ mod tests {
         assert!(s.contains("c=80"), "{s}");
         assert!(s.contains("a=T"), "{s}");
         assert!(s.contains("i=1"), "{s}");
+    }
+
+    #[test]
+    fn max_kitty_cols_respects_available_rows() {
+        // 1×2 cells, 40 rows free → place ≤ 40 * 2 * 320 / (1 * 200) = 128
+        assert_eq!(max_kitty_cols_for_rows(40, Some((1, 2))), 128);
+        // Fewer rows → tighter width cap.
+        assert_eq!(max_kitty_cols_for_rows(20, Some((1, 2))), 64);
+        // Fallback cell aspect still returns a usable value.
+        assert!(max_kitty_cols_for_rows(10, None) >= 20);
     }
 
     #[test]

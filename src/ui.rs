@@ -253,6 +253,11 @@ impl Engine {
     // =======================================================================
 
     /// PAL_InitUI: load the UI sprite and the dialog waiting icons.
+    ///
+    /// Must run once during engine startup (`Engine::build`). Without it,
+    /// `blit_ui_frame` / `draw_number` / `create_box` all silently no-op
+    /// (empty `sprite_ui`), while Big5 font text still draws — menus look
+    /// like “labels only, no numbers or frames”.
     pub fn init_ui(&mut self) -> std::io::Result<()> {
         self.ui.sprite_ui = self
             .globals
@@ -264,6 +269,14 @@ impl Engine {
             .files
             .data
             .chunk_decompressed(CHUNKNUM_DIALOGICONS)?;
+        debug_assert!(
+            surface::sprite_frame_count(&self.ui.sprite_ui) > 70,
+            "UI sprite sheet missing frames after init_ui"
+        );
+        debug_assert!(
+            surface::sprite_frame_count(&self.ui.dialog_icons) > 0,
+            "dialog icon sprite empty after init_ui"
+        );
         Ok(())
     }
 
@@ -280,6 +293,10 @@ impl Engine {
 
     /// Blit frame `n` of gpSpriteUI to the work surface (PAL_RLEBlitToSurface).
     fn blit_ui_frame(&mut self, n: usize, x: i32, y: i32) {
+        debug_assert!(
+            !self.ui.sprite_ui.is_empty(),
+            "blit_ui_frame({n}) with empty sprite_ui — call init_ui() at startup"
+        );
         if let Some(f) = surface::sprite_frame(&self.ui.sprite_ui, n) {
             self.screen.blit_rle(f, x, y);
         }
