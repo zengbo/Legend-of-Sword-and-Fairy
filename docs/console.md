@@ -22,6 +22,10 @@ cargo build --release
 # Kitty size: --console-scale=N ≈ N×40 terminal columns (e.g. 4 → ~160 cols)
 ./target/release/rustpal --console --console-scale=5
 
+# Kitty NN pre-scale: auto pixel-aligns to cell size when known; override if needed
+RUSTPAL_CONSOLE_KITTY_NN=4 ./target/release/rustpal --console=kitty
+# RUSTPAL_CONSOLE_KITTY_NN=1  # raw 320×200
+
 # Show FPS on the top status line (displayed frames / wall time, ~0.5s window)
 RUSTPAL_CONSOLE_FPS=1 ./target/release/rustpal --console=kitty
 # alias: RUSTPAL_SHOW_FPS=1
@@ -40,12 +44,17 @@ RUSTPAL_CONSOLE_FPS=1 ./target/release/rustpal --console=kitty
 
 Needs the `pal/` data directory (same as GUI).
 
-**Kitty:** always sends **320×200** pixels; the terminal stretches them with the
-graphics-protocol `c=` (column) placement — large and fast (no multi‑MB
-upscaled bitmaps that froze the loop). Default width fills the terminal but is
-also capped so the image fits the **available rows** (no bottom clip). Help text
-is printed on the primary screen before enter alt buffer — the game uses the
-full alt screen unless `RUSTPAL_CONSOLE_FPS=1` reserves the top row.
+**Kitty:** nearest-neighbor upscales the logical **320×200** frame **before**
+transmit, then sizes with graphics-protocol `c=` (columns). When the terminal
+reports cell pixel size (`TIOCGWINSZ` xpixel/ypixel), **NN factor and `c=` are
+chosen together** so on-screen width ≈ `320×NN` pixels — Kitty scales near
+**1:1** instead of soft-stretching a mismatched bitmap. Without cell metrics,
+fallback is **4×** local / **3×** SSH. Override NN with
+`RUSTPAL_CONSOLE_KITTY_NN=1..8` (`1` = raw 320×200); columns still snap toward
+1:1 for that scale. Width is capped so the image fits the **available rows**
+(no bottom clip). Help text is printed on the primary screen before enter alt
+buffer — the game uses the full alt screen unless `RUSTPAL_CONSOLE_FPS=1`
+reserves the top row. Startup log shows `1:1` or `near` and cell size when known.
 
 **ANSI:** small integer upscale (1–3×) + half-block cells.
 

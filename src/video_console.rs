@@ -1,7 +1,10 @@
 //! Pure terminal video backend (no window, no system graphics/audio libs).
 //!
-//! * **Kitty** — transmit native 320×200 RGBA; size on screen with protocol
-//!   `c=` (columns). The terminal scales the image (fast, no huge bitmaps).
+//! * **Kitty** — nearest-neighbor upscale the logical 320×200 frame, then
+//!   transmit; on-screen size uses protocol `c=` (columns). The NN factor and
+//!   `c=` are **pixel-aligned** to the terminal cell size when known, so Kitty
+//!   scales ~1:1 instead of soft-stretching. Override NN with
+//!   `RUSTPAL_CONSOLE_KITTY_NN=1..8` (`1` = raw 320×200).
 //! * **ANSI** — half-block truecolor cells, modest integer upscale.
 //!
 //! Input is read on a **background thread** from `/dev/tty` so keys (and a
@@ -68,6 +71,10 @@ pub struct ConsoleVideo {
     over_ssh: bool,
     /// Kitty: display width in terminal cells (`c=`). Aspect preserved by Kitty.
     place_cols: u32,
+    /// Kitty: integer nearest-neighbor scale applied *before* transmit (1 = raw
+    /// 320×200; default 4 local / 3 SSH). Keeps pixel edges hard when Kitty
+    /// resizes to `place_cols`.
+    kitty_nn_scale: u32,
     /// ANSI only: integer nearest-neighbor scale (1–3).
     ansi_scale: u32,
     /// 1-based terminal row where the game image starts. Row 1 is full-bleed;
@@ -244,7 +251,10 @@ impl ConsoleVideo {
         // Kitty image is not clipped at the bottom by a one-line help bar.
         let image_row = if show_fps { 2 } else { 1 };
         let reserve_top = u32::from(show_fps);
-        let (place_cols, ansi_scale) = resolve_display_size(use_kitty, reserve_top);
+        let layout = resolve_console_layout(use_kitty, over_ssh, reserve_top);
+        let place_cols = layout.place_cols;
+        let kitty_nn_scale = layout.kitty_nn_scale;
+        let ansi_scale = layout.ansi_scale;
 
         #[cfg(unix)]
         let (key_rx, tty_guard) = spawn_tty_reader()?;
@@ -258,7 +268,24 @@ impl ConsoleVideo {
 
         let label = if use_kitty { "Kitty" } else { "ANSI" };
         let size_note = if use_kitty {
-            format!("{place_cols} cols wide")
+            let src_w = SCREEN_W as u32 * kitty_nn_scale;
+            let src_h = SCREEN_H as u32 * kitty_nn_scale;
+            match layout.cell {
+                Some((cw, ch)) => {
+                    let disp_w = place_cols * cw;
+                    let align = if disp_w == src_w {
+                        "1:1"
+                    } else {
+                        "near"
+                    };
+                    format!(
+                        "nn {kitty_nn_scale}× → {src_w}×{src_h}, {place_cols} cols ({disp_w}px, cell {cw}×{ch}, {align})"
+                    )
+                }
+                None => format!(
+                    "nn {kitty_nn_scale}× → {src_w}×{src_h}, {place_cols} cols wide"
+                ),
+            }
         } else {
             format!(
                 "{}× → {}×{}",
@@ -272,7 +299,7 @@ impl ConsoleVideo {
         // Help/controls live on the primary screen only — printing them inside
         // the alt buffer permanently steals a row and clips a full-height frame.
         eprintln!(
-            "rustpal: console backend ready ({label}, place_cols={place_cols}, ansi_scale={ansi_scale}, ssh={over_ssh}, fps={show_fps})"
+            "rustpal: console backend ready ({label}, place_cols={place_cols}, kitty_nn={kitty_nn_scale}, ansi_scale={ansi_scale}, ssh={over_ssh}, fps={show_fps})"
         );
         eprintln!(
             "rustpal console ({label} · {size_note}{ssh_note}{fps_note}) — arrows/hjkl · Enter · Esc · Ctrl-C restores terminal & quits"
@@ -303,8 +330,10 @@ impl ConsoleVideo {
         #[cfg(unix)]
         let stderr_guard = StderrRedirect::install()?;
 
+        // Shared NN buffer: Kitty (default 3×/4×) or ANSI (1–3×).
         let scaled_len = if use_kitty {
-            0
+            let s = kitty_nn_scale.max(1) as usize;
+            SCREEN_W * SCREEN_H * 4 * s * s
         } else {
             (SCREEN_W * SCREEN_H * 4) * (ansi_scale as usize).pow(2)
         };
@@ -313,6 +342,7 @@ impl ConsoleVideo {
             use_kitty,
             over_ssh,
             place_cols,
+            kitty_nn_scale,
             ansi_scale,
             image_row,
             rgba: vec![0; SCREEN_W * SCREEN_H * 4],
@@ -435,6 +465,19 @@ impl ConsoleVideo {
         }
 
         if self.use_kitty {
+            // Nearest-neighbor first so Kitty scales a *sharp* high-res bitmap
+            // instead of bilinear-stretching 320×200 (looks soft/blurry).
+            let nn = self.kitty_nn_scale.max(1);
+            let (fw, fh, frame) = if nn <= 1 {
+                (SCREEN_W as u32, SCREEN_H as u32, self.rgba.as_slice())
+            } else {
+                nearest_upscale(&self.rgba, SCREEN_W, SCREEN_H, nn, &mut self.scaled);
+                (
+                    SCREEN_W as u32 * nn,
+                    SCREEN_H as u32 * nn,
+                    self.scaled.as_slice(),
+                )
+            };
             // Always a=T with the same image id + placement. (a=t-only updates
             // did not repaint on several Kitty versions → black screen.)
             if first {
@@ -443,9 +486,9 @@ impl ConsoleVideo {
             if let Err(e) = write_kitty_frame(
                 &mut out,
                 IMAGE_ID,
-                SCREEN_W as u32,
-                SCREEN_H as u32,
-                &self.rgba,
+                fw,
+                fh,
+                frame,
                 self.place_cols,
             ) {
                 // Goes to redirected stderr (file or /dev/null) — never the alt screen.
@@ -729,11 +772,21 @@ fn detect_kitty() -> bool {
         || prog.eq_ignore_ascii_case("iTerm.app")
 }
 
-/// Returns (kitty place_cols, ansi_scale).
+/// Resolved console geometry for one backend.
+struct ConsoleLayout {
+    place_cols: u32,
+    kitty_nn_scale: u32,
+    ansi_scale: u32,
+    /// Terminal cell size in pixels when `TIOCGWINSZ` reports xpixel/ypixel.
+    cell: Option<(u32, u32)>,
+}
+
+/// Pick Kitty `c=` and NN scale, or ANSI scale.
 ///
-/// `reserve_top` is the number of terminal rows kept free above the game
-/// image (0 = full-bleed, 1 = FPS banner).
-fn resolve_display_size(use_kitty: bool, reserve_top: u32) -> (u32, u32) {
+/// For Kitty, when cell pixels are known we choose NN and columns so the
+/// **on-screen width in pixels ≈ 320×NN**, which keeps Kitty’s resampler near
+/// 1:1 (hard pixel edges) instead of bilinear-stretching a mismatched size.
+fn resolve_console_layout(use_kitty: bool, over_ssh: bool, reserve_top: u32) -> ConsoleLayout {
     let (cols, rows, cell) = terminal_geometry().unwrap_or((100, 30, None));
     let manual = std::env::var("RUSTPAL_CONSOLE_SCALE")
         .ok()
@@ -741,19 +794,27 @@ fn resolve_display_size(use_kitty: bool, reserve_top: u32) -> (u32, u32) {
     let avail_rows = rows.saturating_sub(reserve_top).max(1);
 
     if use_kitty {
-        // `c=` columns: fill most of the terminal width. Manual scale N means
-        // roughly N*40 cells (so 4 ≈ 160 cols, 6 ≈ 240).
+        // Desired width in columns before pixel alignment.
         let want = if let Some(n) = manual {
             (n.clamp(1, 16) * 40).min(cols.saturating_sub(2).max(20))
         } else {
             cols.saturating_sub(2).clamp(40, 240)
         };
-        // Kitty preserves aspect when only `c=` is set, so a full-width frame
-        // can be taller than the terminal (bottom clipped). Cap by available
-        // rows using cell pixel size when known.
         let max_by_rows = max_kitty_cols_for_rows(avail_rows, cell);
-        let place = want.min(max_by_rows).clamp(20, 240);
-        (place, 1)
+        let place_want = want.min(max_by_rows).clamp(20, 240);
+        let (place_cols, kitty_nn_scale) = align_kitty_nn_and_place(
+            place_want,
+            max_by_rows.min(240).max(20),
+            cell,
+            over_ssh,
+            kitty_nn_env_override(),
+        );
+        ConsoleLayout {
+            place_cols,
+            kitty_nn_scale,
+            ansi_scale: 1,
+            cell,
+        }
     } else {
         let scale = if let Some(n) = manual {
             n.clamp(1, 3)
@@ -765,8 +826,93 @@ fn resolve_display_size(use_kitty: bool, reserve_top: u32) -> (u32, u32) {
             let sy = max_rows / ((SCREEN_H as u32) / 2);
             sx.min(sy).clamp(1, 3)
         };
-        (cols, scale)
+        ConsoleLayout {
+            place_cols: cols,
+            kitty_nn_scale: 1,
+            ansi_scale: scale,
+            cell,
+        }
     }
+}
+
+/// Explicit `RUSTPAL_CONSOLE_KITTY_NN` if set and valid.
+fn kitty_nn_env_override() -> Option<u32> {
+    std::env::var("RUSTPAL_CONSOLE_KITTY_NN")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|n| n.clamp(1, 8))
+}
+
+/// Choose `(place_cols, nn)` so transmitted `320×nn` is as close as possible to
+/// `place_cols × cell_w` on screen (Kitty 1:1 / integer-ish scale).
+///
+/// * `nn_override` (from `RUSTPAL_CONSOLE_KITTY_NN`) forces NN; columns still
+///   snap toward 1:1.
+/// * Without cell metrics: place stays at `place_want`, NN defaults 4 / SSH 3.
+fn align_kitty_nn_and_place(
+    place_want: u32,
+    max_place: u32,
+    cell: Option<(u32, u32)>,
+    over_ssh: bool,
+    nn_override: Option<u32>,
+) -> (u32, u32) {
+    let max_place = max_place.max(20);
+    let place_want = place_want.clamp(20, max_place);
+    let nn_env = nn_override.map(|n| n.clamp(1, 8));
+
+    let Some((cw, _ch)) = cell.filter(|(w, h)| *w > 0 && *h > 0) else {
+        let nn = nn_env.unwrap_or(if over_ssh { 3 } else { 4 });
+        return (place_want, nn);
+    };
+
+    if let Some(nn) = nn_env {
+        let place = place_cols_for_src_width(SCREEN_W as u32 * nn, cw, max_place);
+        return (place, nn);
+    }
+
+    // Prefer a 1:1 placement whose column count is closest to `place_want`.
+    // Among equal distance, prefer larger image (sharper on big terminals).
+    let mut best: Option<(u32, u32, u32)> = None; // (col_dist, nn, place) — min dist, then max nn
+    for nn in 1..=8u32 {
+        let place = place_cols_for_src_width(SCREEN_W as u32 * nn, cw, max_place);
+        // Reject placements that would force heavy soft scale (>12.5% width error).
+        let disp_w = place as u64 * cw as u64;
+        let src_w = SCREEN_W as u64 * nn as u64;
+        let err = disp_w.abs_diff(src_w);
+        if err * 8 > src_w {
+            continue;
+        }
+        let dist = place.abs_diff(place_want);
+        let cand = (dist, nn, place);
+        let take = match best {
+            None => true,
+            Some(b) => {
+                // Lower column distance wins; tie-break: higher nn (more source pixels).
+                cand.0 < b.0 || (cand.0 == b.0 && cand.1 > b.1)
+            }
+        };
+        if take {
+            best = Some(cand);
+        }
+    }
+
+    if let Some((_dist, nn, place)) = best {
+        return (place, nn);
+    }
+
+    // Fallback: NN from wanted display width, snap columns.
+    let display_w = place_want as u64 * cw as u64;
+    let nn = ((display_w + SCREEN_W as u64 / 2) / SCREEN_W as u64)
+        .clamp(1, 8) as u32;
+    let place = place_cols_for_src_width(SCREEN_W as u32 * nn, cw, max_place);
+    (place, nn)
+}
+
+/// Columns `c` such that `c * cell_w ≈ src_w`, clamped to `[20, max_place]`.
+fn place_cols_for_src_width(src_w: u32, cell_w: u32, max_place: u32) -> u32 {
+    let cell_w = cell_w.max(1) as u64;
+    let place = ((src_w as u64 + cell_w / 2) / cell_w).max(1) as u32;
+    place.clamp(20, max_place.max(20))
 }
 
 /// Largest Kitty `c=` that still fits in `avail_rows` at 320×200 aspect.
@@ -981,5 +1127,60 @@ mod tests {
         let mut dst = vec![0u8; 4 * 4 * 4];
         nearest_upscale(&src, 2, 2, 2, &mut dst);
         assert_eq!(&dst[0..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn nearest_upscale_4x_logical_frame_size() {
+        // Matches the Kitty default path: 320×200 → 1280×800.
+        let src = vec![0u8; SCREEN_W * SCREEN_H * 4];
+        let mut dst = vec![0u8; SCREEN_W * SCREEN_H * 4 * 16];
+        nearest_upscale(&src, SCREEN_W, SCREEN_H, 4, &mut dst);
+        assert_eq!(dst.len(), 1280 * 800 * 4);
+    }
+
+    #[test]
+    fn place_cols_rounds_to_src_pixel_width() {
+        // 1280px source, 8px cells → 160 columns.
+        assert_eq!(place_cols_for_src_width(1280, 8, 240), 160);
+        // 960px / 10px → 96 cols.
+        assert_eq!(place_cols_for_src_width(960, 10, 240), 96);
+    }
+
+    #[test]
+    fn align_kitty_picks_1to1_nn_near_want() {
+        // cell 8×16, want 160 cols → 1280px → nn=4, place=160 exact.
+        let (place, nn) = align_kitty_nn_and_place(160, 240, Some((8, 16)), false, None);
+        assert_eq!(nn, 4);
+        assert_eq!(place, 160);
+        assert_eq!(place * 8, 320 * nn);
+    }
+
+    #[test]
+    fn align_kitty_nn_override_snaps_cols() {
+        let (place, nn) =
+            align_kitty_nn_and_place(160, 240, Some((8, 16)), false, Some(2));
+        assert_eq!(nn, 2);
+        // 640px / 8 = 80 cols (1:1 for nn=2, not full 160).
+        assert_eq!(place, 80);
+        assert_eq!(place * 8, 320 * nn);
+    }
+
+    #[test]
+    fn align_kitty_without_cell_uses_defaults() {
+        let (place, nn) = align_kitty_nn_and_place(120, 240, None, false, None);
+        assert_eq!(place, 120);
+        assert_eq!(nn, 4);
+        let (place_ssh, nn_ssh) = align_kitty_nn_and_place(120, 240, None, true, None);
+        assert_eq!(place_ssh, 120);
+        assert_eq!(nn_ssh, 3);
+    }
+
+    #[test]
+    fn align_kitty_prefers_want_width_among_1to1() {
+        // cell 10×20, want 100 cols → 1000px. nn=3 → 960px → place=96 (near 100).
+        let (place, nn) = align_kitty_nn_and_place(100, 240, Some((10, 20)), false, None);
+        assert_eq!(nn, 3);
+        assert_eq!(place, 96);
+        assert_eq!(place * 10, 320 * nn);
     }
 }
