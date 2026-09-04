@@ -951,15 +951,15 @@ impl Engine {
 
     /// Milliseconds since engine start (SDL_GetTicks equivalent).
     ///
-    /// When the UI driver is in **step mode** (`RUSTPAL_UI_STEP` / `--ui-step`),
-    /// this is a virtual clock advanced only by `POST /v1/step`.
+    /// With the UI driver installed, uses the driver's clock (realtime or
+    /// step-gated via `POST /v1/config`). Otherwise wall time from `start`.
     pub fn ticks(&self) -> u64 {
         #[cfg(all(
             not(target_arch = "wasm32"),
             any(feature = "gui", feature = "console")
         ))]
-        if crate::ui_driver::step_mode_enabled() {
-            return crate::ui_driver::virtual_ticks().saturating_mul(self.tick_scale.max(1));
+        if let Some(ms) = crate::ui_driver::driver_ticks_ms() {
+            return ms.saturating_mul(self.tick_scale.max(1));
         }
         (self.start.elapsed().as_millis() as u64).saturating_mul(self.tick_scale)
     }
@@ -975,17 +975,23 @@ impl Engine {
             crate::ui_driver::publish_party_inventory_json(
                 crate::agent_state::build_party_json(self),
                 crate::agent_state::build_inventory_json(self),
+                crate::agent_state::build_obstacles_json(self),
             );
         }
     }
 
     /// PAL_ProcessEvent: pump window events and update the input state.
     pub fn process_event(&mut self) {
+        let now = self.ticks();
         if let Some(video) = self.video.as_mut() {
             for event in video.pump() {
                 match event {
                     KeyEvent::State { code, pressed } => {
-                        self.input.handle_key_event(code, pressed)
+                        self.input.handle_key_event(code, pressed);
+                        // Apply each edge immediately so press+release in one
+                        // pump (HTTP `tap`) still generates a key_down before
+                        // key_up. Critical for step-gating AI control.
+                        self.input.update_keyboard_state(now);
                     }
                     KeyEvent::Tap(code) => self.input.handle_key_tap(code),
                 }
@@ -996,7 +1002,6 @@ impl Engine {
         }
         // Keep the web audio ring topped up (no-op natively when cpal renders
         // in its own callback thread; the offline mixer renders up to `now`).
-        let now = self.ticks();
         if let Some(audio) = self.audio.as_ref() {
             audio.pump(now);
         }
@@ -1008,6 +1013,7 @@ impl Engine {
                 self.autopilot = Some(pilot);
             }
         }
+        // Repeat/held-key polling for keys still down.
         self.input.update_keyboard_state(now);
         self.publish_ui_driver_state();
     }

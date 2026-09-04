@@ -46,7 +46,7 @@
 | 字段 | 用法 |
 | --- | --- |
 | `frame_id` | 画面更新计数；变大表示有新图 |
-| `step_mode` | `true` = 时间由你步进，必须 `POST /v1/step` 游戏才会走 |
+| `step_mode` / `step_gating` | `true` = 严格步进：时间由你 `POST /v1/step` 推进（运行时用 `/v1/config` 开关） |
 | `ticks` | 游戏内时间（毫秒） |
 
 ### 2.2 `GET /v1/state` — 主观察（轻量，优先）
@@ -58,7 +58,9 @@
 
 | 字段 | 含义 |
 | --- | --- |
-| `phase` | 阶段：`boot` / `dialog` / `menu` / `battle` / `scene_transition` / `overworld` |
+| `phase` | 阶段：`boot` / `title_menu` / `dialog` / `menu` / `battle` / `scene_transition` / `overworld` |
+| `awaiting_input` | 是否在等按键（菜单/对话/未进主游戏的开场） |
+| `boot_stage` | 仅未进主游戏时有：`intro`（开场动画，可用 menu/confirm 跳）/ `title_menu` |
 | `dialog` | 当前对话全文（字符串），无对话为 `null` |
 | `menu` | 当前菜单，无菜单为 `null` |
 | `in_battle` | 是否在战斗 |
@@ -66,13 +68,25 @@
 | `entering_scene` | 是否正在切换场景 |
 | `scene` | 场景编号 |
 | `player` | 队伍位置 `[x, y]`（世界坐标） |
+| **`on_grid`** | 是否在等距走步网格上（`x%16==0` 且 `y%8==0`） |
+| **`grid_snap`** | 仅 `on_grid=false` 时：最近网格点 `[x,y]`（事实，非传送） |
+| **`walk_from_snap`** | 仅 `on_grid=false`：在 `grid_snap` 上的四向是否可走（脱困用） |
 | `viewport` | 镜头位置 `[x, y]` |
 | `party_direction` / `facing` | 朝向 0–3 / 键名 |
 | `walk` | 当前位置四向是否可走一步 |
+| **`step_touch`** | 四向各一步后会进入哪些 touch 区（exit/door id 列表；仅 `walk` 为 true 的方向有意义） |
+| **`in_touch_now`** | 当前站位已处于哪些 touch 区（含 `role`/`touch_radius`/`dest_scene?`） |
+| `facing_note` | 事实：`walk` 为 false 的方向仍会改朝向（不位移） |
+| `walk_span` | 从当前位置 BFS 能走到的格子数（连通区域大小） |
+| `walk_blocked` / `walk_reason` / `trail` / `last_safe` | 卡住/脱困线索（见下） |
+| **`last_safe_steps` / `last_safe_dir` / `last_safe_delta`** | 到 `last_safe` 的步数、几何方向、位移 |
+| **`grid_snap_dir` / `grid_snap_delta`** | 仅 off_grid：朝网格点的几何方向 |
+| `scene_change_exit_id` / `scene_change_from_scene` / `scene_change_dest` | 仅 `entering_scene`：**来源场景**踩到的出口（sticky），不是新场景里最近的出口 |
+| **`last_scene_exit`** | sticky：`{exit_id,from_scene,dest_scene}` 上次站进的出口半径 |
 | **`map`** | **本场景**几何：方向定义、出口、机关、障碍（见下） |
-| `events` | 附近对象（距离截断列表，补充细节） |
+| `events` | 附近对象（距离截断列表，含 `walk_reachable`） |
 | `battle` | 战斗详情；非战斗为 `null` |
-| `resources` | `{party,inventory}` 按需接口路径 |
+| `resources` | `{party,inventory,obstacles}` 按需接口路径 |
 | `actions` | 合法键名词汇表 |
 | `cash` / `playtime_secs` / `quit_requested` / `frame_id` … | 金钱、游玩时间、退出等 |
 
@@ -107,15 +121,22 @@
 - 当前选项 = `items[index]`
 - **上/下/左/右** 移动光标，**confirm** 确认，**menu** 取消
 
-#### 可行走 `walk`
+#### 可行走 `walk` 与卡住信息
 
 ```json
-"walk": {"up": true, "right": false, "down": true, "left": true}
+"walk": {"up": true, "right": false, "down": true, "left": true},
+"step_touch": {"up": [], "right": [50], "down": [], "left": [47]},
+"in_touch_now": [],
+"walk_blocked": false,
+"trail": [[640, 688], [624, 696]],
+"last_safe": [640, 688],
+"last_safe_steps": 2,
+"last_safe_dir": "up"
 ```
 
-只对值为 `true` 的方向移动，避免撞墙。
+只对 `walk` 为 `true` 的方向移动；若 `step_touch[dir]` 非空，该步会触发列出的 touch 事件。
 
-**注意：键名是等距坐标系**，不是屏幕上下左右：
+**键名是等距世界步进**，不是屏幕上下左右：
 
 | 键 | 世界步进 |
 | --- | --- |
@@ -124,66 +145,88 @@
 | `down` | `(-16, +8)` |
 | `left` | `(-16, -8)` |
 
-键名是**等距世界步进**，不是屏幕像素方向。
+当四向都不可走时：
+
+| 字段 | 含义 |
+| --- | --- |
+| `walk_blocked` | `true` = 当前位置一步都走不了 |
+| `walk_reason` | `cornered` / `off_grid` / `dialog` / `menu` / `battle` / `scene_transition` / `boot` … |
+| `trail` | 最近若干世界坐标（回溯线索） |
+| `last_safe` | 轨迹上较可能还能走的位置 |
+| `last_safe_steps` / `last_safe_dir` / `last_safe_delta` | 到 `last_safe` 的 BFS 步数、几何方向、位移 |
+| `grid_snap_dir` / `grid_snap_delta` | off_grid 时朝 `grid_snap` 的几何方向 |
+| `walk_hint` | 卡住 / off_grid 时的简短说明 |
+
+`off_grid`：坐标落在半步（脚本推移后常见）。看 `walk_from_snap` + `grid_snap_dir` + `last_safe`/`last_safe_dir`。
 
 #### 地图 `map`（本场景几何 — 事实，不是路线推荐）
 
 ```json
 "map": {
-  "dirs": {
-    "up":    {"dx": 16, "dy": -8, "world": "(+16,-8)"},
-    "right": {"dx": 16, "dy":  8, "world": "(+16,+8)"},
-    "down":  {"dx":-16, "dy":  8, "world": "(-16,+8)"},
-    "left":  {"dx":-16, "dy": -8, "world": "(-16,-8)"}
-  },
-  "coord_note": "player/events/exits 用世界坐标；一步 = dirs[key]",
+  "dirs": { "up": {"dx":16,"dy":-8}, ... },
   "exits": [
-    {"id": 46, "kind": "touch", "pos": [1472, 1520], "dest_scene": 1, "how": "walk_into", ...}
+    {"id": 46, "dest_scene": 1, "how": "walk_into", "walk_reachable": true, "walk_steps": 3, ...}
   ],
   "mechanisms": [
-    {"id": 20, "kind": "search", "role": "npc", "pos": [...], "how": "face_and_confirm", "progress": "dialog", ...}
+    {"id": 20, "role": "npc", "how": "face_and_confirm", "walk_reachable": false, "face": "down", ...}
   ],
   "obstacles": {
-    "tiles": [[x, y, h], ...],
     "event_blockers": [{"id": 20, "pos": [704, 1072], "state": 2}],
-    "tile_note": "tiles 为地图格 [x,y,h]…"
+    "tiles": "/v1/obstacles",
+    "pathfind_note": "..."
   }
 }
 ```
 
 | 字段 | 含义 |
 | --- | --- |
-| **`dirs`** | 按键 → 世界位移。AI 要用方向键走到某点时，**必须**按此换算（不是屏幕上下） |
-| `coord_note` | 坐标系说明 |
-| **`exits`** | **当前场景**的门/传送点（`dest_scene`）。迷宫只列本房间出口，不列其它房间总出口 |
-| **`mechanisms`** | 本场景需走近/调查的机关、宝箱、NPC 等（非出口）。`how`：`walk_into` 或 `face_and_confirm` |
-| **`obstacles.tiles`** | 当前地图阻挡格 `[tile_x, tile_y, half]`；世界约 `(x*32+h*16, y*16+h*8)` |
-| **`obstacles.event_blockers`** | `state>=2` 的实体挡路（如站着的 NPC） |
+| **`dirs`** | 按键 → 世界位移（寻路必用） |
+| **`exits`** | **仅**含会切场景的门（必有 `dest_scene`）。含 `touch_radius` / `in_touch_range` / `screen` |
+| **`mechanisms`** | 非出口可互动物：`door` / `load_point` / `trigger` / `npc` 等 |
+| **`walk_reachable` / `walk_steps`** | **安全图** BFS：路径不进入任何场景出口的 touch 半径；步数估计 |
+| **`path_crosses_exit` / `walk_steps_any`** | 仅当安全图不可达、但无约束图可达时出现（事实：必经出口半径） |
+| **`exit_detour`** | 当 `path_crosses_exit`：无约束路径会进入的 `blocking_exits[]`，每项带目标场景回本场景的 `return_exits` |
+| **`return_exits`** | 每个 `map.exits[]`：`dest_scene` 里走回本场景的出口列表 |
+| **`touch_radius` / `in_touch_range` / `trigger_mode`** | 所有 touch（exit 与 door）：引擎触发半径与是否已在区内 |
+| **`event_state` / `solid`** | 对象状态位；`solid` 表示挡路实体 |
+| **`screen`** | 相对 `viewport` 的屏幕坐标 `[x,y]`（对齐截图） |
+| **`obstacles.event_blockers`** | `state>=2` 实体挡路（体量小，留在 state） |
+| **`obstacles.tiles`** | 指针 `"/v1/obstacles"` — **整图阻挡格不进 state**（省 token） |
 
-规划路线：`player` + `dirs` + `obstacles` + `exits`/`mechanisms` 自行寻路；引擎**不**给 path。
+**优先用安全图的 `walk_reachable`/`walk_steps`**，不要只靠 `dist`。  
+触碰公式（与引擎一致）：`dist < touch_radius` 时触发，其中 `touch_radius = (trigger_mode-4)*32+16`（`trigger_mode≥4`）。  
+完整阻挡格：仅当需要自建寻路时再 `GET /v1/obstacles`。
 
 #### 事件 `events[]`（附近对象 — 事实，不是推荐列表）
 
-按距离排序，最多约 48 个。**没有**「该去哪个」的排序策略；你自己根据剧情、`progress`、`dest_scene` 等选择。
+按距离排序，最多约 48 个。**没有**「该去哪个」的排序策略。
 
 | 字段 | 含义 |
 | --- | --- |
 | `id` | 对象编号 |
-| `kind` | `search` / `touch` / `scenery` |
-| `role` | 粗分类：`npc` / `exit` / `search` / `trigger` / `decor` |
-| `progress` | 脚本**性质**扫描（非优先级）：`item`/`quest`/`scene`/`dialog`/`battle`/`cash`/`mild`/`none` |
-| `loop` | 可选；`true` = 当前入口像是纯对话循环（事实标注） |
-| `item_use` | 可选；背包里 use 脚本会检查该事件的物品 id（可用道具的事实） |
-| `pos` / `delta` / `dist` | 世界坐标、相对位移、距离度量 |
-| `can_search_now` | **当前朝向**下 confirm 是否命中（引擎格匹配） |
-| `in_search_range` | 任一方位下可调查 |
-| `face` | 若要调查，需要面向的方向（几何事实，不是「请按」） |
-| `in_touch_range` | 是否已在触碰半径内 |
-| `dest_scene` | 可选；脚本会切到的场景号 |
-| `trigger_script` 等 | 脚本/精灵编号（高级） |
+| `kind` | `search` / `touch` |
+| `role` | `exit` / `door` / `load_point` / `npc` / `trigger` |
+| `label` | 可选；脚本对话称呼（如「李大娘」）；**会过滤主角/队员名** |
+| `how` | `walk_into` / `face_and_confirm` |
+| `progress` | 脚本性质：`item`/`quest`/`scene`/`dialog`/… |
+| `loop` | 可选；像纯对话循环 |
+| `item_use` | 可选；相关道具 id |
+| `pos` / `screen` / `delta` / `dist` | 世界坐标、屏幕坐标、相对位移、**直线**距离 |
+| **`walk_reachable` / `walk_steps`** | 安全图下是否可达、最短步数（不进出口 touch 半径） |
+| `path_crosses_exit` / `walk_steps_any` / `exit_detour` | 可选；不安全路径 + 会踩到的出口 + 回程门户 |
+| `can_search_now` / `in_search_range` | 仅 `search`：当前是否可调查 |
+| **`facing_ok` / `need_face`** | 仅 `search`：`facing_ok`≡`can_search_now`；在 range 但朝向不对时 `need_face` |
+| **`face`** | 仅当 `in_search_range`：应用该朝向再 confirm |
+| **`approach_dir`** | 仅 `search`：几何上更接近**身体**的方向（**不是**站位；见 `approach_note`） |
+| **`best_spot`** | 仅 `search`：优先安全站位 `{pos,face,walk_steps,safe,in_exit_touch?}` |
+| **`search_spots`** | 仅 `search`：`[{pos,face,walk_steps?,walk_steps_any?,in_exit_touch,exit_id?},…]` |
+| `trigger_mode` / `touch_radius` / `in_touch_range` | 仅 `touch`（exit/door 等） |
+| `event_state` / `solid` | 状态位 / 是否挡路 |
+| `dest_scene` | 可选；切场景目标 |
 
-调查与引擎一致：朝向锥 + 地图格子。mode=1 时几乎要贴格。  
-如何接近、是否交互、是否用道具：**由你决定**。
+**对话/调查用法（事实驱动）**：优先 `best_spot`（`safe=true` / `in_exit_touch=false`）→ 走到 `pos` → 按 `face` 转身（`walk[face]==false` 时只改朝向）→ 若 `need_face` 先转身 → `confirm`。  
+**避出门**：看 `step_touch`、`in_touch_now`、spot 上的 `in_exit_touch`；`walk_steps` 已绕开出口半径。  
+**off_grid**：看 `grid_snap` + `walk_from_snap` + `last_safe`/`last_safe_dir`。
 
 #### 战斗 `battle`（非战斗为 `null`）
 
@@ -221,15 +264,25 @@
 
 `tags` 如 `use`、`eq`、`throw`、`consume`、`sell`。
 
+### 2.5 `GET /v1/obstacles` — 阻挡格（按需）
+
+**不在** `/v1/state` 里。只有你要自建整图寻路时才拉。
+
+```json
+{ "status":"ok", "format":"sparse_tiles", "tiles":[[x,y,h],...], "event_blockers":[...] }
+```
+
+日常 AI 轮询用 `walk_reachable` 即可，不必每回合读这个。
+
 ---
 
-### 2.5 `GET /v1/frame.png` — 画面
+### 2.6 `GET /v1/frame.png` — 画面
 
 - 320×200 像素图  
 - 可能暂时没有画面（503）：等待或先步进  
 - **默认优先用 state；看不清 UI 时再取图**
 
-### 2.6 `POST /v1/input/{key}/{action}` — 按键
+### 2.7 `POST /v1/input/{key}/{action}` — 按键
 
 | action | 含义 |
 | --- | --- |
@@ -260,7 +313,7 @@
 **走路：** `press` 某一方向 → 保持一段时间或多次步进 → `release`。  
 **步进模式下务必：先发送 input，再 step**，本拍才能读到键。
 
-### 2.7 `POST /v1/step` — 推进时间（仅步进模式）
+### 2.8 `POST /v1/step` — 推进时间（仅步进模式）
 
 当 `step_mode` 为 `true` 时，游戏时间不自动走，必须步进。
 
@@ -287,7 +340,8 @@
 3. **`menu` 不是 null** → 根据 `items`/`index` 选目标；方向移动，`confirm`/`menu`。  
 4. **`phase` 为 `battle`** → 看 `battle` 与菜单；按键见 `actions`。  
 5. **`scene_transition` / boot** → 少操作或过片头。  
-6. **`overworld`** → 用 `player`、`map.dirs`、`map.exits` / `mechanisms` / `obstacles`、`walk`、`events[]` 自己规划；背包/队伍用 `/v1/inventory`、`/v1/party` 按需拉。  
+6. **`overworld`** → 用 `player`、`map.dirs`、`map.exits` / `mechanisms` / `obstacles`、`walk`、`events[]` 自己规划；**优先看 `walk_reachable`，不要只看 `dist`**。背包/队伍用 `/v1/inventory`、`/v1/party` 按需拉。  
+7. **`walk_blocked`** → 看 `walk_reason` / `trail` / `last_safe`，不要对着死键空转。调试时建议开 `step_mode` 便于对齐帧。  
 
 合法键名见 `actions`。等距移动键含义见上文 `walk` 表。
 
@@ -295,28 +349,31 @@
 
 ## 4. 操作循环
 
-### 步进模式（`step_mode == true`）
+### 严格步进（`step_gating == true`，**运行时开关**）
 
 ```
-确认 GET /v1/status 成功
-若尚未进入游戏：可 POST /v1/step?frames=200，并 confirm
-循环：
+# 不必启动时开 --ui-step；随时：
+POST /v1/config   body: {"step_gating": true}
+POST /v1/config   body: {"step_gating": false}
+GET  /v1/config
+
+开启后循环：
   GET /v1/state
-  若 quit_requested → 结束
-  按第 3 节决策
   POST /v1/input/...   （先按键）
   POST /v1/step?frames=1
-  长按移动：press → 多次 step → release
+  长按：press → 多次 step → release
 ```
 
-### 实时模式（`step_mode == false`）
+开场看 `boot_stage` / `awaiting_input`；intro 可按住 menu/confirm 并 step 跳过。
+
+### 实时模式（`step_gating == false`，默认）
 
 ```
 循环：
   GET /v1/state
   决策并 POST /v1/input/...
   等待约 50～200 毫秒（墙钟）
-不必调用 /v1/step
+POST /v1/step → 409（需先 step_gating:true）
 ```
 
 ---
@@ -326,9 +383,14 @@
 ```http
 GET /v1/status
 GET /v1/state
+GET /v1/config
 GET /v1/party
 GET /v1/inventory
+GET /v1/obstacles
 GET /v1/frame.png
+
+POST /v1/config
+{"step_gating": true}
 
 POST /v1/input/confirm/tap
 POST /v1/input/down/press

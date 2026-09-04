@@ -297,6 +297,21 @@ mod tests {
     }
 
     #[test]
+    fn press_then_release_same_frame_still_fires_keydown() {
+        // HTTP `tap` drains press+release before a single late poll; AI needs
+        // intermediate update so SEARCH still edges.
+        let mut s = InputState::new();
+        s.handle_key_event(KeyCode::Enter, true);
+        s.update_keyboard_state(10);
+        assert!(s.pressed(KEY_SEARCH));
+        s.clear_key_state();
+        s.handle_key_event(KeyCode::Enter, false);
+        s.update_keyboard_state(10);
+        assert!(!s.pressed(KEY_SEARCH));
+        assert_eq!(s.dir, DIR_UNKNOWN);
+    }
+
+    #[test]
     fn key_press_is_edge_triggered_with_repeat() {
         let mut s = InputState::new();
         s.handle_key_event(KeyCode::Enter, true);

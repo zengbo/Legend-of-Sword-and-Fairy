@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::keys::KeyCode;
 
@@ -31,6 +31,11 @@ struct LatestFrame {
     rgba: Vec<u8>,
 }
 
+/// Shared control + game clock for the UI driver.
+///
+/// Clock model (always used while the driver is installed):
+/// - **gating on** (`step_gating`): time only advances via `POST /v1/step`
+/// - **gating off**: wall-clock realtime, seamless toggle without jumps
 struct SharedControl {
     latest_frame: RwLock<LatestFrame>,
     /// Latest JSON body for `GET /v1/state` (without trailing framing).
@@ -39,14 +44,21 @@ struct SharedControl {
     party_json: RwLock<String>,
     /// On-demand: inventory (not every state poll).
     inventory_json: RwLock<String>,
-    step_enabled: AtomicBool,
-    /// Virtual millisecond clock used when step mode is on (`Engine::ticks`).
+    /// On-demand: sparse blocked map tiles (not every state poll).
+    obstacles_json: RwLock<String>,
+    /// When true, engine delays block until `POST /v1/step` (strict step mode).
+    step_gating: AtomicBool,
+    /// Milliseconds while gating is on.
     virtual_ms: AtomicU64,
+    /// Realtime clock base when gating is off: `base + anchor.elapsed()`.
+    realtime_base_ms: AtomicU64,
+    realtime_anchor: Mutex<Instant>,
     step_pair: (Mutex<()>, Condvar),
 }
 
 impl SharedControl {
-    fn new(step_enabled: bool) -> Self {
+    fn new(initial_gating: bool) -> Self {
+        let now = Instant::now();
         Self {
             latest_frame: RwLock::new(LatestFrame::default()),
             state_json: RwLock::new(
@@ -54,42 +66,86 @@ impl SharedControl {
             ),
             party_json: RwLock::new("{\"status\":\"starting\",\"party\":[]}\n".into()),
             inventory_json: RwLock::new("{\"status\":\"starting\",\"inventory\":[]}\n".into()),
-            step_enabled: AtomicBool::new(step_enabled),
+            obstacles_json: RwLock::new("{\"status\":\"starting\",\"tiles\":[]}\n".into()),
+            step_gating: AtomicBool::new(initial_gating),
             virtual_ms: AtomicU64::new(0),
+            realtime_base_ms: AtomicU64::new(0),
+            realtime_anchor: Mutex::new(now),
             step_pair: (Mutex::new(()), Condvar::new()),
         }
     }
 
-    fn step_enabled(&self) -> bool {
-        self.step_enabled.load(Ordering::SeqCst)
+    fn step_gating(&self) -> bool {
+        self.step_gating.load(Ordering::SeqCst)
     }
 
-    fn virtual_ms(&self) -> u64 {
-        self.virtual_ms.load(Ordering::SeqCst)
+    /// Current game clock (ms) — continuous across gating toggles.
+    fn now_ms(&self) -> u64 {
+        if self.step_gating() {
+            self.virtual_ms.load(Ordering::SeqCst)
+        } else {
+            let base = self.realtime_base_ms.load(Ordering::SeqCst);
+            let elapsed = self
+                .realtime_anchor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .elapsed()
+                .as_millis() as u64;
+            base.saturating_add(elapsed)
+        }
+    }
+
+    /// Enable/disable strict step gating without jumping the game clock.
+    fn set_step_gating(&self, on: bool) {
+        if on == self.step_gating() {
+            return;
+        }
+        if on {
+            let now = self.now_ms(); // still realtime
+            self.virtual_ms.store(now, Ordering::SeqCst);
+            self.step_gating.store(true, Ordering::SeqCst);
+            self.step_pair.1.notify_all();
+        } else {
+            let now = self.virtual_ms.load(Ordering::SeqCst); // still gated
+            self.realtime_base_ms.store(now, Ordering::SeqCst);
+            if let Ok(mut anchor) = self.realtime_anchor.lock() {
+                *anchor = Instant::now();
+            }
+            self.step_gating.store(false, Ordering::SeqCst);
+            self.step_pair.1.notify_all(); // unblock waiters when gating turns off
+        }
     }
 
     fn advance_ms(&self, ms: u64) {
-        if ms == 0 {
+        if ms == 0 || !self.step_gating() {
             return;
         }
         self.virtual_ms.fetch_add(ms, Ordering::SeqCst);
         self.step_pair.1.notify_all();
     }
 
-    /// Block until `virtual_ms >= deadline` (or step mode is turned off).
+    /// Block until gated clock reaches `deadline` (or gating is turned off).
     fn wait_until_ms(&self, deadline: u64) {
-        if !self.step_enabled() {
+        if !self.step_gating() {
             return;
         }
         let (lock, cvar) = &self.step_pair;
         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        while self.step_enabled() && self.virtual_ms() < deadline {
+        while self.step_gating() && self.now_ms() < deadline {
             let result = cvar
                 .wait_timeout(guard, Duration::from_secs(30))
                 .unwrap_or_else(|e| e.into_inner());
             guard = result.0;
-            // Spurious wake / timeout: loop and re-check.
         }
+    }
+
+    fn config_json(&self) -> String {
+        format!(
+            "{{\"status\":\"ok\",\"step_gating\":{},\"step_mode\":{},\"ticks\":{}}}\n",
+            self.step_gating(),
+            self.step_gating(),
+            self.now_ms(),
+        )
     }
 }
 
@@ -103,42 +159,33 @@ fn install_control(control: Arc<SharedControl>) {
     }
 }
 
-/// True when the engine should use the **virtual** step clock and block in
-/// `delay_until` until `POST /v1/step`.
+/// True when the engine should **gate** on `POST /v1/step` (strict step mode).
 ///
-/// `--ui-step` alone enables this for headless/offscreen agents. With
-/// **console** video, the gate is off by default so the alternate screen keeps
-/// animating in real time (otherwise the first `delay` freezes on a blank
-/// frame until an agent steps). Force the freeze even on console with
-/// `RUSTPAL_UI_STEP_STRICT=1`.
+/// Toggle at runtime with `POST /v1/config` `{"step_gating":true|false}`.
+/// Startup default: on only if `RUSTPAL_UI_STEP_STRICT=1`, or `--ui-step` without
+/// console (headless). Console + `--ui-step` alone still defaults to realtime
+/// so the terminal keeps painting until an agent enables gating.
 pub(crate) fn step_mode_enabled() -> bool {
-    let Some(c) = control() else {
-        return false;
-    };
-    if !c.step_enabled() {
-        return false;
-    }
-    if env_flag("RUSTPAL_UI_STEP_STRICT") {
-        return true;
-    }
-    // Console needs wall-clock presents; agent still has /v1/state + input.
-    if std::env::var_os("RUSTPAL_CONSOLE").is_some() {
-        return false;
-    }
-    true
+    control().is_some_and(|c| c.step_gating())
 }
 
-/// `--ui-step` / `RUSTPAL_UI_STEP` was set (API may still accept /v1/step).
+/// UI driver is installed (config / step endpoints available).
 pub(crate) fn step_mode_configured() -> bool {
-    control().is_some_and(|c| c.step_enabled())
+    control().is_some()
 }
 
-/// Virtual clock (ms) when step mode is active.
+/// Driver game clock in ms (always available while UI driver is installed).
+pub(crate) fn driver_ticks_ms() -> Option<u64> {
+    control().map(|c| c.now_ms())
+}
+
+/// Driver clock (ms); alias of [`driver_ticks_ms`].
+#[allow(dead_code)]
 pub(crate) fn virtual_ticks() -> u64 {
-    control().map(|c| c.virtual_ms()).unwrap_or(0)
+    control().map(|c| c.now_ms()).unwrap_or(0)
 }
 
-/// Wait until the virtual clock reaches `deadline` (step mode only).
+/// Wait until the gated clock reaches `deadline` (no-op if gating is off).
 pub(crate) fn wait_until_virtual(deadline: u64) {
     if let Some(c) = control() {
         c.wait_until_ms(deadline);
@@ -154,14 +201,17 @@ pub(crate) fn publish_state_json(json: String) {
     }
 }
 
-/// Publish on-demand party / inventory snapshots (updated each engine tick).
-pub(crate) fn publish_party_inventory_json(party: String, inventory: String) {
+/// Publish on-demand party / inventory / obstacles snapshots (updated each engine tick).
+pub(crate) fn publish_party_inventory_json(party: String, inventory: String, obstacles: String) {
     if let Some(c) = control() {
         if let Ok(mut slot) = c.party_json.write() {
             *slot = party;
         }
         if let Ok(mut slot) = c.inventory_json.write() {
             *slot = inventory;
+        }
+        if let Ok(mut slot) = c.obstacles_json.write() {
+            *slot = obstacles;
         }
     }
 }
@@ -228,8 +278,10 @@ impl UiDriver {
             ));
         }
 
-        let step_enabled = env_flag("RUSTPAL_UI_STEP");
-        let control = Arc::new(SharedControl::new(step_enabled));
+        // Initial gating: STRICT env always on; bare --ui-step only when not console.
+        let initial_gating = env_flag("RUSTPAL_UI_STEP_STRICT")
+            || (env_flag("RUSTPAL_UI_STEP") && std::env::var_os("RUSTPAL_CONSOLE").is_none());
+        let control = Arc::new(SharedControl::new(initial_gating));
         install_control(Arc::clone(&control));
 
         let listener = TcpListener::bind(addr)?;
@@ -242,22 +294,19 @@ impl UiDriver {
             .map_err(|error| io::Error::other(format!("start UI driver thread: {error}")))?;
 
         eprintln!("rustpal: UI driver listening on http://{local_addr}");
-        if step_enabled {
-            if std::env::var_os("RUSTPAL_CONSOLE").is_some()
-                && !env_flag("RUSTPAL_UI_STEP_STRICT")
-            {
-                eprintln!(
-                    "rustpal: UI step requested with console — using **realtime** display so the \
-                     terminal keeps painting. Set RUSTPAL_UI_STEP_STRICT=1 to freeze the clock \
-                     until POST /v1/step (needed for single-frame AI loops while watching)."
-                );
-            } else {
-                eprintln!(
-                    "rustpal: UI step mode ON — engine clock is virtual; the game will not advance \
-                     until POST /v1/step (default +{FRAME_TIME}ms per call). Without steps the \
-                     screen stays blank/frozen."
-                );
-            }
+        eprintln!(
+            "rustpal: step_gating={} (toggle anytime: POST /v1/config {{\"step_gating\":true|false}})",
+            initial_gating
+        );
+        if initial_gating {
+            eprintln!(
+                "rustpal: strict step ON — clock advances only via POST /v1/step \
+                 (+{FRAME_TIME}ms default). Screen freezes until stepped."
+            );
+        } else {
+            eprintln!(
+                "rustpal: realtime clock (step_gating off). Enable strict step over HTTP when needed."
+            );
         }
         Ok(Self {
             input_rx,
@@ -323,10 +372,48 @@ fn handle_connection(
     input_tx: &Sender<(KeyCode, bool)>,
     control: &SharedControl,
 ) -> io::Result<()> {
-    let mut request = [0u8; 8192];
-    let size = stream.read(&mut request)?;
-    let request = String::from_utf8_lossy(&request[..size]);
-    let Some(request_line) = request.lines().next() else {
+    // Read headers first, then body by Content-Length (small POSTs from curl/urllib).
+    let mut buf = Vec::with_capacity(4096);
+    let mut tmp = [0u8; 2048];
+    let header_end = loop {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            break None;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(pos) = find_header_end(&buf) {
+            break Some(pos);
+        }
+        if buf.len() > 64 * 1024 {
+            return write_text(stream, 413, "Payload Too Large", "request too large\n");
+        }
+    };
+    let Some(header_end) = header_end else {
+        return write_text(stream, 400, "Bad Request", "empty request\n");
+    };
+    let headers = String::from_utf8_lossy(&buf[..header_end]);
+    let mut body_buf = buf[header_end..].to_vec();
+    let content_length = headers
+        .lines()
+        .find_map(|l| {
+            let l = l.trim();
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    while body_buf.len() < content_length {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            break;
+        }
+        body_buf.extend_from_slice(&tmp[..n]);
+    }
+    body_buf.truncate(content_length);
+    let body = String::from_utf8_lossy(&body_buf);
+
+    let Some(request_line) = headers.lines().next() else {
         return write_text(stream, 400, "Bad Request", "empty request\n");
     };
     let mut parts = request_line.split_whitespace();
@@ -343,13 +430,6 @@ fn handle_connection(
         return write_response(stream, 204, "No Content", "text/plain", &[]);
     }
 
-    // Body after headers (for POST /v1/step JSON).
-    let body = request
-        .split("\r\n\r\n")
-        .nth(1)
-        .or_else(|| request.split("\n\n").nth(1))
-        .unwrap_or("");
-
     match (method, path) {
         ("GET", "/") => write_text(stream, 200, "OK", API_HELP),
         ("GET", "/v1/status") => {
@@ -359,18 +439,25 @@ fn handle_connection(
                 .map_err(|_| io::Error::other("frame lock poisoned"))?;
             let body = format!(
                 "{{\"status\":\"ok\",\"width\":{SCREEN_W},\"height\":{SCREEN_H},\
-                 \"frame_id\":{},\"step_mode\":{},\"step_configured\":{},\"ticks\":{}}}\n",
+                 \"frame_id\":{},\"step_mode\":{},\"step_gating\":{},\"step_configured\":true,\
+                 \"ticks\":{}}}\n",
                 frame.id,
-                step_mode_enabled(),
-                control.step_enabled(),
-                if step_mode_enabled() {
-                    control.virtual_ms()
-                } else {
-                    0
-                },
+                control.step_gating(),
+                control.step_gating(),
+                control.now_ms(),
             );
             write_response(stream, 200, "OK", "application/json", body.as_bytes())
         }
+        ("GET", "/v1/config") => {
+            write_response(
+                stream,
+                200,
+                "OK",
+                "application/json",
+                control.config_json().as_bytes(),
+            )
+        }
+        ("POST", "/v1/config") => handle_config(stream, control, body.as_ref()),
         ("GET", "/v1/state") => {
             let json = control
                 .state_json
@@ -395,6 +482,14 @@ fn handle_connection(
                 .clone();
             write_response(stream, 200, "OK", "application/json", json.as_bytes())
         }
+        ("GET", "/v1/obstacles") => {
+            let json = control
+                .obstacles_json
+                .read()
+                .map_err(|_| io::Error::other("obstacles lock poisoned"))?
+                .clone();
+            write_response(stream, 200, "OK", "application/json", json.as_bytes())
+        }
         ("GET", "/v1/frame.png") => {
             let rgba = {
                 let frame = control
@@ -409,7 +504,7 @@ fn handle_connection(
             let png = encode_png(&rgba)?;
             write_response(stream, 200, "OK", "image/png", &png)
         }
-        ("POST", "/v1/step") => handle_step(stream, control, query, body),
+        ("POST", "/v1/step") => handle_step(stream, control, query, body.as_ref()),
         ("POST", path) if path.starts_with("/v1/input/") => handle_input(stream, path, input_tx),
         _ => write_text(stream, 404, "Not Found", "not found\n"),
     }
@@ -459,19 +554,92 @@ fn json_u64_field(body: &str, key: &str) -> Option<u64> {
     num.parse().ok()
 }
 
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .or_else(|| buf.windows(2).position(|w| w == b"\n\n").map(|i| i + 2))
+}
+
+fn handle_config(stream: &mut TcpStream, control: &SharedControl, body: &str) -> io::Result<()> {
+    // Accept {"step_gating":true|false} or {"step_mode":true|false} (aliases).
+    let trimmed = body.trim();
+    let gating = json_bool_field(trimmed, "step_gating")
+        .or_else(|| json_bool_field(trimmed, "step_mode"))
+        .or_else(|| json_bool_field(trimmed, "strict"));
+    let Some(on) = gating else {
+        return write_response(
+            stream,
+            400,
+            "Bad Request",
+            "application/json",
+            b"{\"error\":\"expected JSON {\\\"step_gating\\\":true|false}\"}\n",
+        );
+    };
+    control.set_step_gating(on);
+    // Cached GET /v1/state is only rebuilt on engine frames. When gating turns
+    // on the clock freezes, so without a patch the snapshot keeps stale
+    // step_gating/step_mode until the next POST /v1/step — agents reading only
+    // /v1/state would think gating never applied.
+    patch_cached_state_gating(control, on);
+    write_response(
+        stream,
+        200,
+        "OK",
+        "application/json",
+        control.config_json().as_bytes(),
+    )
+}
+
+/// Rewrite `step_mode` / `step_gating` booleans in the published state snapshot.
+fn patch_cached_state_gating(control: &SharedControl, on: bool) {
+    let Ok(mut slot) = control.state_json.write() else {
+        return;
+    };
+    let val = if on { "true" } else { "false" };
+    for key in ["step_gating", "step_mode"] {
+        for old in ["true", "false"] {
+            let from = format!("\"{key}\":{old}");
+            let to = format!("\"{key}\":{val}");
+            if slot.contains(&from) {
+                *slot = slot.replacen(&from, &to, 1);
+                break;
+            }
+        }
+    }
+}
+
+fn json_bool_field(body: &str, key: &str) -> Option<bool> {
+    let pattern = format!("\"{key}\"");
+    let i = body.find(&pattern)?;
+    let after = body[i + pattern.len()..].trim_start();
+    let after = after.strip_prefix(':')?.trim_start();
+    if after.starts_with("true") {
+        Some(true)
+    } else if after.starts_with("false") {
+        Some(false)
+    } else if after.starts_with('1') {
+        Some(true)
+    } else if after.starts_with('0') {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn handle_step(
     stream: &mut TcpStream,
     control: &SharedControl,
     query: &str,
     body: &str,
 ) -> io::Result<()> {
-    if !control.step_enabled() {
+    if !control.step_gating() {
         return write_response(
             stream,
             409,
             "Conflict",
             "application/json",
-            b"{\"error\":\"step mode not enabled; set RUSTPAL_UI_STEP=1 or pass --ui-step\"}\n",
+            b"{\"error\":\"step_gating is off; POST /v1/config {\\\"step_gating\\\":true} first\"}\n",
         );
     }
     let ms = match parse_step_ms(query, body) {
@@ -481,11 +649,10 @@ fn handle_step(
         }
     };
     control.advance_ms(ms);
-    let ticks = control.virtual_ms();
-    let gating = step_mode_enabled();
+    let ticks = control.now_ms();
     let body = format!(
         "{{\"accepted\":true,\"advanced_ms\":{ms},\"ticks\":{ticks},\
-         \"frame_time_ms\":{FRAME_TIME},\"gating\":{gating}}}\n"
+         \"frame_time_ms\":{FRAME_TIME},\"gating\":true}}\n"
     );
     write_response(stream, 202, "Accepted", "application/json", body.as_bytes())
 }
@@ -623,18 +790,23 @@ const API_HELP: &str = "\
 rustpal UI driver
 
 GET  /v1/status
-GET  /v1/state                lightweight observe (no party/inventory)
+GET  /v1/state                lightweight observe (no party/inventory/tiles)
 GET  /v1/party                party roster (on demand)
 GET  /v1/inventory            inventory (on demand)
+GET  /v1/obstacles            sparse blocked tiles (on demand)
+GET  /v1/config               step_gating / ticks
 GET  /v1/frame.png
-POST /v1/step                 advance virtual clock (step mode only)
+POST /v1/config               {\"step_gating\":true|false}  enable/disable strict step
+POST /v1/step                 advance clock when step_gating is on
 POST /v1/step?frames=N
 POST /v1/step?ms=N
 POST /v1/input/{key}/tap
 POST /v1/input/{key}/press
 POST /v1/input/{key}/release
 
-Step mode: RUSTPAL_UI_STEP=1 or --ui-step (requires --ui-driver).
+step_gating (strict step): clock freezes until POST /v1/step.
+Toggle anytime: POST /v1/config {\"step_gating\":true|false}.
+Optional startup default: RUSTPAL_UI_STEP_STRICT=1.
 Default step advances one overworld frame (100ms virtual).
 
 Keys: up, down, left, right, menu, confirm, space, page_up, page_down,
@@ -729,6 +901,11 @@ mod tests {
             .inventory_json
             .write()
             .expect("lock") = "{\"status\":\"ok\",\"inventory\":[]}\n".into();
+        *driver
+            .control_for_test()
+            .obstacles_json
+            .write()
+            .expect("lock") = "{\"status\":\"ok\",\"tiles\":[[1,2,0]]}\n".into();
         let party = request(
             driver.local_addr(),
             "GET /v1/party HTTP/1.1\r\nHost: localhost\r\n\r\n",
@@ -737,16 +914,31 @@ mod tests {
             driver.local_addr(),
             "GET /v1/inventory HTTP/1.1\r\nHost: localhost\r\n\r\n",
         );
+        let obs = request(
+            driver.local_addr(),
+            "GET /v1/obstacles HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
         assert!(String::from_utf8_lossy(&party).contains("\"name\":\"X\""));
         assert!(String::from_utf8_lossy(&inv).contains("\"inventory\":[]"));
+        assert!(String::from_utf8_lossy(&obs).contains("\"tiles\":[[1,2,0]]"));
     }
 
     #[test]
-    fn step_advances_virtual_clock_when_enabled() {
-        std::env::set_var("RUSTPAL_UI_STEP", "1");
-        let driver = UiDriver::start("127.0.0.1:0").expect("start step driver");
-        assert!(driver.control_for_test().step_enabled());
-        assert_eq!(driver.control_for_test().virtual_ms(), 0);
+    fn step_advances_virtual_clock_when_gating_enabled() {
+        let driver = UiDriver::start("127.0.0.1:0").expect("start UI driver");
+        // Enable gating via API (no startup flag required).
+        let cfg = request(
+            driver.local_addr(),
+            "POST /v1/config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Content-Length: 20\r\n\r\n{\"step_gating\":true}",
+        );
+        assert!(
+            cfg.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&cfg)
+        );
+        assert!(driver.control_for_test().step_gating());
+        let before = driver.control_for_test().now_ms();
         let response = request(
             driver.local_addr(),
             "POST /v1/step?frames=2 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
@@ -756,8 +948,28 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&response)
         );
-        assert_eq!(driver.control_for_test().virtual_ms(), FRAME_TIME * 2);
-        std::env::remove_var("RUSTPAL_UI_STEP");
+        assert_eq!(
+            driver.control_for_test().now_ms(),
+            before + FRAME_TIME * 2
+        );
+        // Disable gating
+        let off = request(
+            driver.local_addr(),
+            "POST /v1/config HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+             Content-Length: 21\r\n\r\n{\"step_gating\":false}",
+        );
+        assert!(off.starts_with(b"HTTP/1.1 200"));
+        assert!(!driver.control_for_test().step_gating());
+        // Step rejected when gating off
+        let rejected = request(
+            driver.local_addr(),
+            "POST /v1/step?frames=1 HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(
+            rejected.starts_with(b"HTTP/1.1 409"),
+            "{}",
+            String::from_utf8_lossy(&rejected)
+        );
     }
 
     #[test]
