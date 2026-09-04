@@ -162,7 +162,7 @@ impl Engine {
             self.delay(800 / scroll_speed);
         }
 
-        self.screen.pixels.copy_from_slice(&p.pixels);
+        self.screen.copy_from(&p);
         self.video_update();
     }
 

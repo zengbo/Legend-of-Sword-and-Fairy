@@ -1797,7 +1797,7 @@ impl Engine {
                 }
                 // Backup the current scene so the crossfade starts from the
                 // just-captured frame (C: VIDEO_BackupScreen(g_Battle.lpSceneBuf)).
-                self.screen_bak.pixels.copy_from_slice(&battle.scene_buf.pixels);
+                self.screen_bak.copy_from(&battle.scene_buf);
                 crate::fight::battle_update_fighters(self, &mut battle);
                 crate::battle::make_scene(self, &mut battle);
                 crate::battle::fade_scene(self, &mut battle);

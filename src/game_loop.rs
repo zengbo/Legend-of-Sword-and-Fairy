@@ -1195,12 +1195,12 @@ impl Engine {
 
     /// VIDEO_BackupScreen (screen -> backup).
     pub fn backup_screen(&mut self) {
-        self.screen_bak.pixels.copy_from_slice(&self.screen.pixels);
+        self.screen_bak.copy_from(&self.screen);
     }
 
     /// VIDEO_RestoreScreen (backup -> screen).
     pub fn restore_screen(&mut self) {
-        self.screen.pixels.copy_from_slice(&self.screen_bak.pixels);
+        self.screen.copy_from(&self.screen_bak);
     }
 
     // =======================================================================

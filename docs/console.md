@@ -62,7 +62,17 @@ When the terminal reports cell pixel size, **`c=` is chosen** for a sharp
 display: **nn** aims on-screen width ≈ `320×N`; **hqx4/neural** keep a 1280×800
 bitmap and pick an **integer display scale** `k` so width ≈ `1280×k` near full
 terminal size (avoids a tiny 1:1 stamp on large fonts). Override NN factor with
-`RUSTPAL_CONSOLE_KITTY_NN=1..8` (nn mode only). Width is capped so the image
+`RUSTPAL_CONSOLE_KITTY_NN=1..8` (nn mode only).
+
+**Crisp text:** with `hqx4` / `neural` the engine marks every font-glyph pixel
+(`Surface::text_mask`) and the console re-stamps those pixels as hard 4×4
+blocks over the smoothed frame, so dialog and menu text keeps pixel-sharp
+edges while scenery gets the filter. `RUSTPAL_CONSOLE_CRISP_TEXT=0` disables it
+(`=1` forces it on for `nn`, which is a no-op visually).
+
+**Neural frame cache:** the worker keeps the last 8 (input frame → encoded
+Kitty payload) pairs. Menus, blinking cursors and idle animations cycle through
+a few frames, and a hit skips both the GPU pass and zlib/base64. Width is capped so the image
 fits the **available rows**. Help text is on the primary screen before alt
 buffer; `RUSTPAL_CONSOLE_FPS=1` reserves the top row. Startup log shows filter,
 size, and `1:1` / `near`.

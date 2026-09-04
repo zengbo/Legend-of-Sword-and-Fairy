@@ -415,12 +415,12 @@ impl Font {
             let b1 = glyph[row as usize * 2 + 1];
             for col in 0..8 {
                 if b0 & (1 << (7 - col)) != 0 {
-                    surf.put_pixel(x + col, y + row, color);
+                    surf.put_text_pixel(x + col, y + row, color);
                 }
             }
             for col in 0..8 {
                 if b1 & (1 << (7 - col)) != 0 {
-                    surf.put_pixel(x + 8 + col, y + row, color);
+                    surf.put_text_pixel(x + 8 + col, y + row, color);
                 }
             }
         }
@@ -434,7 +434,7 @@ fn draw_ascii_glyph(surf: &mut Surface, x: i32, y: i32, b: u8, color: u8) {
         let row_byte = glyph[row as usize];
         for col in 0..8i32 {
             if row_byte & (1 << col) != 0 {
-                surf.put_pixel(x + col, y + row, color);
+                surf.put_text_pixel(x + col, y + row, color);
             }
         }
     }

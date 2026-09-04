@@ -10,6 +10,11 @@ pub struct Surface {
     pub w: usize,
     pub h: usize,
     pub pixels: Vec<u8>,
+    /// Per-pixel flag: this pixel was last written by a font glyph. Upscalers
+    /// use it to keep text pixel-crisp instead of smoothing it. Ordinary blits
+    /// clear the flag; a stale flag only degrades that pixel to
+    /// nearest-neighbour, never to a wrong colour.
+    pub text_mask: Vec<bool>,
 }
 
 impl Surface {
@@ -18,6 +23,7 @@ impl Surface {
             w,
             h,
             pixels: vec![0; w * h],
+            text_mask: vec![false; w * h],
         }
     }
 
@@ -28,12 +34,35 @@ impl Surface {
 
     pub fn clear(&mut self, color: u8) {
         self.pixels.fill(color);
+        self.text_mask.fill(false);
+    }
+
+    /// Copy pixels and the text mask from another surface of the same size.
+    pub fn copy_from(&mut self, other: &Surface) {
+        self.pixels.copy_from_slice(&other.pixels);
+        if self.text_mask.len() == other.text_mask.len() {
+            self.text_mask.copy_from_slice(&other.text_mask);
+        } else {
+            self.text_mask = other.text_mask.clone();
+        }
     }
 
     #[inline]
     pub fn put_pixel(&mut self, x: i32, y: i32, c: u8) {
         if x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h {
-            self.pixels[y as usize * self.w + x as usize] = c;
+            let i = y as usize * self.w + x as usize;
+            self.pixels[i] = c;
+            self.text_mask[i] = false;
+        }
+    }
+
+    /// `put_pixel` for font glyphs: also marks the pixel as text.
+    #[inline]
+    pub fn put_text_pixel(&mut self, x: i32, y: i32, c: u8) {
+        if x >= 0 && y >= 0 && (x as usize) < self.w && (y as usize) < self.h {
+            let i = y as usize * self.w + x as usize;
+            self.pixels[i] = c;
+            self.text_mask[i] = true;
         }
     }
 
@@ -49,7 +78,9 @@ impl Surface {
     pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, c: u8) {
         for yy in y.max(0)..(y + h).min(self.h as i32) {
             for xx in x.max(0)..(x + w).min(self.w as i32) {
-                self.pixels[yy as usize * self.w + xx as usize] = c;
+                let i = yy as usize * self.w + xx as usize;
+                self.pixels[i] = c;
+                self.text_mask[i] = false;
             }
         }
     }
@@ -58,6 +89,7 @@ impl Surface {
     pub fn blit_fbp(&mut self, fbp: &[u8]) {
         let n = (self.w * self.h).min(fbp.len());
         self.pixels[..n].copy_from_slice(&fbp[..n]);
+        self.text_mask[..n].fill(false);
     }
 
     /// Blit an RLE bitmap with transparency (port of PAL_RLEBlitToSurface).
@@ -117,6 +149,7 @@ impl Surface {
                         && (dst_y as usize) < self.h
                     {
                         let idx = dst_y as usize * self.w + dst_x as usize;
+                        self.text_mask[idx] = false;
                         self.pixels[idx] = match mode {
                             RleBlitMode::Normal => rle[p + k],
                             RleBlitMode::Shadow => calc_shadow_color(self.pixels[idx]),
@@ -256,6 +289,24 @@ pub fn sprite_frame(sprite: &[u8], n: usize) -> Option<&[u8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_mask_follows_glyph_writes_and_is_cleared_by_blits() {
+        let mut s = Surface::new(4, 2);
+        s.put_text_pixel(1, 0, 7);
+        assert!(s.text_mask[1]);
+        s.put_pixel(1, 0, 3);
+        assert!(!s.text_mask[1]);
+        s.put_text_pixel(2, 1, 7);
+        s.fill_rect(2, 1, 1, 1, 0);
+        assert!(!s.text_mask[6]);
+        s.put_text_pixel(0, 0, 7);
+        let mut other = Surface::new(4, 2);
+        other.copy_from(&s);
+        assert!(other.text_mask[0]);
+        s.clear(0);
+        assert!(s.text_mask.iter().all(|m| !m));
+    }
 
     #[test]
     fn surface_basics() {

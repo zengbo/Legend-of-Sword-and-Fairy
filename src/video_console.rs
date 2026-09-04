@@ -55,6 +55,11 @@ const MIN_FRAME_INTERVAL_NEURAL: Duration = Duration::from_millis(50);
 const MIN_FRAME_INTERVAL_NEURAL_SSH: Duration = Duration::from_millis(80);
 /// How often to push a new 320×200 job to the neural worker (~12 fps max).
 const NEURAL_SUBMIT_INTERVAL: Duration = Duration::from_millis(80);
+/// Recent (input hash → encoded Kitty payload) pairs kept by the neural worker.
+/// Menus, dialog cursors and idle animations cycle through a handful of frames;
+/// a hit skips both the GPU pass and zlib/base64.
+#[cfg(feature = "neural")]
+const NEURAL_FRAME_CACHE: usize = 8;
 /// FPS text-only refresh when the image is unchanged.
 const NEURAL_FPS_BANNER_INTERVAL: Duration = Duration::from_millis(500);
 /// Ask compatible terminals to report repeat/release for functional keys.
@@ -114,6 +119,12 @@ pub struct ConsoleVideo {
     /// row 2 leaves the top line free for the optional FPS banner.
     image_row: u32,
     rgba: Vec<u8>,
+    /// Text pixels of the current frame (see `Surface::text_mask`), all-false
+    /// while the screen shakes (offsets would not line up).
+    text_mask: Vec<bool>,
+    /// Re-stamp glyph pixels nearest-neighbour over hqx4/neural output so text
+    /// stays sharp (`RUSTPAL_CONSOLE_CRISP_TEXT`, default on for those filters).
+    crisp_text: bool,
     scaled: Vec<u8>,
     /// Mid buffer for HQ4x (640×400).
     hqx_tmp: Vec<u8>,
@@ -438,6 +449,8 @@ impl ConsoleVideo {
             0
         };
 
+        let crisp_text = crisp_text_enabled(upscale);
+
         Ok(ConsoleVideo {
             use_kitty,
             over_ssh,
@@ -447,6 +460,8 @@ impl ConsoleVideo {
             ansi_scale,
             image_row,
             rgba: vec![0; SCREEN_W * SCREEN_H * 4],
+            text_mask: vec![false; SCREEN_W * SCREEN_H],
+            crisp_text,
             scaled: vec![0; scaled_len],
             hqx_tmp: vec![0; hqx_tmp_len],
             prev_rgba: Vec::new(),
@@ -506,6 +521,9 @@ impl ConsoleVideo {
                     &mut self.hqx_tmp,
                     &mut self.scaled,
                 );
+                if self.crisp_text {
+                    overlay_crisp_text(&mut self.scaled, 4, &self.rgba, &self.text_mask);
+                }
                 (1280, 800)
             }
             ConsoleUpscale::Neural => {
@@ -586,6 +604,7 @@ impl ConsoleVideo {
         }
 
         render_rgba(surf, palette, shake, &mut self.rgba);
+        capture_text_mask(surf, shake, &mut self.text_mask);
 
         // Always draw the first few frames even if identical (empty buffer →
         // all zeros can match after a black fade).
@@ -628,10 +647,12 @@ impl ConsoleVideo {
             || now.duration_since(self.last_neural_submit) >= NEURAL_SUBMIT_INTERVAL;
         if due_submit {
             render_rgba(surf, palette, shake, &mut self.rgba);
+            capture_text_mask(surf, shake, &mut self.text_mask);
             self.last_neural_submit = now;
             #[cfg(feature = "neural")]
             if let Some(ref neural) = self.neural {
-                neural.submit(&self.rgba);
+                let mask = if self.crisp_text { Some(self.text_mask.as_slice()) } else { None };
+                neural.submit(&self.rgba, mask);
             }
         }
 
@@ -1097,9 +1118,28 @@ fn detect_kitty() -> bool {
 }
 
 /// Shared job slot: latest 320×200 frame + condvar (no 2ms poll spin).
+/// One 320×200 frame for the neural worker plus the glyph mask to re-stamp
+/// after upscaling (`None` when crisp text is disabled).
+#[cfg(feature = "neural")]
+struct NeuralJob {
+    rgba: Vec<u8>,
+    mask: Option<Vec<bool>>,
+}
+
+#[cfg(feature = "neural")]
+impl NeuralJob {
+    fn content_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.rgba.hash(&mut h);
+        self.mask.hash(&mut h);
+        h.finish()
+    }
+}
+
 #[cfg(feature = "neural")]
 struct NeuralInputSlot {
-    frame: Mutex<Option<Vec<u8>>>,
+    frame: Mutex<Option<NeuralJob>>,
     cvar: Condvar,
 }
 
@@ -1148,6 +1188,9 @@ impl NeuralAsync {
                 };
                 let _ = ready_tx.send(Some(up.adapter_name().to_string()));
                 let mut out_buf = vec![0u8; OUTPUT_SIZE];
+                // Small LRU: (input hash, encoded APC). Front = most recent.
+                let mut cache: std::collections::VecDeque<(u64, Arc<Vec<u8>>)> =
+                    std::collections::VecDeque::with_capacity(NEURAL_FRAME_CACHE);
                 while !stop_w.load(Ordering::Relaxed) {
                     let job = {
                         let mut g = input_w
@@ -1187,27 +1230,40 @@ impl NeuralAsync {
                             None => break,
                         }
                     }
-                    if job.len() != INPUT_SIZE {
+                    if job.rgba.len() != INPUT_SIZE {
                         continue;
                     }
-                    up.upscale(&job, &mut out_buf);
-                    // Level 4: smaller APC than level 1 → less main-thread write/terminal CPU.
-                    match encode_kitty_frame_level(
-                        IMAGE_ID,
-                        1280,
-                        800,
-                        &out_buf,
-                        place_cols,
-                        4,
-                    ) {
-                        Ok(apc) => {
-                            let apc = Arc::new(apc);
-                            let mut g = payload_w.lock().unwrap_or_else(|e| e.into_inner());
-                            *g = Some(apc);
-                            gen_w.fetch_add(1, Ordering::Release);
+                    let key = job.content_hash();
+                    let apc = if let Some(pos) = cache.iter().position(|(k, _)| *k == key) {
+                        let hit = cache.remove(pos).expect("position is in range");
+                        cache.push_front(hit.clone());
+                        hit.1
+                    } else {
+                        up.upscale(&job.rgba, &mut out_buf);
+                        if let Some(mask) = job.mask.as_deref() {
+                            overlay_crisp_text(&mut out_buf, 4, &job.rgba, mask);
                         }
-                        Err(_) => {}
-                    }
+                        // Level 4: smaller APC than level 1 → less main-thread write/terminal CPU.
+                        let Ok(apc) = encode_kitty_frame_level(
+                            IMAGE_ID,
+                            1280,
+                            800,
+                            &out_buf,
+                            place_cols,
+                            4,
+                        ) else {
+                            continue;
+                        };
+                        let apc = Arc::new(apc);
+                        if cache.len() == NEURAL_FRAME_CACHE {
+                            cache.pop_back();
+                        }
+                        cache.push_front((key, Arc::clone(&apc)));
+                        apc
+                    };
+                    let mut g = payload_w.lock().unwrap_or_else(|e| e.into_inner());
+                    *g = Some(apc);
+                    gen_w.fetch_add(1, Ordering::Release);
                 }
             })
             .ok()?;
@@ -1239,12 +1295,25 @@ impl NeuralAsync {
     }
 
     /// Queue a 320×200 RGBA frame (replaces any not-yet-processed job).
-    fn submit(&self, rgba: &[u8]) {
+    fn submit(&self, rgba: &[u8], mask: Option<&[bool]>) {
         {
             let mut g = self.input.frame.lock().unwrap_or_else(|e| e.into_inner());
             match g.as_mut() {
-                Some(buf) if buf.len() == rgba.len() => buf.copy_from_slice(rgba),
-                _ => *g = Some(rgba.to_vec()),
+                Some(job) if job.rgba.len() == rgba.len() => {
+                    job.rgba.copy_from_slice(rgba);
+                    match (job.mask.as_mut(), mask) {
+                        (Some(dst), Some(src)) if dst.len() == src.len() => {
+                            dst.copy_from_slice(src)
+                        }
+                        _ => job.mask = mask.map(<[bool]>::to_vec),
+                    }
+                }
+                _ => {
+                    *g = Some(NeuralJob {
+                        rgba: rgba.to_vec(),
+                        mask: mask.map(<[bool]>::to_vec),
+                    })
+                }
             }
         }
         self.input.cvar.notify_one();
@@ -1619,6 +1688,58 @@ fn sync_output_enabled(over_ssh: bool) -> bool {
     }
 }
 
+/// `RUSTPAL_CONSOLE_CRISP_TEXT`: unset → on for smoothing filters (hqx4 /
+/// neural), off for nearest-neighbour where text is already crisp.
+fn crisp_text_enabled(upscale: ConsoleUpscale) -> bool {
+    match std::env::var("RUSTPAL_CONSOLE_CRISP_TEXT").ok().as_deref() {
+        Some("1") | Some("true") | Some("yes") | Some("on") => true,
+        Some("0") | Some("false") | Some("no") | Some("off") => false,
+        _ => upscale != ConsoleUpscale::Nearest,
+    }
+}
+
+/// Stamp every masked source pixel as a solid `scale`×`scale` block over an
+/// upscaled frame, so glyphs keep hard pixel edges while the scenery behind
+/// them stays smoothed. `out` is `SCREEN_W*scale` wide.
+fn overlay_crisp_text(out: &mut [u8], scale: usize, rgba: &[u8], mask: &[bool]) {
+    if scale == 0 || mask.len() < SCREEN_W * SCREEN_H {
+        return;
+    }
+    let out_w = SCREEN_W * scale;
+    for y in 0..SCREEN_H {
+        let row = &mask[y * SCREEN_W..(y + 1) * SCREEN_W];
+        if !row.iter().any(|&m| m) {
+            continue;
+        }
+        for (x, &m) in row.iter().enumerate() {
+            if !m {
+                continue;
+            }
+            let s = (y * SCREEN_W + x) * 4;
+            let px = [rgba[s], rgba[s + 1], rgba[s + 2], 0xff];
+            for dy in 0..scale {
+                let base = ((y * scale + dy) * out_w + x * scale) * 4;
+                for dx in 0..scale {
+                    let o = base + dx * 4;
+                    if o + 4 <= out.len() {
+                        out[o..o + 4].copy_from_slice(&px);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Copy the surface's text mask for this frame; a shaking screen is offset
+/// row-wise, so the mask would not line up — publish no text pixels then.
+fn capture_text_mask(surf: &Surface, shake: Option<(u16, u16)>, out: &mut [bool]) {
+    if shake.is_some() || surf.text_mask.len() != out.len() {
+        out.fill(false);
+    } else {
+        out.copy_from_slice(&surf.text_mask);
+    }
+}
+
 /// True for `1` / `true` / `yes` / `on` (case-insensitive). Empty/unset → false.
 fn env_flag_enabled(name: &str) -> bool {
     match std::env::var(name) {
@@ -1772,6 +1893,25 @@ mod tests {
         assert!(s.contains("a=T"), "{s}");
         assert!(s.contains("f=24"), "{s}");
         assert!(s.contains("i=1"), "{s}");
+    }
+
+    #[test]
+    fn crisp_text_overlay_stamps_solid_blocks_only_where_masked() {
+        let mut rgba = vec![0u8; SCREEN_W * SCREEN_H * 4];
+        let mut mask = vec![false; SCREEN_W * SCREEN_H];
+        // Source pixel (1,0) is red text.
+        rgba[4..8].copy_from_slice(&[255, 0, 0, 255]);
+        mask[1] = true;
+        let mut out = vec![9u8; SCREEN_W * 2 * SCREEN_H * 2 * 4];
+        overlay_crisp_text(&mut out, 2, &rgba, &mask);
+        let at = |x: usize, y: usize| {
+            let o = (y * SCREEN_W * 2 + x) * 4;
+            [out[o], out[o + 1], out[o + 2], out[o + 3]]
+        };
+        assert_eq!(at(2, 0), [255, 0, 0, 255]);
+        assert_eq!(at(3, 1), [255, 0, 0, 255]);
+        assert_eq!(at(1, 0), [9, 9, 9, 9], "unmasked neighbour untouched");
+        assert_eq!(at(4, 0), [9, 9, 9, 9]);
     }
 
     #[test]
