@@ -60,7 +60,14 @@ const NEURAL_FPS_BANNER_INTERVAL: Duration = Duration::from_millis(500);
 /// Ask compatible terminals to report repeat/release for functional keys.
 /// Requesting only the event-types flag preserves legacy Ctrl-C/ISIG and
 /// plain-text key encoding.
-const KEYBOARD_PUSH_EVENT_TYPES: &[u8] = b"\x1b[>2u";
+/// Kitty keyboard protocol flags: 1 = disambiguate escape codes (bare Esc
+/// arrives as `CSI 27 u`, no timeout needed), 2 = report event types
+/// (press/repeat/release), 8 = report all keys as escape codes (Enter, Space,
+/// hjkl, WASD get real key-up too instead of legacy text bytes).
+const KEYBOARD_PUSH_EVENT_TYPES: &[u8] = b"\x1b[>11u";
+/// XTerm focus-in/out reporting (`CSI I` / `CSI O`), so a key released while
+/// another window has focus does not stay held in the game.
+const FOCUS_EVENTS_ON: &[u8] = b"\x1b[?1004h";
 
 /// Pre-Kitty upscale filter (`RUSTPAL_CONSOLE_UPSCALE`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,7 +219,7 @@ impl Drop for TtyRawGuard {
 fn restore_terminal_ui() {
     // Pop while still on the alternate screen. Send this sequence exactly
     // once: a second pop after `?1049l` would affect the main-screen stack.
-    let seq = b"\x1b[<u\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?25h\x1b[?1049l\r\n";
+    let seq = b"\x1b[?1004l\x1b[<u\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?25h\x1b[?1049l\r\n";
     #[cfg(unix)]
     {
         let fd = TTY_FD.load(Ordering::SeqCst);
@@ -252,7 +259,7 @@ fn restore_termios_fd(fd: i32, orig: &libc::termios) {
 extern "C" fn console_signal_handler(sig: libc::c_int) {
     CONSOLE_QUIT.store(true, Ordering::SeqCst);
     // Inline minimal restore (only async-signal-safe calls).
-    let seq = b"\x1b[<u\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?25h\x1b[?1049l\r\n";
+    let seq = b"\x1b[?1004l\x1b[<u\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?25h\x1b[?1049l\r\n";
     unsafe {
         let fd = TTY_FD.load(Ordering::SeqCst);
         let out = if fd >= 0 { fd } else { libc::STDOUT_FILENO };
@@ -402,6 +409,7 @@ impl ConsoleVideo {
         // The keyboard-mode stack is screen-local, so push this only after
         // entering the alternate screen and pop it before leaving.
         out.write_all(KEYBOARD_PUSH_EVENT_TYPES)?;
+        out.write_all(FOCUS_EVENTS_ON)?;
         out.flush()?;
 
         #[cfg(unix)]
@@ -942,6 +950,14 @@ fn parse_escape(buf: &mut Vec<u8>) -> Option<KeyEvent> {
         if let Some(&last) = buf.last() {
             if (0x40..=0x7e).contains(&last) && buf.len() >= 3 {
                 let params = &buf[2..buf.len() - 1];
+                if params.is_empty() && last == b'O' {
+                    buf.clear();
+                    return Some(KeyEvent::ReleaseAll);
+                }
+                if params.is_empty() && last == b'I' {
+                    buf.clear();
+                    return None;
+                }
                 let code = match last {
                     b'A' => Some(KeyCode::ArrowUp),
                     b'B' => Some(KeyCode::ArrowDown),
@@ -960,7 +976,7 @@ fn parse_escape(buf: &mut Vec<u8>) -> Option<KeyEvent> {
                     b'u' => csi_primary_param(params).and_then(map_kitty_key_code),
                     _ => None,
                 };
-                let event = code.map(|code| key_event_from_csi(code, params));
+                let event = code.map(|code| key_event_from_csi(code, params, last == b'u'));
                 buf.clear();
                 return event;
             }
@@ -990,7 +1006,7 @@ fn parse_escape(buf: &mut Vec<u8>) -> Option<KeyEvent> {
 /// Convert a CSI key sequence into either a real state transition (when the
 /// terminal supplied a Kitty event type) or a deterministic one-frame tap for
 /// legacy sequences that have no release information.
-fn key_event_from_csi(code: KeyCode, params: &[u8]) -> KeyEvent {
+fn key_event_from_csi(code: KeyCode, params: &[u8], csi_u: bool) -> KeyEvent {
     match csi_event_type(params) {
         Some(1 | 2) => KeyEvent::State {
             code,
@@ -999,6 +1015,12 @@ fn key_event_from_csi(code: KeyCode, params: &[u8]) -> KeyEvent {
         Some(3) => KeyEvent::State {
             code,
             pressed: false,
+        },
+        // `CSI code u` only exists in the Kitty protocol; a missing event
+        // type there means press (release is always explicit as `:3`).
+        None if csi_u => KeyEvent::State {
+            code,
+            pressed: true,
         },
         _ => KeyEvent::Tap(code),
     }
@@ -1022,7 +1044,7 @@ fn csi_event_type(params: &[u8]) -> Option<u8> {
 fn map_kitty_key_code(code: u32) -> Option<KeyCode> {
     Some(match code {
         13 => KeyCode::Enter,
-        27 => KeyCode::Escape,
+        27 | 8 | 127 => KeyCode::Escape,
         32 => KeyCode::Space,
         97 | 65 => KeyCode::KeyA,
         100 | 68 => KeyCode::KeyD,
@@ -1046,6 +1068,15 @@ fn map_kitty_key_code(code: u32) -> Option<KeyCode> {
         57_407 => KeyCode::Numpad8,
         57_408 => KeyCode::Numpad9,
         57_414 => KeyCode::NumpadEnter,
+        57_417 => KeyCode::ArrowLeft,
+        57_418 => KeyCode::ArrowRight,
+        57_419 => KeyCode::ArrowUp,
+        57_420 => KeyCode::ArrowDown,
+        57_421 => KeyCode::PageUp,
+        57_422 => KeyCode::PageDown,
+        57_423 => KeyCode::Home,
+        57_424 => KeyCode::End,
+        57_425 => KeyCode::Insert,
         57_442 | 57_448 => KeyCode::ControlLeft,
         57_443 => KeyCode::AltLeft,
         57_449 => KeyCode::AltRight,
@@ -1770,6 +1801,36 @@ mod tests {
         assert_eq!(
             parse_escape(&mut buf),
             Some(KeyEvent::Tap(KeyCode::ArrowLeft))
+        );
+    }
+
+    #[test]
+    fn focus_out_releases_all_and_focus_in_is_ignored() {
+        let mut buf = b"\x1b[O".to_vec();
+        assert_eq!(parse_escape(&mut buf), Some(KeyEvent::ReleaseAll));
+        assert!(buf.is_empty());
+        let mut buf = b"\x1b[I".to_vec();
+        assert_eq!(parse_escape(&mut buf), None);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn kitty_csi_u_without_event_type_is_a_press() {
+        let mut buf = b"\x1b[13u".to_vec();
+        assert_eq!(
+            parse_escape(&mut buf),
+            Some(KeyEvent::State {
+                code: KeyCode::Enter,
+                pressed: true,
+            })
+        );
+        let mut buf = b"\x1b[104;1:3u".to_vec();
+        assert_eq!(
+            parse_escape(&mut buf),
+            Some(KeyEvent::State {
+                code: KeyCode::ArrowLeft,
+                pressed: false,
+            })
         );
     }
 

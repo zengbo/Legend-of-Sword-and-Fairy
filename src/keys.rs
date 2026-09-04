@@ -52,6 +52,9 @@ pub enum KeyCode {
 pub enum KeyEvent {
     State { code: KeyCode, pressed: bool },
     Tap(KeyCode),
+    /// The terminal/window lost focus: any key-up we would have received is
+    /// gone, so every physically held key must be treated as released.
+    ReleaseAll,
 }
 
 /// Map a winit key into the engine set. Returns `None` for keys we ignore.

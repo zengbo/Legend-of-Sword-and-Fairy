@@ -77,14 +77,22 @@ exits — so Kitty does not stay frozen on the game frame with invisible typing.
 | --- | --- |
 | Arrows / hjkl | Move |
 | Enter / Space | Confirm |
-| Esc | Menu / cancel |
+| Esc / Backspace | Menu / cancel |
 | R A D E W Q F S | Battle shortcuts (same as GUI) |
 | Ctrl-C | Quit |
 
-Compatible terminals use the Kitty keyboard protocol's real press/repeat/release
-events for functional keys. Legacy arrow/hjkl sequences are frame-latched taps:
-one sequence moves at most one step, and repeat bursts are coalesced instead of
-queuing extra movement after release.
+Compatible terminals (Kitty, WezTerm, foot, Ghostty, recent Alacritty) get the
+Kitty keyboard protocol with flags `1+2+8`: every key — arrows, hjkl, Enter,
+Space, battle letters — reports real press/repeat/release, so holding a key
+walks continuously exactly like the GUI build, and a bare Esc is recognised
+immediately (no 50 ms wait). Focus-out reporting (`?1004h`) releases all held
+keys when you switch windows, so a key-up lost to another window can never
+leave the party walking.
+
+Legacy terminals fall back to frame-latched taps: one arrow/hjkl sequence moves
+at most one step, and repeat bursts are coalesced instead of queuing extra
+movement after release. Holding a key there pauses until the OS autorepeat
+delay kicks in.
 
 ### Flicker (especially over SSH)
 
@@ -158,5 +166,5 @@ Console-only binary: `--no-default-features --features console`.
 - No music/SFX in console mode
 - Legacy terminals cannot report key-up; movement uses deterministic one-frame taps
 - Smooth physical hold/release requires Kitty keyboard event-type support
-- Bare Esc is recognized after the stdin poll (no long CSI wait)
+- Bare Esc on legacy terminals is recognized after a ~50 ms CSI timeout
 - Not a substitute for the 720p GUI / neural upscale path

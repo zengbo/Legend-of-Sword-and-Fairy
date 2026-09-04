@@ -994,6 +994,10 @@ impl Engine {
                         self.input.update_keyboard_state(now);
                     }
                     KeyEvent::Tap(code) => self.input.handle_key_tap(code),
+                    KeyEvent::ReleaseAll => {
+                        self.input.release_all();
+                        self.input.update_keyboard_state(now);
+                    }
                 }
             }
             if video.close_requested() {
