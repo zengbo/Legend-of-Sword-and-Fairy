@@ -6,8 +6,8 @@
 //!   * `nn` (default) — nearest-neighbor; scale pixel-aligned to cell size
 //!     (`RUSTPAL_CONSOLE_KITTY_NN=1..8` overrides).
 //!   * `hqx4` / `xbr4` — CPU HQ4x (two HQ2x passes) → 1280×800.
-//!   * `neural` — same GPU mega-kernel as the GUI (`OfflineUpscaler` readback);
-//!     needs the `gui` feature + `SHADER_F16` adapter; falls back to `hqx4`.
+//!   * `neural` — same GPU mega-kernel as the GUI (`OfflineUpscaler` readback; `neural` feature);
+//!     needs the `neural` feature (in `gui` or `console-neural`) + `SHADER_F16` adapter; falls back to `hqx4`.
 //! * **ANSI** — half-block truecolor cells, modest integer upscale.
 //!
 //! Input is read on a **background thread** from `/dev/tty` so keys (and a
@@ -29,10 +29,10 @@ use std::io::Read;
 #[cfg(unix)]
 use std::os::fd::IntoRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-#[cfg(feature = "gui")]
+#[cfg(feature = "neural")]
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-#[cfg(feature = "gui")]
+#[cfg(feature = "neural")]
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -76,7 +76,7 @@ enum ConsoleUpscale {
     Nearest,
     /// CPU HQ4x → 1280×800.
     Hqx4,
-    /// GPU neural 4× → 1280×800 (gui feature + F16 GPU).
+    /// GPU neural 4× → 1280×800 (`neural` feature + F16 GPU).
     Neural,
 }
 
@@ -134,8 +134,8 @@ pub struct ConsoleVideo {
     pending: Vec<KeyEvent>,
     /// Optional HTTP control API (`RUSTPAL_UI_DRIVER` / `--ui-driver`).
     ui_driver: Option<crate::ui_driver::UiDriver>,
-    /// Async GPU neural path (gui feature). Worker thread owns OfflineUpscaler.
-    #[cfg(feature = "gui")]
+    /// Async GPU neural path (`neural` feature). Worker thread owns OfflineUpscaler.
+    #[cfg(feature = "neural")]
     neural: Option<NeuralAsync>,
     /// Last time we submitted a 320×200 job to the neural worker.
     last_neural_submit: Instant,
@@ -304,10 +304,10 @@ impl ConsoleVideo {
         let reserve_top = u32::from(show_fps);
 
         let mut upscale = resolve_console_upscale();
-        #[cfg(not(feature = "gui"))]
+        #[cfg(not(feature = "neural"))]
         if upscale == ConsoleUpscale::Neural {
             eprintln!(
-                "rustpal: console neural needs the `gui` feature (wgpu); falling back to hqx4"
+                "rustpal: console neural needs the `neural` feature (build with --features console-neural); falling back to hqx4"
             );
             upscale = ConsoleUpscale::Hqx4;
         }
@@ -319,9 +319,9 @@ impl ConsoleVideo {
         let kitty_nn_scale = layout.kitty_nn_scale;
         let ansi_scale = layout.ansi_scale;
 
-        #[cfg(feature = "gui")]
+        #[cfg(feature = "neural")]
         let mut neural = None;
-        #[cfg(feature = "gui")]
+        #[cfg(feature = "neural")]
         {
             if upscale == ConsoleUpscale::Neural {
                 match NeuralAsync::start(place_cols) {
@@ -462,7 +462,7 @@ impl ConsoleVideo {
             esc_solo_since: None,
             pending: Vec::new(),
             ui_driver,
-            #[cfg(feature = "gui")]
+            #[cfg(feature = "neural")]
             neural,
             last_neural_submit: Instant::now() - NEURAL_SUBMIT_INTERVAL,
             last_fps_banner: Instant::now() - NEURAL_FPS_BANNER_INTERVAL,
@@ -613,13 +613,13 @@ impl ConsoleVideo {
         let force = self.frame_n < 3;
 
         // 1) Poll worker first (cheap) — may already have something to show.
-        #[cfg(feature = "gui")]
+        #[cfg(feature = "neural")]
         let (have_frame, is_new) = if let Some(ref mut neural) = self.neural {
             neural.poll_payload()
         } else {
             (false, false)
         };
-        #[cfg(not(feature = "gui"))]
+        #[cfg(not(feature = "neural"))]
         let (have_frame, is_new) = (false, false);
 
         // 2) Submit at most ~12 fps. Skip render_rgba + 256KB compare on every
@@ -629,7 +629,7 @@ impl ConsoleVideo {
         if due_submit {
             render_rgba(surf, palette, shake, &mut self.rgba);
             self.last_neural_submit = now;
-            #[cfg(feature = "gui")]
+            #[cfg(feature = "neural")]
             if let Some(ref neural) = self.neural {
                 neural.submit(&self.rgba);
             }
@@ -657,7 +657,7 @@ impl ConsoleVideo {
             self.last_present = now;
             self.frame_n = self.frame_n.saturating_add(1);
             let first = self.frame_n == 1;
-            #[cfg(feature = "gui")]
+            #[cfg(feature = "neural")]
             {
                 let payload = self.neural.as_ref().and_then(|n| n.payload_arc());
                 if let Some(payload) = payload {
@@ -685,7 +685,7 @@ impl ConsoleVideo {
     }
 
     /// Write a prebuilt Kitty APC (no zlib on main).
-    #[cfg(feature = "gui")]
+    #[cfg(feature = "neural")]
     fn emit_neural_payload_bytes(&mut self, payload: &[u8], first: bool, now: Instant) {
         let mut out = io::stdout();
         let use_sync = sync_output_enabled(self.over_ssh);
@@ -1097,7 +1097,7 @@ fn detect_kitty() -> bool {
 }
 
 /// Shared job slot: latest 320×200 frame + condvar (no 2ms poll spin).
-#[cfg(feature = "gui")]
+#[cfg(feature = "neural")]
 struct NeuralInputSlot {
     frame: Mutex<Option<Vec<u8>>>,
     cvar: Condvar,
@@ -1107,7 +1107,7 @@ struct NeuralInputSlot {
 ///
 /// Main thread rate-limits `submit` (~12/s) and only `write_all`s when a new
 /// `Arc` payload is ready — no multi-MB clone, no re-send of the same image.
-#[cfg(feature = "gui")]
+#[cfg(feature = "neural")]
 struct NeuralAsync {
     input: Arc<NeuralInputSlot>,
     /// Prebuilt Kitty APC (`Arc` so main never copies multi-MB buffers).
@@ -1120,7 +1120,7 @@ struct NeuralAsync {
     adapter_name: String,
 }
 
-#[cfg(feature = "gui")]
+#[cfg(feature = "neural")]
 impl NeuralAsync {
     fn start(place_cols: u32) -> Option<NeuralAsync> {
         use crate::native_upscale::offline::{OfflineUpscaler, INPUT_SIZE, OUTPUT_SIZE};
@@ -1278,7 +1278,7 @@ impl NeuralAsync {
     }
 }
 
-#[cfg(feature = "gui")]
+#[cfg(feature = "neural")]
 impl Drop for NeuralAsync {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -1691,7 +1691,10 @@ fn write_kitty_frame_level(
 ) -> io::Result<()> {
     assert_eq!(rgba.len(), (width * height * 4) as usize);
     let level = zlib_level.clamp(1, 9);
-    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(rgba, level);
+    // The game frame is opaque: ship 24-bit RGB (f=24), 25% less raw data
+    // before zlib and a proportionally shorter base64 stream.
+    let rgb = rgba_to_rgb(rgba);
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&rgb, level);
     let payload = BASE64.encode(&compressed);
     let chunks: Vec<&[u8]> = payload.as_bytes().chunks(KITTY_CHUNK).collect();
     let last = chunks.len().saturating_sub(1);
@@ -1701,7 +1704,7 @@ fn write_kitty_frame_level(
             // a=T transmit+display, c= columns (Kitty scales), C=1 keep cursor.
             write!(
                 out,
-                "\x1b_Ga=T,f=32,o=z,s={width},v={height},t=d,i={image_id},p=1,c={place_cols},C=1,q=2,m={more};"
+                "\x1b_Ga=T,f=24,o=z,s={width},v={height},t=d,i={image_id},p=1,c={place_cols},C=1,q=2,m={more};"
             )?;
         } else {
             write!(out, "\x1b_Gm={more};")?;
@@ -1710,6 +1713,15 @@ fn write_kitty_frame_level(
         write!(out, "\x1b\\")?;
     }
     Ok(())
+}
+
+/// Drop the alpha channel: Kitty `f=24` expects packed RGB.
+fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
+    for px in rgba.chunks_exact(4) {
+        rgb.extend_from_slice(&px[..3]);
+    }
+    rgb
 }
 
 // --- ANSI --------------------------------------------------------------------
@@ -1758,7 +1770,14 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("c=80"), "{s}");
         assert!(s.contains("a=T"), "{s}");
+        assert!(s.contains("f=24"), "{s}");
         assert!(s.contains("i=1"), "{s}");
+    }
+
+    #[test]
+    fn kitty_payload_is_packed_rgb() {
+        let px = [1u8, 2, 3, 255, 4, 5, 6, 255];
+        assert_eq!(rgba_to_rgb(&px), vec![1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

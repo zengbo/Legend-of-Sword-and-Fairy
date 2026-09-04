@@ -8,8 +8,8 @@
 
 use std::num::NonZeroU64;
 
-use pixels::wgpu;
-use pixels::wgpu::util::DeviceExt;
+use wgpu;
+use wgpu::util::DeviceExt;
 
 pub(crate) const INPUT_W: u32 = 320;
 pub(crate) const INPUT_H: u32 = 200;

@@ -11,11 +11,16 @@ crate-type = ["rlib", "cdylib"]
 default = ["gui", "console"]
 # Desktop window (winit + pixels + cpal). Needs system packages on Linux
 # (pkg-config, libasound, X11/Wayland, …).
-gui = ["dep:winit", "dep:pixels", "dep:cpal", "dep:pollster", "dep:png"]
+gui = ["dep:winit", "dep:pixels", "dep:cpal", "dep:png", "neural"]
 # Pure terminal backend: no window, no sound device. Builds with only crates.io
 # deps (see --no-default-features --features console). `png` is pure Rust and
 # only needed for the optional HTTP UI driver (`--ui-driver`).
 console = ["dep:base64", "dep:miniz_oxide", "dep:libc", "dep:png"]
+# Headless wgpu neural upscaler (Real-ESRGAN mega-kernel). Pulled in by `gui`;
+# add it to a console-only build for `RUSTPAL_CONSOLE_UPSCALE=neural` without
+# any window/audio system libs: --no-default-features --features console-neural
+neural = ["dep:wgpu", "dep:pollster"]
+console-neural = ["console", "neural"]
 
 [dependencies]
 web-time = "1"
@@ -28,6 +33,9 @@ pixels = { version = "0.17.2", optional = true }
 cpal = { version = "0.15", optional = true }
 png = { version = "0.18", optional = true }
 pollster = { version = "0.4", optional = true }
+# Same wgpu that `pixels` re-exports; a direct dep lets console builds use the
+# headless compute path without pixels/winit.
+wgpu = { version = "29", optional = true }
 # Console video: Kitty graphics protocol (+ ANSI fallback). Pure Rust crates + libc for termios.
 base64 = { version = "0.22", optional = true }
 miniz_oxide = { version = "0.8", optional = true }

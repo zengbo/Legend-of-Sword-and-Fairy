@@ -12,7 +12,7 @@
 use super::{
     request_headless_gpu, NativeUpscaler, INPUT_H, INPUT_W, OUTPUT_H, OUTPUT_ROW_BYTES, OUTPUT_W,
 };
-use pixels::wgpu;
+use wgpu;
 
 /// Size of the RGBA buffer `upscale` expects to be handed.
 pub const INPUT_SIZE: usize = (INPUT_W * INPUT_H * 4) as usize;

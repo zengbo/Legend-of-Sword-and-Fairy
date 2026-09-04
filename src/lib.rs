@@ -15,7 +15,7 @@ pub mod keys;
 pub mod magicmenu;
 pub mod map;
 pub mod mkf;
-#[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
+#[cfg(all(not(target_arch = "wasm32"), feature = "neural"))]
 pub mod native_upscale;
 pub mod opl;
 pub mod palette;

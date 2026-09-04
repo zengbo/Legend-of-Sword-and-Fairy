@@ -8,6 +8,8 @@ no system GUI/audio packages** when built with the `console` feature alone.
 ```shell
 # Console only (crates.io deps: base64, miniz_oxide, libc)
 cargo build --release --no-default-features --features console
+# Headless + GPU neural upscale (wgpu, no window/audio libs):
+cargo build --release --no-default-features --features console-neural
 
 # Default: GUI + console (both backends; --console selects terminal at runtime)
 cargo build --release
@@ -54,7 +56,7 @@ sizes with graphics-protocol `c=` (columns). Filter via
 |-------|--------|--------|--------|
 | `nn` (default) | Nearest-neighbor | `320×N × 200×N` | Pixel-align `N` + `c=` to cell size when known |
 | `hqx4` / `xbr4` | CPU HQ4x (2× HQ2x) | 1280×800 | No GPU; smoother than raw NN |
-| `neural` | GUI mega-kernel (wgpu) | 1280×800 | **Async** worker: GPU + zlib/Kitty encode off main; needs `gui` + F16 GPU; else `hqx4` |
+| `neural` | GUI mega-kernel (wgpu) | 1280×800 | **Async** worker: GPU + zlib/Kitty encode off main; needs the `neural` feature (in `gui`, or `--features console-neural` for headless builds) + F16 GPU; else `hqx4` |
 
 When the terminal reports cell pixel size, **`c=` is chosen** for a sharp
 display: **nn** aims on-screen width ≈ `320×N`; **hqx4/neural** keep a 1280×800
@@ -114,7 +116,7 @@ Prefer `kitten ssh user@host`. Avoid tmux unless passthrough is enabled.
 ### Kitty mode
 
 Uses the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
-to draw the real **320×200 RGBA** frame (zlib + base64 APC chunks), same idea as
+to draw the real **320×200** frame as 24-bit RGB (zlib + base64 APC chunks), same idea as
 [zenbu-labs/terminal-browser](https://github.com/zenbu-labs/terminal-browser)
 (`pixel-core` kitty transmit). Works in Kitty, Ghostty, and other supporting
 terminals (often over SSH).
