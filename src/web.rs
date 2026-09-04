@@ -16,7 +16,7 @@ use std::io;
 use js_sys::{Atomics, Int32Array, SharedArrayBuffer, Uint8Array};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use crate::keys::KeyCode;
+use crate::keys::{KeyCode, KeyEvent};
 
 use crate::game_loop::PalColor;
 use crate::surface::{Surface, SCREEN_H, SCREEN_W};
@@ -79,7 +79,7 @@ impl Video {
     /// Drain key events written by the main thread since the last pump.
     /// Ring layout: [0] = write counter (main thread), [1] = read counter
     /// (mirrored here for debugging), [2..] = event slots.
-    pub fn pump(&mut self) -> Vec<(KeyCode, bool)> {
+    pub fn pump(&mut self) -> Vec<KeyEvent> {
         let mut out = Vec::new();
         let capacity = self.input.length().saturating_sub(2);
         if capacity == 0 {
@@ -95,7 +95,7 @@ impl Video {
             let v = Atomics::load(&self.input, slot).unwrap_or(0);
             let pressed = v & 1 != 0;
             if let Some(&code) = WEB_KEYS.get((v >> 1) as usize) {
-                out.push((code, pressed));
+                out.push(KeyEvent::State { code, pressed });
             }
             self.read_seq = self.read_seq.wrapping_add(1);
         }

@@ -516,8 +516,8 @@ impl Engine {
 
     /// PAL_UpdateParty: walk the party according to input.
     pub fn update_party(&mut self) {
-        if self.input.dir != input::DIR_UNKNOWN {
-            let dir = self.input.dir;
+        let dir = self.input.take_direction();
+        if dir != input::DIR_UNKNOWN {
             let x_offset = if dir == input::DIR_WEST || dir == input::DIR_SOUTH {
                 -16
             } else {
@@ -968,6 +968,47 @@ mod tests {
             assert_eq!(eng.globals.trail[0].y, y_source as u16);
             assert_eq!(eng.globals.trail[0].direction, global::DIR_EAST);
         }
+    }
+
+    #[test]
+    fn update_party_consumes_a_terminal_tap_for_exactly_one_frame() {
+        use crate::keys::KeyCode;
+
+        let mut eng = engine();
+        eng.globals.load_default_game().unwrap();
+        eng.globals.load_flags = LOAD_SCENE | LOAD_PLAYER_SPRITE;
+        eng.res.load_resources(&mut eng.globals).unwrap();
+        eng.globals.party[0].x = eng.globals.partyoffset.0 as i16;
+        eng.globals.party[0].y = eng.globals.partyoffset.1 as i16;
+
+        let source = (
+            eng.globals.viewport.0 + eng.globals.partyoffset.0,
+            eng.globals.viewport.1 + eng.globals.partyoffset.1,
+        );
+        let candidates = [
+            (KeyCode::ArrowDown, (-16, 8)),
+            (KeyCode::ArrowLeft, (-16, -8)),
+            (KeyCode::ArrowUp, (16, -8)),
+            (KeyCode::ArrowRight, (16, 8)),
+        ];
+        let (key, offset) = candidates
+            .into_iter()
+            .find(|(_, (dx, dy))| {
+                !eng.check_obstacle_with_range((source.0 + dx, source.1 + dy), true, 0, true)
+            })
+            .expect("the initial party position should have an open adjacent step");
+
+        let before = eng.globals.viewport;
+        eng.input.handle_key_tap(key);
+        eng.update_party();
+        assert_eq!(
+            eng.globals.viewport,
+            (before.0 + offset.0, before.1 + offset.1)
+        );
+
+        let after_one_step = eng.globals.viewport;
+        eng.update_party();
+        assert_eq!(eng.globals.viewport, after_one_step);
     }
 
     // ---------------------------------------------------------------------

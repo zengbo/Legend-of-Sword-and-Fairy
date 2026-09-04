@@ -42,6 +42,8 @@ pub(crate) mod agent_state;
 pub mod uibattle;
 pub mod uigame;
 #[cfg(all(not(target_arch = "wasm32"), feature = "console"))]
+pub(crate) mod hqx;
+#[cfg(all(not(target_arch = "wasm32"), feature = "console"))]
 pub mod video_console;
 pub mod voc;
 #[cfg(target_arch = "wasm32")]

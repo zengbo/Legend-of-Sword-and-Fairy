@@ -34,7 +34,7 @@ use winit::window::{Window, WindowId};
 #[cfg(target_arch = "wasm32")]
 use crate::web::Video;
 
-use crate::keys::KeyCode;
+use crate::keys::KeyEvent;
 
 use crate::data::DataDir;
 use crate::font::Font;
@@ -138,7 +138,7 @@ struct VideoApp {
     /// Windows this is lowered to Vulkan when that backend is selected.
     upscaler: Option<crate::native_upscale::NativeUpscaler>,
     surface_size: (u32, u32),
-    key_events: Vec<(KeyCode, bool)>,
+    key_events: Vec<KeyEvent>,
     close_requested: bool,
     /// RGBA staging buffer for the native 720p presentation surface.
     rgba: Vec<u8>,
@@ -240,8 +240,10 @@ impl ApplicationHandler for VideoApp {
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if let Some(code) = crate::keys::from_winit(code) {
-                        self.key_events
-                            .push((code, event.state == ElementState::Pressed));
+                        self.key_events.push(KeyEvent::State {
+                            code,
+                            pressed: event.state == ElementState::Pressed,
+                        });
                     }
                 }
             }
@@ -294,12 +296,17 @@ impl GuiVideo {
     }
 
     /// Pump pending window events; returns collected key transitions.
-    fn pump(&mut self) -> Vec<(KeyCode, bool)> {
+    fn pump(&mut self) -> Vec<KeyEvent> {
         self.event_loop
             .pump_app_events(Some(Duration::ZERO), &mut self.app);
         let mut events = std::mem::take(&mut self.app.key_events);
         if let Some(driver) = self.ui_driver.as_ref() {
-            driver.drain_input(&mut events);
+            let mut injected = Vec::new();
+            driver.drain_input(&mut injected);
+            events.extend(injected.into_iter().map(|(code, pressed)| KeyEvent::State {
+                code,
+                pressed,
+            }));
         }
         events
     }
@@ -458,7 +465,7 @@ impl Video {
         }
     }
 
-    fn pump(&mut self) -> Vec<(KeyCode, bool)> {
+    fn pump(&mut self) -> Vec<KeyEvent> {
         match self {
             #[cfg(feature = "gui")]
             Video::Gui(v) => v.pump(),
@@ -975,8 +982,13 @@ impl Engine {
     /// PAL_ProcessEvent: pump window events and update the input state.
     pub fn process_event(&mut self) {
         if let Some(video) = self.video.as_mut() {
-            for (code, pressed) in video.pump() {
-                self.input.handle_key_event(code, pressed);
+            for event in video.pump() {
+                match event {
+                    KeyEvent::State { code, pressed } => {
+                        self.input.handle_key_event(code, pressed)
+                    }
+                    KeyEvent::Tap(code) => self.input.handle_key_tap(code),
+                }
             }
             if video.close_requested() {
                 self.quit_requested = true;

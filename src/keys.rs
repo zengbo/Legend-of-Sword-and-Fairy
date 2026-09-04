@@ -42,6 +42,18 @@ pub enum KeyCode {
     NumpadEnter,
 }
 
+/// A normalized input event from a video/input backend.
+///
+/// `State` is used when the backend can report a real key-up event. `Tap` is
+/// for legacy terminals, which only provide an undifferentiated press/repeat
+/// byte sequence. A tap is latched until one game input cycle consumes it, so
+/// its behavior does not depend on wall-clock timing or rendering latency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyEvent {
+    State { code: KeyCode, pressed: bool },
+    Tap(KeyCode),
+}
+
 /// Map a winit key into the engine set. Returns `None` for keys we ignore.
 #[cfg(all(not(target_arch = "wasm32"), feature = "gui"))]
 pub fn from_winit(code: winit::keyboard::KeyCode) -> Option<KeyCode> {

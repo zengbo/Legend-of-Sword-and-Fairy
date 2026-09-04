@@ -1,16 +1,22 @@
 //! Pure terminal video backend (no window, no system graphics/audio libs).
 //!
-//! * **Kitty** — nearest-neighbor upscale the logical 320×200 frame, then
-//!   transmit; on-screen size uses protocol `c=` (columns). The NN factor and
-//!   `c=` are **pixel-aligned** to the terminal cell size when known, so Kitty
-//!   scales ~1:1 instead of soft-stretching. Override NN with
-//!   `RUSTPAL_CONSOLE_KITTY_NN=1..8` (`1` = raw 320×200).
+//! * **Kitty** — upscale the logical 320×200 frame, then transmit; on-screen
+//!   size uses protocol `c=` (columns). Upscale mode via
+//!   `RUSTPAL_CONSOLE_UPSCALE`:
+//!   * `nn` (default) — nearest-neighbor; scale pixel-aligned to cell size
+//!     (`RUSTPAL_CONSOLE_KITTY_NN=1..8` overrides).
+//!   * `hqx4` / `xbr4` — CPU HQ4x (two HQ2x passes) → 1280×800.
+//!   * `neural` — same GPU mega-kernel as the GUI (`OfflineUpscaler` readback);
+//!     needs the `gui` feature + `SHADER_F16` adapter; falls back to `hqx4`.
 //! * **ANSI** — half-block truecolor cells, modest integer upscale.
 //!
 //! Input is read on a **background thread** from `/dev/tty` so keys (and a
 //! stuck main thread) still work. Ctrl-C is handled by a signal handler that
 //! **restores the terminal** (leave alt screen, re-enable echo) before exit —
 //! a bare SIGINT kill would leave Kitty stuck on the game buffer.
+//! Compatible terminals report real functional-key press/repeat/release events;
+//! legacy input is delivered as frame-latched taps so timing cannot create
+//! duplicate movement steps.
 //!
 //! After the alternate screen is entered, **stderr is redirected** away from
 //! the tty (to `RUSTPAL_CONSOLE_LOG` or `/dev/null`) so `eprintln!` from the
@@ -23,7 +29,11 @@ use std::io::Read;
 #[cfg(unix)]
 use std::os::fd::IntoRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+#[cfg(feature = "gui")]
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+#[cfg(feature = "gui")]
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,7 +41,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 
 use crate::game_loop::{render_rgba, PalColor};
-use crate::keys::KeyCode;
+use crate::keys::{KeyCode, KeyEvent};
 use crate::surface::{Surface, SCREEN_H, SCREEN_W};
 
 const KITTY_CHUNK: usize = 4096;
@@ -40,8 +50,28 @@ const IMAGE_ID: u32 = 1;
 const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(70);
 /// SSH has higher latency; fewer full-frame APC blasts = less white flash.
 const MIN_FRAME_INTERVAL_SSH: Duration = Duration::from_millis(100);
-/// How long a key stays down for the engine after a terminal press / repeat.
-const KEY_HOLD: Duration = Duration::from_millis(180);
+/// Neural is async: only used for warmup / rare fallback emits.
+const MIN_FRAME_INTERVAL_NEURAL: Duration = Duration::from_millis(50);
+const MIN_FRAME_INTERVAL_NEURAL_SSH: Duration = Duration::from_millis(80);
+/// How often to push a new 320×200 job to the neural worker (~12 fps max).
+const NEURAL_SUBMIT_INTERVAL: Duration = Duration::from_millis(80);
+/// FPS text-only refresh when the image is unchanged.
+const NEURAL_FPS_BANNER_INTERVAL: Duration = Duration::from_millis(500);
+/// Ask compatible terminals to report repeat/release for functional keys.
+/// Requesting only the event-types flag preserves legacy Ctrl-C/ISIG and
+/// plain-text key encoding.
+const KEYBOARD_PUSH_EVENT_TYPES: &[u8] = b"\x1b[>2u";
+
+/// Pre-Kitty upscale filter (`RUSTPAL_CONSOLE_UPSCALE`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConsoleUpscale {
+    /// Integer nearest-neighbor (scale from layout / env).
+    Nearest,
+    /// CPU HQ4x → 1280×800.
+    Hqx4,
+    /// GPU neural 4× → 1280×800 (gui feature + F16 GPU).
+    Neural,
+}
 
 /// Set by SIGINT/SIGTERM so the game loop can also quit cleanly if needed.
 static CONSOLE_QUIT: AtomicBool = AtomicBool::new(false);
@@ -60,20 +90,16 @@ pub enum ConsoleMode {
     Ansi,
 }
 
-struct HeldKey {
-    code: KeyCode,
-    until: Instant,
-}
-
 pub struct ConsoleVideo {
     use_kitty: bool,
     /// True when `SSH_CONNECTION` / `SSH_TTY` is set — use flicker-resistant path.
     over_ssh: bool,
+    /// Pre-transmit filter (nn / hqx4 / neural).
+    upscale: ConsoleUpscale,
     /// Kitty: display width in terminal cells (`c=`). Aspect preserved by Kitty.
     place_cols: u32,
-    /// Kitty: integer nearest-neighbor scale applied *before* transmit (1 = raw
-    /// 320×200; default 4 local / 3 SSH). Keeps pixel edges hard when Kitty
-    /// resizes to `place_cols`.
+    /// Kitty: integer nearest-neighbor scale when `upscale == Nearest` (1 = raw
+    /// 320×200). HQX/neural always emit 1280×800 (logical 4×).
     kitty_nn_scale: u32,
     /// ANSI only: integer nearest-neighbor scale (1–3).
     ansi_scale: u32,
@@ -82,6 +108,8 @@ pub struct ConsoleVideo {
     image_row: u32,
     rgba: Vec<u8>,
     scaled: Vec<u8>,
+    /// Mid buffer for HQ4x (640×400).
+    hqx_tmp: Vec<u8>,
     prev_rgba: Vec<u8>,
     last_present: Instant,
     close_requested: bool,
@@ -96,10 +124,16 @@ pub struct ConsoleVideo {
     key_rx: Receiver<u8>,
     esc_buf: Vec<u8>,
     esc_solo_since: Option<Instant>,
-    held: Vec<HeldKey>,
-    pending: Vec<(KeyCode, bool)>,
+    pending: Vec<KeyEvent>,
     /// Optional HTTP control API (`RUSTPAL_UI_DRIVER` / `--ui-driver`).
     ui_driver: Option<crate::ui_driver::UiDriver>,
+    /// Async GPU neural path (gui feature). Worker thread owns OfflineUpscaler.
+    #[cfg(feature = "gui")]
+    neural: Option<NeuralAsync>,
+    /// Last time we submitted a 320×200 job to the neural worker.
+    last_neural_submit: Instant,
+    /// Last time we rewrote the FPS banner without a new image.
+    last_fps_banner: Instant,
     /// Restores original stderr when the console backend ends.
     #[cfg(unix)]
     _stderr_guard: Option<StderrRedirect>,
@@ -176,21 +210,31 @@ impl Drop for TtyRawGuard {
 /// Leave alt screen, show cursor, drop Kitty images, restore cooked termios.
 /// Safe to call more than once. Used from `Drop` and from the SIGINT handler.
 fn restore_terminal_ui() {
-    // Best-effort writes — ignore errors (stdout may be half-dead in a handler).
-    let seq = b"\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?25h\x1b[?1049l\r\n";
-    let _ = io::stdout().write_all(seq);
-    let _ = io::stdout().flush();
+    // Pop while still on the alternate screen. Send this sequence exactly
+    // once: a second pop after `?1049l` would affect the main-screen stack.
+    let seq = b"\x1b[<u\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?25h\x1b[?1049l\r\n";
     #[cfg(unix)]
-    unsafe {
-        // Also write directly to the tty fd (async-signal-safe path for handlers).
+    {
         let fd = TTY_FD.load(Ordering::SeqCst);
         if fd >= 0 {
-            let _ = libc::write(fd, seq.as_ptr() as *const _, seq.len());
+            unsafe {
+                let _ = libc::write(fd, seq.as_ptr() as *const _, seq.len());
+            }
+        } else {
+            let _ = io::stdout().write_all(seq);
+            let _ = io::stdout().flush();
         }
         if TERMIOS_SAVED.load(Ordering::SeqCst) {
             let tfd = if fd >= 0 { fd } else { libc::STDIN_FILENO };
-            let _ = libc::tcsetattr(tfd, libc::TCSANOW, std::ptr::addr_of!(SAVED_TERMIOS));
+            unsafe {
+                let _ = libc::tcsetattr(tfd, libc::TCSANOW, std::ptr::addr_of!(SAVED_TERMIOS));
+            }
         }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = io::stdout().write_all(seq);
+        let _ = io::stdout().flush();
     }
 }
 
@@ -208,7 +252,7 @@ fn restore_termios_fd(fd: i32, orig: &libc::termios) {
 extern "C" fn console_signal_handler(sig: libc::c_int) {
     CONSOLE_QUIT.store(true, Ordering::SeqCst);
     // Inline minimal restore (only async-signal-safe calls).
-    let seq = b"\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?25h\x1b[?1049l\r\n";
+    let seq = b"\x1b[<u\x1b_Ga=d,d=A,q=2\x1b\\\x1b[?25h\x1b[?1049l\r\n";
     unsafe {
         let fd = TTY_FD.load(Ordering::SeqCst);
         let out = if fd >= 0 { fd } else { libc::STDOUT_FILENO };
@@ -251,10 +295,46 @@ impl ConsoleVideo {
         // Kitty image is not clipped at the bottom by a one-line help bar.
         let image_row = if show_fps { 2 } else { 1 };
         let reserve_top = u32::from(show_fps);
-        let layout = resolve_console_layout(use_kitty, over_ssh, reserve_top);
+
+        let mut upscale = resolve_console_upscale();
+        #[cfg(not(feature = "gui"))]
+        if upscale == ConsoleUpscale::Neural {
+            eprintln!(
+                "rustpal: console neural needs the `gui` feature (wgpu); falling back to hqx4"
+            );
+            upscale = ConsoleUpscale::Hqx4;
+        }
+
+        // Layout before starting the neural worker so it can pre-encode Kitty
+        // payloads with the final `c=` (place_cols).
+        let layout = resolve_console_layout(use_kitty, over_ssh, reserve_top, upscale);
         let place_cols = layout.place_cols;
         let kitty_nn_scale = layout.kitty_nn_scale;
         let ansi_scale = layout.ansi_scale;
+
+        #[cfg(feature = "gui")]
+        let mut neural = None;
+        #[cfg(feature = "gui")]
+        {
+            if upscale == ConsoleUpscale::Neural {
+                match NeuralAsync::start(place_cols) {
+                    Some(n) => {
+                        eprintln!(
+                            "rustpal: console neural async (GPU {} + zlib/Kitty on worker) — place_cols={place_cols}",
+                            n.adapter_name()
+                        );
+                        neural = Some(n);
+                    }
+                    None => {
+                        eprintln!(
+                            "rustpal: console neural unavailable (need SHADER_F16 GPU); falling back to hqx4"
+                        );
+                        upscale = ConsoleUpscale::Hqx4;
+                        // place_cols already match 1280-wide path for hqx/neural.
+                    }
+                }
+            }
+        }
 
         #[cfg(unix)]
         let (key_rx, tty_guard) = spawn_tty_reader()?;
@@ -267,24 +347,23 @@ impl ConsoleVideo {
         let ui_driver = crate::ui_driver::UiDriver::start_from_env()?;
 
         let label = if use_kitty { "Kitty" } else { "ANSI" };
+        let filter_tag = match upscale {
+            ConsoleUpscale::Nearest => "nn",
+            ConsoleUpscale::Hqx4 => "hqx4",
+            ConsoleUpscale::Neural => "neural",
+        };
         let size_note = if use_kitty {
-            let src_w = SCREEN_W as u32 * kitty_nn_scale;
-            let src_h = SCREEN_H as u32 * kitty_nn_scale;
+            let src_w = kitty_output_width(upscale, kitty_nn_scale);
+            let src_h = kitty_output_height(upscale, kitty_nn_scale);
             match layout.cell {
                 Some((cw, ch)) => {
                     let disp_w = place_cols * cw;
-                    let align = if disp_w == src_w {
-                        "1:1"
-                    } else {
-                        "near"
-                    };
+                    let align = if disp_w == src_w { "1:1" } else { "near" };
                     format!(
-                        "nn {kitty_nn_scale}× → {src_w}×{src_h}, {place_cols} cols ({disp_w}px, cell {cw}×{ch}, {align})"
+                        "{filter_tag} → {src_w}×{src_h}, {place_cols} cols ({disp_w}px, cell {cw}×{ch}, {align})"
                     )
                 }
-                None => format!(
-                    "nn {kitty_nn_scale}× → {src_w}×{src_h}, {place_cols} cols wide"
-                ),
+                None => format!("{filter_tag} → {src_w}×{src_h}, {place_cols} cols wide"),
             }
         } else {
             format!(
@@ -299,7 +378,7 @@ impl ConsoleVideo {
         // Help/controls live on the primary screen only — printing them inside
         // the alt buffer permanently steals a row and clips a full-height frame.
         eprintln!(
-            "rustpal: console backend ready ({label}, place_cols={place_cols}, kitty_nn={kitty_nn_scale}, ansi_scale={ansi_scale}, ssh={over_ssh}, fps={show_fps})"
+            "rustpal: console backend ready ({label}, upscale={filter_tag}, place_cols={place_cols}, kitty_nn={kitty_nn_scale}, ansi_scale={ansi_scale}, ssh={over_ssh}, fps={show_fps})"
         );
         eprintln!(
             "rustpal console ({label} · {size_note}{ssh_note}{fps_note}) — arrows/hjkl · Enter · Esc · Ctrl-C restores terminal & quits"
@@ -320,6 +399,9 @@ impl ConsoleVideo {
         let mut out = io::stdout();
         // Alternate screen once — no status line on row 1 unless FPS is enabled.
         write!(out, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
+        // The keyboard-mode stack is screen-local, so push this only after
+        // entering the alternate screen and pop it before leaving.
+        out.write_all(KEYBOARD_PUSH_EVENT_TYPES)?;
         out.flush()?;
 
         #[cfg(unix)]
@@ -330,25 +412,37 @@ impl ConsoleVideo {
         #[cfg(unix)]
         let stderr_guard = StderrRedirect::install()?;
 
-        // Shared NN buffer: Kitty (default 3×/4×) or ANSI (1–3×).
+        // Output buffer: NN uses scale²; HQX/neural always 1280×800.
         let scaled_len = if use_kitty {
-            let s = kitty_nn_scale.max(1) as usize;
-            SCREEN_W * SCREEN_H * 4 * s * s
+            match upscale {
+                ConsoleUpscale::Nearest => {
+                    let s = kitty_nn_scale.max(1) as usize;
+                    SCREEN_W * SCREEN_H * 4 * s * s
+                }
+                ConsoleUpscale::Hqx4 | ConsoleUpscale::Neural => 1280 * 800 * 4,
+            }
         } else {
             (SCREEN_W * SCREEN_H * 4) * (ansi_scale as usize).pow(2)
+        };
+        let hqx_tmp_len = if upscale == ConsoleUpscale::Hqx4 {
+            640 * 400 * 4
+        } else {
+            0
         };
 
         Ok(ConsoleVideo {
             use_kitty,
             over_ssh,
+            upscale,
             place_cols,
             kitty_nn_scale,
             ansi_scale,
             image_row,
             rgba: vec![0; SCREEN_W * SCREEN_H * 4],
             scaled: vec![0; scaled_len],
+            hqx_tmp: vec![0; hqx_tmp_len],
             prev_rgba: Vec::new(),
-            last_present: Instant::now() - frame_interval(over_ssh),
+            last_present: Instant::now() - frame_interval(over_ssh, upscale),
             close_requested: false,
             frame_n: 0,
             show_fps,
@@ -358,9 +452,12 @@ impl ConsoleVideo {
             key_rx,
             esc_buf: Vec::new(),
             esc_solo_since: None,
-            held: Vec::new(),
             pending: Vec::new(),
             ui_driver,
+            #[cfg(feature = "gui")]
+            neural,
+            last_neural_submit: Instant::now() - NEURAL_SUBMIT_INTERVAL,
+            last_fps_banner: Instant::now() - NEURAL_FPS_BANNER_INTERVAL,
             #[cfg(unix)]
             _stderr_guard: stderr_guard,
             #[cfg(unix)]
@@ -369,10 +466,49 @@ impl ConsoleVideo {
     }
 
     fn frame_interval(&self) -> Duration {
-        frame_interval(self.over_ssh)
+        frame_interval(self.over_ssh, self.upscale)
     }
 
-    pub fn pump(&mut self) -> Vec<(KeyCode, bool)> {
+    /// Upscale `self.rgba` into `self.scaled`; returns (width, height) of the result.
+    /// Neural mode is handled in `present_neural` (async worker).
+    fn kitty_upscale_into_scaled(&mut self) -> (u32, u32) {
+        match self.upscale {
+            ConsoleUpscale::Nearest => {
+                let nn = self.kitty_nn_scale.max(1);
+                if nn <= 1 {
+                    let n = SCREEN_W * SCREEN_H * 4;
+                    self.scaled[..n].copy_from_slice(&self.rgba[..n]);
+                    (SCREEN_W as u32, SCREEN_H as u32)
+                } else {
+                    nearest_upscale(
+                        &self.rgba,
+                        SCREEN_W,
+                        SCREEN_H,
+                        nn,
+                        &mut self.scaled,
+                    );
+                    (SCREEN_W as u32 * nn, SCREEN_H as u32 * nn)
+                }
+            }
+            ConsoleUpscale::Hqx4 => {
+                crate::hqx::hqx4(
+                    &self.rgba,
+                    SCREEN_W,
+                    SCREEN_H,
+                    &mut self.hqx_tmp,
+                    &mut self.scaled,
+                );
+                (1280, 800)
+            }
+            ConsoleUpscale::Neural => {
+                // Warmup / fallback only — live path uses NeuralAsync.
+                nearest_upscale(&self.rgba, SCREEN_W, SCREEN_H, 4, &mut self.scaled);
+                (1280, 800)
+            }
+        }
+    }
+
+    pub fn pump(&mut self) -> Vec<KeyEvent> {
         if CONSOLE_QUIT.load(Ordering::SeqCst) {
             self.close_requested = true;
         }
@@ -397,7 +533,7 @@ impl ConsoleVideo {
                 Some(t) if now.duration_since(t) >= Duration::from_millis(50) => {
                     self.esc_buf.clear();
                     self.esc_solo_since = None;
-                    self.note_press(KeyCode::Escape, now);
+                    self.pending.push(KeyEvent::Tap(KeyCode::Escape));
                 }
                 Some(_) => {}
             }
@@ -405,21 +541,15 @@ impl ConsoleVideo {
             self.esc_solo_since = None;
         }
 
-        // Expire held keys.
-        let mut still = Vec::with_capacity(self.held.len());
-        for h in self.held.drain(..) {
-            if now >= h.until {
-                self.pending.push((h.code, false));
-            } else {
-                still.push(h);
-            }
-        }
-        self.held = still;
-
         let mut events = std::mem::take(&mut self.pending);
         // External scripts inject keys through the same path as the tty.
         if let Some(driver) = self.ui_driver.as_ref() {
-            driver.drain_input(&mut events);
+            let mut injected = Vec::new();
+            driver.drain_input(&mut injected);
+            events.extend(injected.into_iter().map(|(code, pressed)| KeyEvent::State {
+                code,
+                pressed,
+            }));
         }
         events
     }
@@ -434,6 +564,12 @@ impl ConsoleVideo {
         // terminal output is throttled or de-duplicated.
         if let Some(driver) = self.ui_driver.as_mut() {
             driver.capture(surf, palette, shake);
+        }
+
+        // Neural: never block the engine clock on GPU readback.
+        if self.upscale == ConsoleUpscale::Neural {
+            self.present_neural(surf, palette, shake);
+            return;
         }
 
         let now = Instant::now();
@@ -454,32 +590,132 @@ impl ConsoleVideo {
         self.frame_n = self.frame_n.saturating_add(1);
         let first = self.frame_n == 1;
 
+        self.emit_kitty_or_ansi(first, now);
+    }
+
+    /// Async neural path: worker does GPU + zlib/base64; main only rate-limited
+    /// submit + write_all when a *new* payload is ready (no re-send of same frame).
+    fn present_neural(
+        &mut self,
+        surf: &Surface,
+        palette: &[PalColor; 256],
+        shake: Option<(u16, u16)>,
+    ) {
+        let now = Instant::now();
+        let force = self.frame_n < 3;
+
+        // 1) Poll worker first (cheap) — may already have something to show.
+        #[cfg(feature = "gui")]
+        let (have_frame, is_new) = if let Some(ref mut neural) = self.neural {
+            neural.poll_payload()
+        } else {
+            (false, false)
+        };
+        #[cfg(not(feature = "gui"))]
+        let (have_frame, is_new) = (false, false);
+
+        // 2) Submit at most ~12 fps. Skip render_rgba + 256KB compare on every
+        //    engine present() (was the main CPU hog when present is called 100+/s).
+        let due_submit = force
+            || now.duration_since(self.last_neural_submit) >= NEURAL_SUBMIT_INTERVAL;
+        if due_submit {
+            render_rgba(surf, palette, shake, &mut self.rgba);
+            self.last_neural_submit = now;
+            #[cfg(feature = "gui")]
+            if let Some(ref neural) = self.neural {
+                neural.submit(&self.rgba);
+            }
+        }
+
+        // 3) Warmup only: main-thread NN4× until first worker payload.
+        if !have_frame {
+            if !force && now.duration_since(self.last_present) < self.frame_interval() {
+                return;
+            }
+            if !due_submit {
+                render_rgba(surf, palette, shake, &mut self.rgba);
+            }
+            nearest_upscale(&self.rgba, SCREEN_W, SCREEN_H, 4, &mut self.scaled);
+            self.last_present = now;
+            self.frame_n = self.frame_n.saturating_add(1);
+            let first = self.frame_n == 1;
+            self.emit_kitty_or_ansi(first, now);
+            return;
+        }
+
+        // 4) Only push a full Kitty image when the worker finished a *new* encode.
+        //    Re-sending the same multi-MB APC every 50ms was burning CPU + terminal.
+        if is_new || force {
+            self.last_present = now;
+            self.frame_n = self.frame_n.saturating_add(1);
+            let first = self.frame_n == 1;
+            #[cfg(feature = "gui")]
+            {
+                let payload = self.neural.as_ref().and_then(|n| n.payload_arc());
+                if let Some(payload) = payload {
+                    self.emit_neural_payload_bytes(payload.as_slice(), first, now);
+                    return;
+                }
+            }
+            self.emit_kitty_or_ansi(first, now);
+            return;
+        }
+
+        // 5) Unchanged image: optional FPS text only (no image rewrite).
+        if self.show_fps && now.duration_since(self.last_fps_banner) >= NEURAL_FPS_BANNER_INTERVAL
+        {
+            self.last_fps_banner = now;
+            self.note_displayed_frame(now);
+            let mut out = io::stdout();
+            let _ = write!(
+                out,
+                "\x1b[1;1H\x1b[36mrustpal\x1b[0m  \x1b[33m{:>5.1} FPS\x1b[0m\x1b[K",
+                self.fps_value
+            );
+            let _ = out.flush();
+        }
+    }
+
+    /// Write a prebuilt Kitty APC (no zlib on main).
+    #[cfg(feature = "gui")]
+    fn emit_neural_payload_bytes(&mut self, payload: &[u8], first: bool, now: Instant) {
         let mut out = io::stdout();
-        // Sync output (CSI 2026) only over SSH — batches the APC so the
-        // terminal does not flash between chunks. Locally we skip it: some
-        // Kitty builds held a blank buffer when 2026 was used incorrectly.
-        // Force: RUSTPAL_CONSOLE_SYNC=1/0.
+        let use_sync = sync_output_enabled(self.over_ssh);
+        if use_sync {
+            let _ = write!(out, "\x1b[?2026h");
+        }
+        if first {
+            let _ = write!(out, "\x1b[{};1H", self.image_row);
+        }
+        let _ = out.write_all(payload);
+        if self.show_fps {
+            self.note_displayed_frame(now);
+            self.last_fps_banner = now;
+            let _ = write!(
+                out,
+                "\x1b[1;1H\x1b[36mrustpal\x1b[0m  \x1b[33m{:>5.1} FPS\x1b[0m\x1b[K",
+                self.fps_value
+            );
+        }
+        if use_sync {
+            let _ = write!(out, "\x1b[?2026l");
+        }
+        let _ = out.flush();
+    }
+
+    fn emit_kitty_or_ansi(&mut self, first: bool, now: Instant) {
+        let mut out = io::stdout();
         let use_sync = sync_output_enabled(self.over_ssh);
         if use_sync {
             let _ = write!(out, "\x1b[?2026h");
         }
 
         if self.use_kitty {
-            // Nearest-neighbor first so Kitty scales a *sharp* high-res bitmap
-            // instead of bilinear-stretching 320×200 (looks soft/blurry).
-            let nn = self.kitty_nn_scale.max(1);
-            let (fw, fh, frame) = if nn <= 1 {
-                (SCREEN_W as u32, SCREEN_H as u32, self.rgba.as_slice())
-            } else {
-                nearest_upscale(&self.rgba, SCREEN_W, SCREEN_H, nn, &mut self.scaled);
-                (
-                    SCREEN_W as u32 * nn,
-                    SCREEN_H as u32 * nn,
-                    self.scaled.as_slice(),
-                )
-            };
-            // Always a=T with the same image id + placement. (a=t-only updates
-            // did not repaint on several Kitty versions → black screen.)
+            let (fw, fh) = self.kitty_upscale_into_scaled();
+            let nbytes = (fw as usize)
+                .saturating_mul(fh as usize)
+                .saturating_mul(4)
+                .min(self.scaled.len());
             if first {
                 let _ = write!(out, "\x1b[{};1H", self.image_row);
             }
@@ -488,10 +724,9 @@ impl ConsoleVideo {
                 IMAGE_ID,
                 fw,
                 fh,
-                frame,
+                &self.scaled[..nbytes],
                 self.place_cols,
             ) {
-                // Goes to redirected stderr (file or /dev/null) — never the alt screen.
                 eprintln!("rustpal: kitty frame error: {e}");
             }
         } else {
@@ -511,7 +746,6 @@ impl ConsoleVideo {
 
         if self.show_fps {
             self.note_displayed_frame(now);
-            // Status line on the reserved top row (image starts at row 2).
             let _ = write!(
                 out,
                 "\x1b[1;1H\x1b[36mrustpal\x1b[0m  \x1b[33m{:>5.1} FPS\x1b[0m\x1b[K",
@@ -563,25 +797,15 @@ impl ConsoleVideo {
             } else {
                 self.esc_solo_since = None;
             }
-            if let Some(code) = parse_escape(&mut self.esc_buf) {
+            if let Some(event) = parse_escape(&mut self.esc_buf) {
                 self.esc_solo_since = None;
-                self.note_press(code, now);
+                self.pending.push(event);
             }
             return;
         }
         if let Some(code) = map_ascii(b) {
-            self.note_press(code, now);
+            self.pending.push(KeyEvent::Tap(code));
         }
-    }
-
-    fn note_press(&mut self, code: KeyCode, now: Instant) {
-        let until = now + KEY_HOLD;
-        if let Some(h) = self.held.iter_mut().find(|h| h.code == code) {
-            h.until = until;
-            return;
-        }
-        self.held.push(HeldKey { code, until });
-        self.pending.push((code, true));
     }
 }
 
@@ -702,7 +926,7 @@ fn map_ascii(b: u8) -> Option<KeyCode> {
     })
 }
 
-fn parse_escape(buf: &mut Vec<u8>) -> Option<KeyCode> {
+fn parse_escape(buf: &mut Vec<u8>) -> Option<KeyEvent> {
     if buf.is_empty() || buf.len() == 1 {
         return None;
     }
@@ -712,11 +936,12 @@ fn parse_escape(buf: &mut Vec<u8>) -> Option<KeyCode> {
     }
     if buf.len() == 2 && buf[1] != b'[' && buf[1] != b'O' {
         buf.clear();
-        return Some(KeyCode::Escape);
+        return Some(KeyEvent::Tap(KeyCode::Escape));
     }
     if buf.get(1) == Some(&b'[') {
         if let Some(&last) = buf.last() {
             if (0x40..=0x7e).contains(&last) && buf.len() >= 3 {
+                let params = &buf[2..buf.len() - 1];
                 let code = match last {
                     b'A' => Some(KeyCode::ArrowUp),
                     b'B' => Some(KeyCode::ArrowDown),
@@ -724,21 +949,23 @@ fn parse_escape(buf: &mut Vec<u8>) -> Option<KeyCode> {
                     b'D' => Some(KeyCode::ArrowLeft),
                     b'H' => Some(KeyCode::Home),
                     b'F' => Some(KeyCode::End),
-                    b'~' => match &buf[2..buf.len() - 1] {
-                        b"5" => Some(KeyCode::PageUp),
-                        b"6" => Some(KeyCode::PageDown),
-                        b"2" => Some(KeyCode::Insert),
-                        b"1" => Some(KeyCode::Home),
-                        b"4" => Some(KeyCode::End),
+                    b'~' => match csi_primary_param(params) {
+                        Some(5) => Some(KeyCode::PageUp),
+                        Some(6) => Some(KeyCode::PageDown),
+                        Some(2) => Some(KeyCode::Insert),
+                        Some(1 | 7) => Some(KeyCode::Home),
+                        Some(4 | 8) => Some(KeyCode::End),
                         _ => None,
                     },
+                    b'u' => csi_primary_param(params).and_then(map_kitty_key_code),
                     _ => None,
                 };
+                let event = code.map(|code| key_event_from_csi(code, params));
                 buf.clear();
-                return code;
+                return event;
             }
         }
-        if buf.len() > 16 {
+        if buf.len() > 64 {
             buf.clear();
         }
         return None;
@@ -752,12 +979,78 @@ fn parse_escape(buf: &mut Vec<u8>) -> Option<KeyCode> {
             _ => None,
         };
         buf.clear();
-        return code;
+        return code.map(KeyEvent::Tap);
     }
     if buf.len() > 8 {
         buf.clear();
     }
     None
+}
+
+/// Convert a CSI key sequence into either a real state transition (when the
+/// terminal supplied a Kitty event type) or a deterministic one-frame tap for
+/// legacy sequences that have no release information.
+fn key_event_from_csi(code: KeyCode, params: &[u8]) -> KeyEvent {
+    match csi_event_type(params) {
+        Some(1 | 2) => KeyEvent::State {
+            code,
+            pressed: true,
+        },
+        Some(3) => KeyEvent::State {
+            code,
+            pressed: false,
+        },
+        _ => KeyEvent::Tap(code),
+    }
+}
+
+fn csi_primary_param(params: &[u8]) -> Option<u32> {
+    let end = params
+        .iter()
+        .position(|&b| b == b';' || b == b':')
+        .unwrap_or(params.len());
+    std::str::from_utf8(&params[..end]).ok()?.parse().ok()
+}
+
+/// Kitty encodes the event type after the modifiers as `;modifiers:event`.
+fn csi_event_type(params: &[u8]) -> Option<u8> {
+    let text = std::str::from_utf8(params).ok()?;
+    let modifiers = text.split(';').nth(1)?;
+    modifiers.split(':').nth(1)?.parse().ok()
+}
+
+fn map_kitty_key_code(code: u32) -> Option<KeyCode> {
+    Some(match code {
+        13 => KeyCode::Enter,
+        27 => KeyCode::Escape,
+        32 => KeyCode::Space,
+        97 | 65 => KeyCode::KeyA,
+        100 | 68 => KeyCode::KeyD,
+        101 | 69 => KeyCode::KeyE,
+        102 | 70 => KeyCode::KeyF,
+        104 | 72 => KeyCode::ArrowLeft,
+        106 | 74 => KeyCode::ArrowDown,
+        107 | 75 => KeyCode::ArrowUp,
+        108 | 76 => KeyCode::ArrowRight,
+        113 | 81 => KeyCode::KeyQ,
+        114 | 82 => KeyCode::KeyR,
+        115 | 83 => KeyCode::KeyS,
+        119 | 87 => KeyCode::KeyW,
+        57_399 => KeyCode::Numpad0,
+        57_400 => KeyCode::Numpad1,
+        57_401 => KeyCode::Numpad2,
+        57_402 => KeyCode::Numpad3,
+        57_403 => KeyCode::Numpad4,
+        57_405 => KeyCode::Numpad6,
+        57_406 => KeyCode::Numpad7,
+        57_407 => KeyCode::Numpad8,
+        57_408 => KeyCode::Numpad9,
+        57_414 => KeyCode::NumpadEnter,
+        57_442 | 57_448 => KeyCode::ControlLeft,
+        57_443 => KeyCode::AltLeft,
+        57_449 => KeyCode::AltRight,
+        _ => return None,
+    })
 }
 
 fn detect_kitty() -> bool {
@@ -772,6 +1065,199 @@ fn detect_kitty() -> bool {
         || prog.eq_ignore_ascii_case("iTerm.app")
 }
 
+/// Shared job slot: latest 320×200 frame + condvar (no 2ms poll spin).
+#[cfg(feature = "gui")]
+struct NeuralInputSlot {
+    frame: Mutex<Option<Vec<u8>>>,
+    cvar: Condvar,
+}
+
+/// Background GPU neural + zlib/base64 Kitty encode.
+///
+/// Main thread rate-limits `submit` (~12/s) and only `write_all`s when a new
+/// `Arc` payload is ready — no multi-MB clone, no re-send of the same image.
+#[cfg(feature = "gui")]
+struct NeuralAsync {
+    input: Arc<NeuralInputSlot>,
+    /// Prebuilt Kitty APC (`Arc` so main never copies multi-MB buffers).
+    payload: Arc<Mutex<Option<Arc<Vec<u8>>>>>,
+    payload_gen: Arc<AtomicU64>,
+    shown_gen: u64,
+    cached_payload: Option<Arc<Vec<u8>>>,
+    stop: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<()>>,
+    adapter_name: String,
+}
+
+#[cfg(feature = "gui")]
+impl NeuralAsync {
+    fn start(place_cols: u32) -> Option<NeuralAsync> {
+        use crate::native_upscale::offline::{OfflineUpscaler, INPUT_SIZE, OUTPUT_SIZE};
+
+        let input = Arc::new(NeuralInputSlot {
+            frame: Mutex::new(None),
+            cvar: Condvar::new(),
+        });
+        let payload: Arc<Mutex<Option<Arc<Vec<u8>>>>> = Arc::new(Mutex::new(None));
+        let payload_gen = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::channel::<Option<String>>();
+
+        let input_w = Arc::clone(&input);
+        let payload_w = Arc::clone(&payload);
+        let gen_w = Arc::clone(&payload_gen);
+        let stop_w = Arc::clone(&stop);
+
+        let join = thread::Builder::new()
+            .name("rustpal-console-neural".into())
+            .spawn(move || {
+                let Some(up) = OfflineUpscaler::new() else {
+                    let _ = ready_tx.send(None);
+                    return;
+                };
+                let _ = ready_tx.send(Some(up.adapter_name().to_string()));
+                let mut out_buf = vec![0u8; OUTPUT_SIZE];
+                while !stop_w.load(Ordering::Relaxed) {
+                    let job = {
+                        let mut g = input_w
+                            .frame
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if stop_w.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            if let Some(frame) = g.take() {
+                                break frame;
+                            }
+                            let (guard, wait_res) = input_w
+                                .cvar
+                                .wait_timeout(g, Duration::from_millis(50))
+                                .unwrap_or_else(|e| {
+                                    let g = e.into_inner();
+                                    (g.0, g.1)
+                                });
+                            g = guard;
+                            let _ = wait_res;
+                        }
+                    };
+                    // Coalesce anything queued during GPU/compress of previous job.
+                    let mut job = job;
+                    loop {
+                        let newer = {
+                            let mut g = input_w
+                                .frame
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            g.take()
+                        };
+                        match newer {
+                            Some(n) => job = n,
+                            None => break,
+                        }
+                    }
+                    if job.len() != INPUT_SIZE {
+                        continue;
+                    }
+                    up.upscale(&job, &mut out_buf);
+                    // Level 4: smaller APC than level 1 → less main-thread write/terminal CPU.
+                    match encode_kitty_frame_level(
+                        IMAGE_ID,
+                        1280,
+                        800,
+                        &out_buf,
+                        place_cols,
+                        4,
+                    ) {
+                        Ok(apc) => {
+                            let apc = Arc::new(apc);
+                            let mut g = payload_w.lock().unwrap_or_else(|e| e.into_inner());
+                            *g = Some(apc);
+                            gen_w.fetch_add(1, Ordering::Release);
+                        }
+                        Err(_) => {}
+                    }
+                }
+            })
+            .ok()?;
+
+        let adapter_name = match ready_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(Some(name)) => name,
+            _ => {
+                stop.store(true, Ordering::Relaxed);
+                input.cvar.notify_all();
+                let _ = join.join();
+                return None;
+            }
+        };
+
+        Some(NeuralAsync {
+            input,
+            payload,
+            payload_gen,
+            shown_gen: 0,
+            cached_payload: None,
+            stop,
+            join: Some(join),
+            adapter_name,
+        })
+    }
+
+    fn adapter_name(&self) -> &str {
+        &self.adapter_name
+    }
+
+    /// Queue a 320×200 RGBA frame (replaces any not-yet-processed job).
+    fn submit(&self, rgba: &[u8]) {
+        {
+            let mut g = self.input.frame.lock().unwrap_or_else(|e| e.into_inner());
+            match g.as_mut() {
+                Some(buf) if buf.len() == rgba.len() => buf.copy_from_slice(rgba),
+                _ => *g = Some(rgba.to_vec()),
+            }
+        }
+        self.input.cvar.notify_one();
+    }
+
+    /// Returns `(have_any_frame, is_new_since_last_poll)`.
+    fn poll_payload(&mut self) -> (bool, bool) {
+        let gen = self.payload_gen.load(Ordering::Acquire);
+        if gen == 0 {
+            return (false, false);
+        }
+        let is_new = gen != self.shown_gen;
+        if is_new {
+            let g = self.payload.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref p) = *g {
+                self.cached_payload = Some(Arc::clone(p));
+                self.shown_gen = gen;
+                return (true, true);
+            }
+            return (false, false);
+        }
+        (self.cached_payload.is_some(), false)
+    }
+
+    fn payload_bytes(&self) -> Option<&[u8]> {
+        self.cached_payload.as_ref().map(|a| a.as_slice())
+    }
+
+    fn payload_arc(&self) -> Option<Arc<Vec<u8>>> {
+        self.cached_payload.clone()
+    }
+}
+
+#[cfg(feature = "gui")]
+impl Drop for NeuralAsync {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.input.cvar.notify_all();
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
 /// Resolved console geometry for one backend.
 struct ConsoleLayout {
     place_cols: u32,
@@ -781,12 +1267,50 @@ struct ConsoleLayout {
     cell: Option<(u32, u32)>,
 }
 
+/// `RUSTPAL_CONSOLE_UPSCALE=nn|hqx4|xbr4|neural` (default `nn`).
+fn resolve_console_upscale() -> ConsoleUpscale {
+    let raw = std::env::var("RUSTPAL_CONSOLE_UPSCALE")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match raw.trim() {
+        "" | "nn" | "nearest" => ConsoleUpscale::Nearest,
+        "hqx" | "hqx4" | "xbr" | "xbr4" | "xbrz" | "xbrz4" => ConsoleUpscale::Hqx4,
+        "neural" | "gpu" | "nn-gpu" | "esrgan" => ConsoleUpscale::Neural,
+        other => {
+            eprintln!(
+                "rustpal: unknown RUSTPAL_CONSOLE_UPSCALE={other:?}, using nn (try nn|hqx4|neural)"
+            );
+            ConsoleUpscale::Nearest
+        }
+    }
+}
+
+fn kitty_output_width(upscale: ConsoleUpscale, kitty_nn_scale: u32) -> u32 {
+    match upscale {
+        ConsoleUpscale::Nearest => SCREEN_W as u32 * kitty_nn_scale.max(1),
+        ConsoleUpscale::Hqx4 | ConsoleUpscale::Neural => 1280,
+    }
+}
+
+fn kitty_output_height(upscale: ConsoleUpscale, kitty_nn_scale: u32) -> u32 {
+    match upscale {
+        ConsoleUpscale::Nearest => SCREEN_H as u32 * kitty_nn_scale.max(1),
+        ConsoleUpscale::Hqx4 | ConsoleUpscale::Neural => 800,
+    }
+}
+
 /// Pick Kitty `c=` and NN scale, or ANSI scale.
 ///
-/// For Kitty, when cell pixels are known we choose NN and columns so the
-/// **on-screen width in pixels ≈ 320×NN**, which keeps Kitty’s resampler near
-/// 1:1 (hard pixel edges) instead of bilinear-stretching a mismatched size.
-fn resolve_console_layout(use_kitty: bool, over_ssh: bool, reserve_top: u32) -> ConsoleLayout {
+/// * **Nearest:** choose NN + `c=` so on-screen width ≈ `320×NN` (hard edges).
+/// * **HQX/neural:** bitmap is always 1280×800; pick `c=` near full terminal
+///   width using an **integer display scale** `k` (`disp ≈ 1280×k`) so the
+///   picture is not stuck at tiny 1:1 (e.g. ~58 cols on large fonts).
+fn resolve_console_layout(
+    use_kitty: bool,
+    over_ssh: bool,
+    reserve_top: u32,
+    upscale: ConsoleUpscale,
+) -> ConsoleLayout {
     let (cols, rows, cell) = terminal_geometry().unwrap_or((100, 30, None));
     let manual = std::env::var("RUSTPAL_CONSOLE_SCALE")
         .ok()
@@ -802,13 +1326,22 @@ fn resolve_console_layout(use_kitty: bool, over_ssh: bool, reserve_top: u32) -> 
         };
         let max_by_rows = max_kitty_cols_for_rows(avail_rows, cell);
         let place_want = want.min(max_by_rows).clamp(20, 240);
-        let (place_cols, kitty_nn_scale) = align_kitty_nn_and_place(
-            place_want,
-            max_by_rows.min(240).max(20),
-            cell,
-            over_ssh,
-            kitty_nn_env_override(),
-        );
+        let max_place = max_by_rows.min(240).max(20);
+
+        let (place_cols, kitty_nn_scale) = match upscale {
+            ConsoleUpscale::Nearest => align_kitty_nn_and_place(
+                place_want,
+                max_place,
+                cell,
+                over_ssh,
+                kitty_nn_env_override(),
+            ),
+            // Fixed 1280×800 source — grow with integer k to fill the terminal.
+            ConsoleUpscale::Hqx4 | ConsoleUpscale::Neural => {
+                let place = align_fixed_src_place(1280, place_want, max_place, cell);
+                (place, 4)
+            }
+        };
         ConsoleLayout {
             place_cols,
             kitty_nn_scale,
@@ -915,6 +1448,53 @@ fn place_cols_for_src_width(src_w: u32, cell_w: u32, max_place: u32) -> u32 {
     place.clamp(20, max_place.max(20))
 }
 
+/// Place a **fixed** source width (e.g. HQX/neural 1280) on the terminal.
+///
+/// Prefers integer display scales `k` so `place × cell_w ≈ src_w × k`, picking
+/// the candidate closest to `place_want` (fill the window) rather than locking
+/// to tiny 1:1 when the font is large.
+fn align_fixed_src_place(
+    src_w: u32,
+    place_want: u32,
+    max_place: u32,
+    cell: Option<(u32, u32)>,
+) -> u32 {
+    let max_place = max_place.max(20);
+    let place_want = place_want.clamp(20, max_place);
+
+    let Some((cw, _ch)) = cell.filter(|(w, h)| *w > 0 && *h > 0) else {
+        return place_want;
+    };
+
+    // Among integer scales k with ≤5% soft error, pick closest to place_want
+    // (fill the terminal). Tie-break: lower err, then larger k.
+    let mut best: Option<(u32, u64, u32, u32)> = None; // (dist, err, k, place)
+    for k in 1..=8u32 {
+        let ideal_w = src_w.saturating_mul(k);
+        let place = place_cols_for_src_width(ideal_w, cw, max_place);
+        let disp_w = place as u64 * cw as u64;
+        let err = disp_w.abs_diff(ideal_w as u64);
+        if err.saturating_mul(20) > ideal_w as u64 {
+            continue;
+        }
+        let dist = place.abs_diff(place_want);
+        let cand = (dist, err, k, place);
+        let take = match best {
+            None => true,
+            Some(b) => {
+                cand.0 < b.0
+                    || (cand.0 == b.0 && cand.1 < b.1)
+                    || (cand.0 == b.0 && cand.1 == b.1 && cand.2 > b.2)
+            }
+        };
+        if take {
+            best = Some(cand);
+        }
+    }
+
+    best.map(|c| c.3).unwrap_or(place_want)
+}
+
 /// Largest Kitty `c=` that still fits in `avail_rows` at 320×200 aspect.
 ///
 /// With only `c=` set, display height in cells is:
@@ -990,11 +1570,12 @@ fn is_over_ssh() -> bool {
         || std::env::var_os("SSH_CLIENT").is_some()
 }
 
-fn frame_interval(over_ssh: bool) -> Duration {
-    if over_ssh {
-        MIN_FRAME_INTERVAL_SSH
-    } else {
-        MIN_FRAME_INTERVAL
+fn frame_interval(over_ssh: bool, upscale: ConsoleUpscale) -> Duration {
+    match (upscale, over_ssh) {
+        (ConsoleUpscale::Neural, true) => MIN_FRAME_INTERVAL_NEURAL_SSH,
+        (ConsoleUpscale::Neural, false) => MIN_FRAME_INTERVAL_NEURAL,
+        (_, true) => MIN_FRAME_INTERVAL_SSH,
+        (_, false) => MIN_FRAME_INTERVAL,
     }
 }
 
@@ -1021,6 +1602,39 @@ fn env_flag_enabled(name: &str) -> bool {
     }
 }
 
+/// Build a full Kitty APC sequence (zlib + base64 + chunking) into a buffer.
+fn encode_kitty_frame(
+    image_id: u32,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    place_cols: u32,
+) -> io::Result<Vec<u8>> {
+    encode_kitty_frame_level(image_id, width, height, rgba, place_cols, 1)
+}
+
+/// Like `encode_kitty_frame` with an explicit zlib level (neural worker uses 4).
+fn encode_kitty_frame_level(
+    image_id: u32,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    place_cols: u32,
+    zlib_level: u8,
+) -> io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(rgba.len() / 4 + 512);
+    write_kitty_frame_level(
+        &mut out,
+        image_id,
+        width,
+        height,
+        rgba,
+        place_cols,
+        zlib_level,
+    )?;
+    Ok(out)
+}
+
 /// Transmit + display (a=T) with stable image/placement ids so Kitty replaces
 /// the same slot. Same `i`/`p`/`c` every frame is the portable path that
 /// actually paints; `a=t` alone left a black screen on several Kitty builds.
@@ -1032,8 +1646,21 @@ fn write_kitty_frame(
     rgba: &[u8],
     place_cols: u32,
 ) -> io::Result<()> {
+    write_kitty_frame_level(out, image_id, width, height, rgba, place_cols, 1)
+}
+
+fn write_kitty_frame_level(
+    out: &mut impl Write,
+    image_id: u32,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    place_cols: u32,
+    zlib_level: u8,
+) -> io::Result<()> {
     assert_eq!(rgba.len(), (width * height * 4) as usize);
-    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(rgba, 1);
+    let level = zlib_level.clamp(1, 9);
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(rgba, level);
     let payload = BASE64.encode(&compressed);
     let chunks: Vec<&[u8]> = payload.as_bytes().chunks(KITTY_CHUNK).collect();
     let last = chunks.len().saturating_sub(1);
@@ -1116,7 +1743,46 @@ mod tests {
     #[test]
     fn parse_arrow_csi() {
         let mut buf = vec![0x1b, b'[', b'A'];
-        assert_eq!(parse_escape(&mut buf), Some(KeyCode::ArrowUp));
+        assert_eq!(
+            parse_escape(&mut buf),
+            Some(KeyEvent::Tap(KeyCode::ArrowUp))
+        );
+    }
+
+    #[test]
+    fn parse_kitty_arrow_press_repeat_release() {
+        for (event_type, pressed) in [(1, true), (2, true), (3, false)] {
+            let mut buf = format!("\x1b[1;1:{event_type}C").into_bytes();
+            assert_eq!(
+                parse_escape(&mut buf),
+                Some(KeyEvent::State {
+                    code: KeyCode::ArrowRight,
+                    pressed,
+                })
+            );
+            assert!(buf.is_empty());
+        }
+    }
+
+    #[test]
+    fn parameterized_legacy_arrow_is_still_a_tap() {
+        let mut buf = b"\x1b[1;2D".to_vec();
+        assert_eq!(
+            parse_escape(&mut buf),
+            Some(KeyEvent::Tap(KeyCode::ArrowLeft))
+        );
+    }
+
+    #[test]
+    fn parse_kitty_csi_u_key_event() {
+        let mut buf = b"\x1b[27;1:3u".to_vec();
+        assert_eq!(
+            parse_escape(&mut buf),
+            Some(KeyEvent::State {
+                code: KeyCode::Escape,
+                pressed: false,
+            })
+        );
     }
 
     #[test]
@@ -1182,5 +1848,23 @@ mod tests {
         assert_eq!(nn, 3);
         assert_eq!(place, 96);
         assert_eq!(place * 10, 320 * nn);
+    }
+
+    #[test]
+    fn fixed_src_place_grows_with_integer_k() {
+        // Ghostty-like large cells: 1:1 of 1280 is only ~58 cols; with want=204
+        // we should pick k≥2 so the image is not a postage stamp.
+        let place = align_fixed_src_place(1280, 204, 204, Some((22, 55)));
+        assert!(
+            place >= 100,
+            "expected large placement for hqx/neural, got {place}"
+        );
+        // k=3 → 3840px / 22 ≈ 175
+        assert_eq!(place, 175);
+    }
+
+    #[test]
+    fn fixed_src_place_without_cell_fills_want() {
+        assert_eq!(align_fixed_src_place(1280, 160, 240, None), 160);
     }
 }

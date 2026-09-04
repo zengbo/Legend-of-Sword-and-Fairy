@@ -503,7 +503,7 @@ fn ui_select_move(engine: &mut Engine, battle: &mut Battle) {
 
     if battle.ui.menu_state == BattleMenuState::Main {
         use crate::input::{DIR_EAST, DIR_NORTH, DIR_SOUTH, DIR_WEST};
-        let dir = engine.input.dir;
+        let dir = engine.input.direction();
         if dir == DIR_NORTH {
             battle.ui.selected_action = 0;
         } else if dir == DIR_SOUTH {

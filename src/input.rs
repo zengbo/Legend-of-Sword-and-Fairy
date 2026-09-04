@@ -77,6 +77,11 @@ pub struct InputState {
     pub prev_dir: usize,
     pub key_press: u32,
 
+    /// Most recent direction press that has not yet been consumed by a game
+    /// frame. This preserves a quick press+release that occurs entirely
+    /// between two 100 ms movement frames.
+    pending_dir: usize,
+
     /// Which KEY_MAP entries are physically held down.
     down: [bool; KEY_MAP_LEN],
     /// Per-entry next-repeat deadline in ms (0 = not pressed yet).
@@ -93,6 +98,7 @@ impl Default for InputState {
             dir: DIR_UNKNOWN,
             prev_dir: DIR_UNKNOWN,
             key_press: 0,
+            pending_dir: DIR_UNKNOWN,
             down: [false; KEY_MAP_LEN],
             last_time: [0; KEY_MAP_LEN],
             key_order: [0; 4],
@@ -109,10 +115,53 @@ impl InputState {
 
     /// Record a physical key state change from the window system.
     pub fn handle_key_event(&mut self, code: KeyCode, pressed: bool) {
-        for (i, (key, _)) in KEY_MAP.iter().enumerate() {
+        for (i, (key, mapped)) in KEY_MAP.iter().enumerate() {
             if *key == code {
+                if pressed && !self.down[i] {
+                    let dir = Self::dir_of_key(*mapped);
+                    if dir != DIR_UNKNOWN {
+                        self.pending_dir = dir;
+                    }
+                }
                 self.down[i] = pressed;
             }
+        }
+    }
+
+    /// Record a discrete key tap from a source that cannot report key-up.
+    ///
+    /// Direction taps are kept for exactly one movement/input cycle. Multiple
+    /// terminal repeat sequences received before that cycle are coalesced,
+    /// preventing queued movement after the user has released the key.
+    pub fn handle_key_tap(&mut self, code: KeyCode) {
+        for &(key, mapped) in KEY_MAP {
+            if key == code {
+                self.key_press |= mapped;
+                let dir = Self::dir_of_key(mapped);
+                if dir != DIR_UNKNOWN {
+                    self.pending_dir = dir;
+                }
+            }
+        }
+    }
+
+    /// Current direction for non-movement consumers such as the battle UI.
+    pub fn direction(&self) -> usize {
+        if self.pending_dir != DIR_UNKNOWN {
+            self.pending_dir
+        } else {
+            self.dir
+        }
+    }
+
+    /// Direction for one party movement frame. A pending tap is consumed;
+    /// a physically held key remains active on subsequent frames.
+    pub fn take_direction(&mut self) -> usize {
+        let pending = std::mem::replace(&mut self.pending_dir, DIR_UNKNOWN);
+        if pending != DIR_UNKNOWN {
+            pending
+        } else {
+            self.dir
         }
     }
 
@@ -198,12 +247,14 @@ impl InputState {
     /// PAL_ClearKeyState.
     pub fn clear_key_state(&mut self) {
         self.key_press = 0;
+        self.pending_dir = DIR_UNKNOWN;
     }
 
     /// Reset the walking direction (used by fades: dir = prevdir = unknown).
     pub fn reset_dir(&mut self) {
         self.dir = DIR_UNKNOWN;
         self.prev_dir = DIR_UNKNOWN;
+        self.pending_dir = DIR_UNKNOWN;
     }
 
     /// Test whether any of `keys` was pressed since the last clear.
@@ -258,5 +309,48 @@ mod tests {
         // After the 200ms initial repeat delay: repeats.
         s.update_keyboard_state(300);
         assert!(s.pressed(KEY_SEARCH));
+    }
+
+    #[test]
+    fn terminal_direction_tap_is_consumed_exactly_once() {
+        let mut s = InputState::new();
+        s.handle_key_tap(KeyCode::ArrowRight);
+        assert!(s.pressed(KEY_RIGHT));
+        assert_eq!(s.direction(), DIR_EAST);
+        assert_eq!(s.take_direction(), DIR_EAST);
+        assert_eq!(s.take_direction(), DIR_UNKNOWN);
+    }
+
+    #[test]
+    fn repeated_terminal_taps_coalesce_before_a_frame() {
+        let mut s = InputState::new();
+        s.handle_key_tap(KeyCode::ArrowDown);
+        s.handle_key_tap(KeyCode::ArrowDown);
+        s.handle_key_tap(KeyCode::ArrowDown);
+        assert_eq!(s.take_direction(), DIR_SOUTH);
+        assert_eq!(s.take_direction(), DIR_UNKNOWN);
+    }
+
+    #[test]
+    fn quick_physical_press_and_release_still_moves_once() {
+        let mut s = InputState::new();
+        s.handle_key_event(KeyCode::ArrowLeft, true);
+        s.handle_key_event(KeyCode::ArrowLeft, false);
+        s.update_keyboard_state(10);
+        assert_eq!(s.dir, DIR_UNKNOWN);
+        assert_eq!(s.take_direction(), DIR_WEST);
+        assert_eq!(s.take_direction(), DIR_UNKNOWN);
+    }
+
+    #[test]
+    fn held_direction_continues_after_initial_latch() {
+        let mut s = InputState::new();
+        s.handle_key_event(KeyCode::ArrowUp, true);
+        s.update_keyboard_state(10);
+        assert_eq!(s.take_direction(), DIR_NORTH);
+        assert_eq!(s.take_direction(), DIR_NORTH);
+        s.handle_key_event(KeyCode::ArrowUp, false);
+        s.update_keyboard_state(20);
+        assert_eq!(s.take_direction(), DIR_UNKNOWN);
     }
 }

@@ -127,7 +127,8 @@ fn print_help() {
            RUSTPAL_SHOW_FPS=1      Same as above\n\
            RUSTPAL_CONSOLE_SYNC=0  Disable CSI 2026 sync (SSH)\n\
            RUSTPAL_CONSOLE_SCALE=N Same as --console-scale\n\
-           RUSTPAL_CONSOLE_KITTY_NN=N  Kitty NN 1..8 (auto pixel-align if unset)"
+           RUSTPAL_CONSOLE_KITTY_NN=N  Kitty NN 1..8 (nn mode; auto-align if unset)\n\
+           RUSTPAL_CONSOLE_UPSCALE=   nn|hqx4|xbr4|neural (default nn)"
     );
     // ui_driver is native + (gui|console); keep the same gate as lib.rs so
     // `cargo build --target wasm32-unknown-unknown` (default features) works.

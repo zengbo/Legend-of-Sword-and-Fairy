@@ -22,9 +22,11 @@ cargo build --release
 # Kitty size: --console-scale=N ≈ N×40 terminal columns (e.g. 4 → ~160 cols)
 ./target/release/rustpal --console --console-scale=5
 
-# Kitty NN pre-scale: auto pixel-aligns to cell size when known; override if needed
+# Kitty pre-scale filter (default nn). Also: hqx4 / xbr4 / neural
+RUSTPAL_CONSOLE_UPSCALE=hqx4 ./target/release/rustpal --console=kitty
+RUSTPAL_CONSOLE_UPSCALE=neural ./target/release/rustpal --console=kitty
+# NN only: auto pixel-aligns; force factor with RUSTPAL_CONSOLE_KITTY_NN=1..8
 RUSTPAL_CONSOLE_KITTY_NN=4 ./target/release/rustpal --console=kitty
-# RUSTPAL_CONSOLE_KITTY_NN=1  # raw 320×200
 
 # Show FPS on the top status line (displayed frames / wall time, ~0.5s window)
 RUSTPAL_CONSOLE_FPS=1 ./target/release/rustpal --console=kitty
@@ -44,17 +46,24 @@ RUSTPAL_CONSOLE_FPS=1 ./target/release/rustpal --console=kitty
 
 Needs the `pal/` data directory (same as GUI).
 
-**Kitty:** nearest-neighbor upscales the logical **320×200** frame **before**
-transmit, then sizes with graphics-protocol `c=` (columns). When the terminal
-reports cell pixel size (`TIOCGWINSZ` xpixel/ypixel), **NN factor and `c=` are
-chosen together** so on-screen width ≈ `320×NN` pixels — Kitty scales near
-**1:1** instead of soft-stretching a mismatched bitmap. Without cell metrics,
-fallback is **4×** local / **3×** SSH. Override NN with
-`RUSTPAL_CONSOLE_KITTY_NN=1..8` (`1` = raw 320×200); columns still snap toward
-1:1 for that scale. Width is capped so the image fits the **available rows**
-(no bottom clip). Help text is printed on the primary screen before enter alt
-buffer — the game uses the full alt screen unless `RUSTPAL_CONSOLE_FPS=1`
-reserves the top row. Startup log shows `1:1` or `near` and cell size when known.
+**Kitty:** upscales the logical **320×200** frame **before** transmit, then
+sizes with graphics-protocol `c=` (columns). Filter via
+`RUSTPAL_CONSOLE_UPSCALE`:
+
+| Value | Method | Output | Notes |
+|-------|--------|--------|--------|
+| `nn` (default) | Nearest-neighbor | `320×N × 200×N` | Pixel-align `N` + `c=` to cell size when known |
+| `hqx4` / `xbr4` | CPU HQ4x (2× HQ2x) | 1280×800 | No GPU; smoother than raw NN |
+| `neural` | GUI mega-kernel (wgpu) | 1280×800 | **Async** worker: GPU + zlib/Kitty encode off main; needs `gui` + F16 GPU; else `hqx4` |
+
+When the terminal reports cell pixel size, **`c=` is chosen** for a sharp
+display: **nn** aims on-screen width ≈ `320×N`; **hqx4/neural** keep a 1280×800
+bitmap and pick an **integer display scale** `k` so width ≈ `1280×k` near full
+terminal size (avoids a tiny 1:1 stamp on large fonts). Override NN factor with
+`RUSTPAL_CONSOLE_KITTY_NN=1..8` (nn mode only). Width is capped so the image
+fits the **available rows**. Help text is on the primary screen before alt
+buffer; `RUSTPAL_CONSOLE_FPS=1` reserves the top row. Startup log shows filter,
+size, and `1:1` / `near`.
 
 **ANSI:** small integer upscale (1–3×) + half-block cells.
 
@@ -72,9 +81,10 @@ exits — so Kitty does not stay frozen on the game frame with invisible typing.
 | R A D E W Q F S | Battle shortcuts (same as GUI) |
 | Ctrl-C | Quit |
 
-Keys are held for ~150 ms in engine time (OS key-repeat extends this) so the
-game sees a real press; earlier builds released in the same frame and menus
-ignored input.
+Compatible terminals use the Kitty keyboard protocol's real press/repeat/release
+events for functional keys. Legacy arrow/hjkl sequences are frame-latched taps:
+one sequence moves at most one step, and repeat bursts are coalesced instead of
+queuing extra movement after release.
 
 ### Flicker (especially over SSH)
 
@@ -146,6 +156,7 @@ Console-only binary: `--no-default-features --features console`.
 ## Limits
 
 - No music/SFX in console mode
-- Terminals only report key *presses*; each press is paired with a synthetic release
+- Legacy terminals cannot report key-up; movement uses deterministic one-frame taps
+- Smooth physical hold/release requires Kitty keyboard event-type support
 - Bare Esc is recognized after the stdin poll (no long CSI wait)
 - Not a substitute for the 720p GUI / neural upscale path
