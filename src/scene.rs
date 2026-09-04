@@ -516,7 +516,8 @@ impl Engine {
 
     /// PAL_UpdateParty: walk the party according to input.
     pub fn update_party(&mut self) {
-        let dir = self.input.take_direction();
+        let now = self.ticks();
+        let dir = self.input.take_direction(now);
         if dir != input::DIR_UNKNOWN {
             let x_offset = if dir == input::DIR_WEST || dir == input::DIR_SOUTH {
                 -16
@@ -931,7 +932,9 @@ mod tests {
         eng.globals.party[0].y = eng.globals.partyoffset.1 as i16;
         let viewport_before = eng.globals.viewport;
 
-        eng.input.dir = input::DIR_EAST;
+        // Go through the real key path: a fresh press latches one step.
+        eng.input.handle_key_event(crate::keys::KeyCode::ArrowRight, true);
+        eng.input.update_keyboard_state(0);
         eng.update_party();
 
         assert_eq!(eng.globals.party_direction, global::DIR_EAST);
@@ -947,7 +950,9 @@ mod tests {
         eng.globals.party[0].x = eng.globals.partyoffset.0 as i16;
         eng.globals.party[0].y = eng.globals.partyoffset.1 as i16;
 
-        eng.input.dir = input::DIR_EAST;
+        // Go through the real key path: a fresh press latches one step.
+        eng.input.handle_key_event(crate::keys::KeyCode::ArrowRight, true);
+        eng.input.update_keyboard_state(0);
         let x_source = eng.globals.viewport.0 + eng.globals.partyoffset.0;
         let y_source = eng.globals.viewport.1 + eng.globals.partyoffset.1;
         let target = (x_source + 16, y_source + 8);

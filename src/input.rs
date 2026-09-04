@@ -31,6 +31,12 @@ pub const DIR_NORTH: usize = 2;
 pub const DIR_EAST: usize = 3;
 pub const DIR_UNKNOWN: usize = 4;
 
+/// A direction key must stay physically held this long before the held state
+/// (as opposed to the initial press edge) walks another step. A human tap of
+/// ~80–150 ms that happens to straddle a 100 ms movement frame would otherwise
+/// be counted twice: once as the latched edge, once as "still down".
+pub const HOLD_WALK_MS: u64 = 150;
+
 /// The keyboard map (g_KeyMap): physical key -> PALKEY.
 const KEY_MAP: &[(KeyCode, u32)] = &[
     (KeyCode::ArrowUp, KEY_UP),
@@ -84,6 +90,8 @@ pub struct InputState {
 
     /// Which KEY_MAP entries are physically held down.
     down: [bool; KEY_MAP_LEN],
+    /// Time (ms) each direction was last pressed down; gates hold-walking.
+    dir_down_ms: [u64; 4],
     /// Per-entry next-repeat deadline in ms (0 = not pressed yet).
     last_time: [u64; KEY_MAP_LEN],
     key_order: [u32; 4],
@@ -100,6 +108,7 @@ impl Default for InputState {
             key_press: 0,
             pending_dir: DIR_UNKNOWN,
             down: [false; KEY_MAP_LEN],
+            dir_down_ms: [0; 4],
             last_time: [0; KEY_MAP_LEN],
             key_order: [0; 4],
             key_max_count: 0,
@@ -155,13 +164,19 @@ impl InputState {
     }
 
     /// Direction for one party movement frame. A pending tap is consumed;
-    /// a physically held key remains active on subsequent frames.
-    pub fn take_direction(&mut self) -> usize {
+    /// a physically held key remains active on subsequent frames once it has
+    /// been down for at least `HOLD_WALK_MS`.
+    pub fn take_direction(&mut self, now_ms: u64) -> usize {
         let pending = std::mem::replace(&mut self.pending_dir, DIR_UNKNOWN);
         if pending != DIR_UNKNOWN {
-            pending
-        } else {
+            return pending;
+        }
+        if self.dir != DIR_UNKNOWN
+            && now_ms >= self.dir_down_ms[self.dir].saturating_add(HOLD_WALK_MS)
+        {
             self.dir
+        } else {
+            DIR_UNKNOWN
         }
     }
 
@@ -195,10 +210,11 @@ impl InputState {
     }
 
     /// PAL_KeyDown.
-    fn key_down(&mut self, key: u32, repeat: bool) {
+    fn key_down(&mut self, key: u32, repeat: bool, now_ms: u64) {
         if !repeat {
             let cur = Self::dir_of_key(key);
             if cur != DIR_UNKNOWN {
+                self.dir_down_ms[cur] = now_ms;
                 self.key_max_count += 1;
                 self.key_order[cur] = self.key_max_count;
                 self.dir = self.current_direction();
@@ -230,7 +246,7 @@ impl InputState {
             if self.down[i] {
                 if now_ms > self.last_time[i] {
                     let first = self.last_time[i] == 0;
-                    self.key_down(key, !first);
+                    self.key_down(key, !first, now_ms);
                     self.last_time[i] = if self.enable_key_repeat {
                         now_ms + if first { 200 } else { 75 }
                     } else {
@@ -327,7 +343,7 @@ mod tests {
         s.release_all();
         s.update_keyboard_state(20);
         assert_eq!(s.dir, DIR_UNKNOWN);
-        assert_eq!(s.take_direction(), DIR_UNKNOWN);
+        assert_eq!(s.take_direction(0), DIR_UNKNOWN);
     }
 
     #[test]
@@ -351,8 +367,8 @@ mod tests {
         s.handle_key_tap(KeyCode::ArrowRight);
         assert!(s.pressed(KEY_RIGHT));
         assert_eq!(s.direction(), DIR_EAST);
-        assert_eq!(s.take_direction(), DIR_EAST);
-        assert_eq!(s.take_direction(), DIR_UNKNOWN);
+        assert_eq!(s.take_direction(0), DIR_EAST);
+        assert_eq!(s.take_direction(0), DIR_UNKNOWN);
     }
 
     #[test]
@@ -361,8 +377,8 @@ mod tests {
         s.handle_key_tap(KeyCode::ArrowDown);
         s.handle_key_tap(KeyCode::ArrowDown);
         s.handle_key_tap(KeyCode::ArrowDown);
-        assert_eq!(s.take_direction(), DIR_SOUTH);
-        assert_eq!(s.take_direction(), DIR_UNKNOWN);
+        assert_eq!(s.take_direction(0), DIR_SOUTH);
+        assert_eq!(s.take_direction(0), DIR_UNKNOWN);
     }
 
     #[test]
@@ -372,8 +388,8 @@ mod tests {
         s.handle_key_event(KeyCode::ArrowLeft, false);
         s.update_keyboard_state(10);
         assert_eq!(s.dir, DIR_UNKNOWN);
-        assert_eq!(s.take_direction(), DIR_WEST);
-        assert_eq!(s.take_direction(), DIR_UNKNOWN);
+        assert_eq!(s.take_direction(0), DIR_WEST);
+        assert_eq!(s.take_direction(0), DIR_UNKNOWN);
     }
 
     #[test]
@@ -381,10 +397,37 @@ mod tests {
         let mut s = InputState::new();
         s.handle_key_event(KeyCode::ArrowUp, true);
         s.update_keyboard_state(10);
-        assert_eq!(s.take_direction(), DIR_NORTH);
-        assert_eq!(s.take_direction(), DIR_NORTH);
+        assert_eq!(s.take_direction(100), DIR_NORTH);
+        assert_eq!(s.take_direction(200), DIR_NORTH);
+        assert_eq!(s.take_direction(300), DIR_NORTH);
         s.handle_key_event(KeyCode::ArrowUp, false);
-        s.update_keyboard_state(20);
-        assert_eq!(s.take_direction(), DIR_UNKNOWN);
+        s.update_keyboard_state(310);
+        assert_eq!(s.take_direction(400), DIR_UNKNOWN);
+    }
+
+    #[test]
+    fn tap_straddling_a_frame_boundary_moves_once() {
+        // Press at 95 ms, poll at 100 ms (edge step), release at 130 ms,
+        // poll at 200 ms: the key was never held for HOLD_WALK_MS.
+        let mut s = InputState::new();
+        s.handle_key_event(KeyCode::ArrowRight, true);
+        s.update_keyboard_state(95);
+        assert_eq!(s.take_direction(100), DIR_EAST);
+        s.update_keyboard_state(100);
+        // Still held at the next poll but only 5 ms old: no second step yet.
+        assert_eq!(s.take_direction(100), DIR_UNKNOWN);
+        s.handle_key_event(KeyCode::ArrowRight, false);
+        s.update_keyboard_state(130);
+        assert_eq!(s.take_direction(200), DIR_UNKNOWN);
+    }
+
+    #[test]
+    fn genuine_hold_walks_on_the_second_frame() {
+        let mut s = InputState::new();
+        s.handle_key_event(KeyCode::ArrowDown, true);
+        s.update_keyboard_state(5);
+        assert_eq!(s.take_direction(100), DIR_SOUTH);
+        s.update_keyboard_state(200);
+        assert_eq!(s.take_direction(200), DIR_SOUTH);
     }
 }
